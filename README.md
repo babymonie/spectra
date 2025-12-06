@@ -81,40 +81,6 @@ npx node-gyp rebuild
 
 ---
 
-## **📦 Packaging**
-
-Spectra uses **electron-builder**, configured in `package.json`.
-
-### **Build for your platform**
-
-```powershell
-npm run build
-```
-
-Outputs:
-
-* Windows: `.exe` installer & portable folder
-* macOS: `.app` + `.dmg`
-* Linux: `.AppImage` / `.deb` (depending on your config)
-
----
-
-## **🎨 Icons**
-
-| Purpose             | Location                          |
-| ------------------- | --------------------------------- |
-| Runtime app icon    | `images/icon.png`                 |
-| Installer/packaging | `build/icon.png`, `.ico`, `.icns` |
-| README screenshot   | `images/screenshot.png`           |
-
-Recommended export sizes:
-
-* **1024×1024 PNG** (base source)
-* **256×256 PNG** (app window)
-* **Windows `.ico`** generated from source
-* **macOS `.icns`**
-
----
 
 ## **🔌 Plugins & Remote Control**
 
