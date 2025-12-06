@@ -1,0 +1,146 @@
+# **Spectra Source-Available License**
+
+**Version 1.0 — January 2025**
+**Copyright © 2025 Aloysius (“babymonie”). All rights reserved.**
+
+## **1. Definitions**
+
+* **“Software”** refers to the Spectra application, including but not limited to source code, compiled binaries, assets, documentation, build scripts, plugins, configuration files, and all intellectual property contained within the repository.
+* **“Author”** refers to Aloysius (“babymonie”), the sole copyright holder.
+* **“User”** refers to any individual who accesses, views, clones, downloads, compiles, or runs the Software.
+* **“Personal Use”** means use by an individual **solely on their own equipment**, for private, non-commercial purposes.
+
+---
+
+## **2. Grant of Permission**
+
+Subject to full compliance with this License, the Author grants the User the following limited rights:
+
+1. **Right to View**
+   The User may access and view the source code for personal education, research, or curiosity.
+
+2. **Right to Study**
+   The User may analyze the Software’s architecture, design, implementation, and techniques **for learning purposes only**.
+
+3. **Right to Execute**
+   The User may compile and run the Software on their own personal computer for private use.
+
+These rights are **non-exclusive, non-transferable, revocable**, and granted **solely for Personal Use**.
+
+---
+
+## **3. Prohibited Actions**
+
+The User **may not**, under any circumstances, perform any of the following:
+
+### **3.1 Modification Restrictions**
+
+* Modify, alter, patch, translate, or create derivative works of the Software.
+  This includes:
+* Forking the repository
+* Changing source files
+* Merging with other software
+* Extracting or reusing components
+
+### **3.2 Distribution Restrictions**
+
+The User may NOT:
+
+* Redistribute the Software or any portion of it
+* Upload or mirror the Software publicly
+* Publish modified or unmodified versions
+* Host the Software online (including any remote client versions)
+
+This applies to:
+
+* Source code
+* Binaries
+* Screenshots
+* Assets
+* Documentation
+
+### **3.3 Commercial Restrictions**
+
+The User may NOT:
+
+* Sell, rent, lease, license, or commercialize the Software
+* Use the Software for business, institutional, or organizational purposes
+* Include the Software in commercial or non-commercial packages
+
+### **3.4 Sub-licensing Restrictions**
+
+The User may not:
+
+* Grant rights to others
+* Provide access to third parties
+* Circumvent restrictions of this License
+
+## **4. Intellectual Property**
+
+All intellectual property rights are retained by the Author.
+The Software is **not open-source** despite having visible source code.
+
+Nothing in this License shall be interpreted as:
+
+* Transferring ownership
+* Granting long-term or perpetual rights
+* Waiving any of the Author’s rights
+
+---
+
+## **5. Termination**
+
+Any violation of this License results in the **immediate termination** of all granted rights.
+Upon termination, the User must:
+
+1. Delete all copies of the Software
+2. Cease all use
+3. Not attempt to regain access through new accounts or redistribution
+
+The Author reserves the right to pursue legal remedies where applicable.
+
+---
+
+## **6. No Warranty**
+
+THE SOFTWARE IS PROVIDED “AS IS”, WITHOUT WARRANTY OF ANY KIND.
+THE AUTHOR DISCLAIMS ALL LIABILITY FOR:
+
+* Loss of data
+* Damages of any kind
+* Hardware or software malfunction
+* Security vulnerabilities
+* Incorrect behavior or audio output defects
+
+The User assumes all risks associated with running the Software.
+
+---
+
+## **7. No Support Obligation**
+
+The Author is **not required** to:
+
+* Provide updates
+* Fix bugs
+* Maintain compatibility
+* Offer technical support
+* Continue development
+
+The Software may be modified, unpublished, or discontinued at any time.
+
+---
+
+
+## **9. Entire Agreement**
+
+This License constitutes the complete agreement between the User and the Author.
+No additional rights are granted, whether implied or explicit.
+
+---
+
+## **10. Acceptance**
+
+By downloading, viewing, cloning, copying, compiling, or running the Software, the User acknowledges and agrees to all terms of this License.
+
+If the User does not agree, they must not download, access, or use the Software.
+

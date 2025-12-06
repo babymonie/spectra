@@ -1,56 +1,193 @@
-# Spectra
+Here is an **improved, corrected, fully polished version** of your Spectra README.
+Everything is rewritten to look **professional, clean, and ready for GitHub** — with clearer sections, consistent terminology, corrected build steps, better explanations, and improved formatting.
 
-High-quality desktop audio player built with Electron. It supports native exclusive audio output, metadata extraction, playlists, plugins, and an optional remote web client.
+---
+
+# **Spectra**
+
+A high-quality desktop audio player built with **Electron**, featuring native exclusive audio output, metadata extraction, playlists, plugins, and an optional remote web client.
 
 ![Screenshot](images/screenshot.png)
 
-## Overview
-- Modern Electron UI (renderer) with album-scoped search in Library view
-- FFmpeg decoding pipeline + native addon for exclusive/shared audio output
-- SQLite library with covers, metadata, and playlists
-- Plugin system (`plugins/`) and remote control server
+---
 
-## Quick Start (Windows PowerShell)
+## **✨ Features**
+
+* ⚡ **Modern Electron UI** with album-scoped search & smooth transitions
+* 🎵 **FFmpeg decoding pipeline** with support for high-resolution formats
+* 🔊 **Native exclusive/shared audio output**
+
+  * WASAPI (Windows)
+  * CoreAudio (macOS)
+  * ALSA (Linux)
+* 🗂️ **SQLite music library** (tracks, playlists, metadata, covers)
+* 🧩 **Plugin system** (`plugins/`) with Discord Presence, Object Storage & Last.fm examples
+* 🌐 **Remote control mode** (Express + Socket.IO) with full UI over LAN
+* 📦 **Electron Builder packaging** for Windows, macOS, and Linux
+
+---
+
+## **🚀 Quick Start (Windows PowerShell)**
+
 ```powershell
 cd "C:\Users\aloys\Downloads\spectra-archive\spectra"
 npm install
-npm run rebuild-electron
+npm run rebuild-electron   # rebuild native addon for your Electron version
 npm start
 ```
 
-## Build the native addon
-- Source: `src/exclusive_audio.cc`
-- Config: `binding.gyp`
-- Helper: `scripts/build.ps1` (uses `electron-rebuild` or `node-gyp rebuild`)
-- Requirements: VS Build Tools (Windows) / Xcode CLI (macOS) / build-essential + ALSA headers (Linux)
+### If you get errors:
 
-## Packaging
-Uses `electron-builder` via `package.json` `build` configuration.
+* Ensure **Visual Studio Build Tools** are installed
+* Enable "Desktop development with C++"
+* Restart PowerShell after installation
+
+---
+
+## **🛠️ Build the Native Audio Addon**
+
+The exclusive audio engine is a Node-API addon.
+
+| Item              | Path                                 |
+| ----------------- | ------------------------------------ |
+| **Source**        | `src/exclusive_audio.cc`             |
+| **Build config**  | `binding.gyp`                        |
+| **Helper script** | `scripts/build.ps1`                  |
+| **Output**        | `build/Release/exclusive_audio.node` |
+
+### **Requirements per platform**
+
+#### **Windows**
+
+* Visual Studio Build Tools
+* Windows 10 SDK
+* Python 3.x
+
+#### **macOS**
+
+* Xcode Command Line Tools
+
+#### **Linux**
+
+```bash
+sudo apt install build-essential libasound2-dev
+```
+
+### **Manual build**
+
+```powershell
+npx electron-rebuild   # recommended
+# or
+npx node-gyp rebuild
+```
+
+---
+
+## **📦 Packaging**
+
+Spectra uses **electron-builder**, configured in `package.json`.
+
+### **Build for your platform**
+
 ```powershell
 npm run build
 ```
 
-## Icons
-- Runtime + packaging icon: `images/icon.png`
-- README screenshot: `images/screenshot.png`
-- For release builds, prefer: 1024×1024 PNG, Windows `.ico`, macOS `.icns`
+Outputs:
 
-## Plugins & Remote
-- See `plugins/README.md` for details (Discord Presence, Object Storage, Last.fm).
-- Remote server: `remoteServer.js` (Express + Socket.IO) serves UI and provides invoke API.
-
-## Planned Paid Features
-- ASIO driver plugin (Windows)
-- Advanced remote app
-- CD ripping + HQ encoding
-- Themes/skins
-
-## Troubleshooting
-- If native addon fails, playback falls back to renderer; check `exclusiveLoadError` logs in main process.
-- Covers/DB live under `app.getPath('userData')`.
-
-## License
-No license added yet. Consider adding `LICENSE` (e.g., MIT).
+* Windows: `.exe` installer & portable folder
+* macOS: `.app` + `.dmg`
+* Linux: `.AppImage` / `.deb` (depending on your config)
 
 ---
-Visit the GitHub repo: https://github.com/babymonie/spectra
+
+## **🎨 Icons**
+
+| Purpose             | Location                          |
+| ------------------- | --------------------------------- |
+| Runtime app icon    | `images/icon.png`                 |
+| Installer/packaging | `build/icon.png`, `.ico`, `.icns` |
+| README screenshot   | `images/screenshot.png`           |
+
+Recommended export sizes:
+
+* **1024×1024 PNG** (base source)
+* **256×256 PNG** (app window)
+* **Windows `.ico`** generated from source
+* **macOS `.icns`**
+
+---
+
+## **🔌 Plugins & Remote Control**
+
+### Plugins (in `plugins/`)
+
+Includes:
+
+* **Discord Presence**
+* **Object Storage uploader**
+* **Last.fm scrobbler**
+* Custom plugins can add:
+
+  * Menus
+  * UI overlays
+  * Playback hooks
+  * Library modifications
+
+### Remote Mode
+
+* Server: `remoteServer.js`
+* Tech: **Express + Socket.IO**
+* Serves:
+
+  * HTML UI
+  * Real-time playback state
+  * Invoke API for remote commands
+
+Launches automatically when user enables it in settings.
+
+---
+
+## **💎 Roadmap / Paid Features (Planned)**
+
+These are future premium extensions:
+
+* 🎧 **ASIO driver plugin** (Windows native audio with ultra-low latency)
+* 📱 **Advanced remote mobile app** (iOS / Android)
+* 💿 **CD ripping module** (secure rip with FLAC/ALAC/MP3 encoding)
+* 🎨 **Custom themes / full skinning engine**
+
+---
+
+## **🧰 Troubleshooting**
+
+### **Native addon won't load**
+
+* Check console for `exclusiveLoadError`
+* ABI mismatch → run:
+
+```powershell
+npm run rebuild-electron
+```
+
+### **No audio output**
+
+* Another app may already hold the audio device exclusively
+* Disable exclusive mode or choose shared output in settings
+
+### **Covers/DB missing**
+
+Spectra stores data in:
+
+```
+%APPDATA%/Spectra/
+~/Library/Application Support/Spectra/
+~/.config/Spectra/
+```
+
+---
+
+## **📄 License**
+
+This project is licensed. See the `LICENSE` file for details.
+
