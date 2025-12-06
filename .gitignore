@@ -1,0 +1,50 @@
+# Node modules
+node_modules/
+
+# Build outputs
+dist/
+build/
+Release/
+out/
+
+# Electron builder artifacts
+*.app
+*.dmg
+*.exe
+*.AppImage
+
+# Native addon build artifacts
+*.node
+**/build/Release/
+**/build/Debug/
+
+# Logs
+logs
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# OS files
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# IDE/editor settings
+.vscode/
+*.suo
+*.ntvs_analysis.dat
+*.njsproj
+*.sln
+
+# User files
+notes
+
+# dotenv
+.env
+
+# Misc
+.cache/
+.parcel-cache/
+coverage/
+.nyc_output

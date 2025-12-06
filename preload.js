@@ -1,0 +1,71 @@
+const { contextBridge, ipcRenderer } = require('electron');
+
+contextBridge.exposeInMainWorld('electron', {
+  importFile: () => ipcRenderer.invoke('library:import-file'),
+  importFolder: () => ipcRenderer.invoke('library:import-folder'),
+  addFiles: (paths) => ipcRenderer.invoke('library:add-files', paths),
+  addRemote: (info) => ipcRenderer.invoke('library:add-remote', info),
+  getLibrary: () => ipcRenderer.invoke('library:get'),
+  getAlbums: () => ipcRenderer.invoke('library:get-albums'),
+  getCoverImage: (coverPath) => ipcRenderer.invoke('library:get-cover-image', coverPath),
+  removeTrack: (id) => ipcRenderer.invoke('library:remove-track', id),
+  updateTrack: (id, data) => ipcRenderer.invoke('library:update-track', id, data),
+  showTrackContextMenu: (tracks) => ipcRenderer.invoke('context-menu:show-track', tracks),
+  playTrack: (path, options) => ipcRenderer.invoke('audio:play', path, options),
+  pause: () => ipcRenderer.invoke('audio:pause'),
+  resume: () => ipcRenderer.invoke('audio:resume'),
+  getAudioStatus: () => ipcRenderer.invoke('audio:get-status'),
+  stop: () => ipcRenderer.invoke('audio:stop'),
+    getLyrics: (opts) => ipcRenderer.invoke('lyrics:get', opts),
+    saveLyrics: (opts) => ipcRenderer.invoke('lyrics:save', opts),
+    setFullscreen: (flag) => ipcRenderer.invoke('window:set-fullscreen', flag),
+  seek: (time) => ipcRenderer.invoke('audio:seek', time),
+  getTime: () => ipcRenderer.invoke('audio:get-time'),
+  setVolume: (val) => ipcRenderer.invoke('audio:set-volume', val),
+  getDevices: () => ipcRenderer.invoke('audio:get-devices'),
+  getPlayerState: () => ipcRenderer.invoke('player:get-state'),
+  toggleRemote: (enable) => ipcRenderer.invoke('remote:toggle', enable),
+  getPlugins: () => ipcRenderer.invoke('plugins:list'),
+  // Remove listeners for a channel (used by plugin cleanup)
+  off: (channel) => ipcRenderer.removeAllListeners && ipcRenderer.removeAllListeners(channel),
+  // Signal renderer->main that cleanup is complete and main can proceed with reload
+  signalPluginsReadyForReload: () => ipcRenderer.send('plugins:ready-for-reload'),
+  createPlaylist: (name) => ipcRenderer.invoke('playlists:create', name),
+  getPlaylists: () => ipcRenderer.invoke('playlists:list'),
+  getPlaylistTracks: (id) => ipcRenderer.invoke('playlists:get-tracks', id),
+  addTrackToPlaylist: (playlistId, trackId) => ipcRenderer.invoke('playlists:add-track', playlistId, trackId),
+  renamePlaylist: (playlistId, name) => ipcRenderer.invoke('playlists:rename', playlistId, name),
+  deletePlaylist: (playlistId) => ipcRenderer.invoke('playlists:delete', playlistId),
+  removeTrackFromPlaylist: (playlistId, trackId) => ipcRenderer.invoke('playlists:remove-track', playlistId, trackId),
+  reorderPlaylist: (playlistId, orderedTrackIds) => ipcRenderer.invoke('playlists:reorder', playlistId, orderedTrackIds),
+  // Queue management
+  getQueue: () => ipcRenderer.invoke('queue:get'),
+  setQueue: (tracks) => ipcRenderer.invoke('queue:set', tracks),
+  addToQueue: (track) => ipcRenderer.invoke('queue:add', track),
+  removeFromQueue: (index) => ipcRenderer.invoke('queue:remove', index),
+  clearQueue: () => ipcRenderer.invoke('queue:clear'),
+  queueNext: () => ipcRenderer.invoke('queue:next'),
+  queuePrevious: () => ipcRenderer.invoke('queue:previous'),
+  // Shuffle and Repeat
+  setShuffle: (enabled) => ipcRenderer.invoke('player:set-shuffle', enabled),
+  setRepeat: (mode) => ipcRenderer.invoke('player:set-repeat', mode),
+  getPlayerModes: () => ipcRenderer.invoke('player:get-modes'),
+  // Equalizer
+  getEQ: () => ipcRenderer.invoke('eq:get'),
+  setEQEnabled: (enabled) => ipcRenderer.invoke('eq:set-enabled', enabled),
+  setEQPreset: (preset) => ipcRenderer.invoke('eq:set-preset', preset),
+  setEQBands: (bands) => ipcRenderer.invoke('eq:set-bands', bands),
+  setPluginEnabled: (id, enabled) => ipcRenderer.invoke('plugins:set-enabled', id, enabled),
+  updatePluginSettings: (id, settings) => ipcRenderer.invoke('plugins:update-settings', id, settings),
+  reloadPlugins: () => ipcRenderer.invoke('plugins:reload'),
+  // Minimize-to-tray setting: inform main process to enable/disable tray behavior
+  setMinimizeToTray: (enabled) => ipcRenderer.invoke('app:set-minimize-to-tray', enabled),
+  // Playlist export/import
+  exportPlaylist: (playlistId) => ipcRenderer.invoke('playlists:export', playlistId),
+  importPlaylist: () => ipcRenderer.invoke('playlists:import'),
+  // Object storage upload from renderer -> plugin main
+  objectStorageUpload: (localPath, key) => ipcRenderer.invoke('object-storage:upload', localPath, key),
+  relinkTrack: (info) => ipcRenderer.invoke('track:relink', info),
+  downloadTrack: (opts) => ipcRenderer.invoke('track:download', opts),
+  on: (channel, callback) => ipcRenderer.on(channel, (event, ...args) => callback(...args))
+});

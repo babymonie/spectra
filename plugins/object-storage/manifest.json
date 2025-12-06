@@ -1,0 +1,22 @@
+{
+  "id": "object-storage",
+  "name": "Object Storage",
+  "version": "1.0.0",
+  "author": "Spectra",
+  "description": "Import and play audio files from remote object storage services (S3, GCS, Minio, etc.)",
+  "main": "plugin.js",
+  "entry": "ui.js",
+  "settings": {
+    "provider": "minio",
+    "endpoint": "http://localhost:9000",
+    "region": "us-east-1",
+    "accessKeyId": "",
+    "secretAccessKey": "",
+    "bucket": "music",
+    "pathPrefix": "",
+    "autoSync": false,
+    "syncInterval": 300,
+    "cacheFiles": true,
+    "maxCacheSize": 1024
+  }
+}

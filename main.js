@@ -1,0 +1,1590 @@
+
+import { app, BrowserWindow, ipcMain, dialog, Menu, protocol, globalShortcut, Tray, nativeImage } from 'electron';
+import path from 'path';
+import { fileURLToPath } from 'url';
+import fs from 'fs';
+import audioEngine from './audioEngine.js';
+import Database from 'better-sqlite3';
+import { extractMetadata, extractMetadataFromBuffer } from './metadataLookup.js';
+import { extractLyrics } from './metadataLookup.js';
+import db from './database.js';
+import RemoteServer from './remoteServer.js';
+
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
+
+// Plugin system setup
+const repoPluginsDir = path.join(__dirname, 'plugins'); // Built-in plugins in repo
+const pluginsDir = path.join(app.getPath('userData'), 'plugins');
+const pluginConfigPath = path.join(pluginsDir, 'plugins-config.json');
+const loadedPlugins = new Map();
+
+// Small persistent app-level settings stored in userData
+const appSettingsPath = path.join(app.getPath('userData'), 'app-settings.json');
+let appSettings = { minimizeToTray: true };
+
+function loadAppSettings() {
+  try {
+    if (fs.existsSync(appSettingsPath)) {
+      const j = JSON.parse(fs.readFileSync(appSettingsPath, 'utf8'));
+      appSettings = Object.assign({}, appSettings, j || {});
+      console.log('[settings] Loaded app settings:', appSettingsPath, appSettings);
+    } else {
+      console.log('[settings] No app settings found, using defaults');
+    }
+  } catch (e) {
+    console.warn('[settings] Failed to load app settings', e);
+  }
+}
+
+function saveAppSettings() {
+  try {
+    fs.writeFileSync(appSettingsPath, JSON.stringify(appSettings, null, 2), 'utf8');
+    console.log('[settings] Saved app settings:', appSettingsPath, appSettings);
+  } catch (e) {
+    console.error('[settings] Failed to save app settings', e);
+  }
+}
+
+if (!fs.existsSync(pluginsDir)) {
+  fs.mkdirSync(pluginsDir, { recursive: true });
+}
+
+protocol.registerSchemesAsPrivileged([
+  { scheme: 'plugins', privileges: { standard: true, secure: true, supportFetchAPI: true, corsEnabled: true } }
+]);
+
+function loadPluginConfig() {
+  try {
+    if (fs.existsSync(pluginConfigPath)) {
+      const cfg = JSON.parse(fs.readFileSync(pluginConfigPath, 'utf8'));
+      console.log(`[plugins] Loaded config from ${pluginConfigPath}:`, JSON.stringify(cfg, null, 2));
+      return cfg;
+    } else {
+      console.log(`[plugins] No config file found at ${pluginConfigPath}, using defaults`);
+    }
+  } catch (e) {
+    console.error('Failed to read plugins-config.json', e);
+  }
+  return {};
+}
+
+function savePluginConfig(cfg) {
+  try {
+    // Ensure the plugins directory exists before saving
+    if (!fs.existsSync(pluginsDir)) {
+      fs.mkdirSync(pluginsDir, { recursive: true });
+      console.log(`[plugins] Created plugins directory: ${pluginsDir}`);
+    }
+    fs.writeFileSync(pluginConfigPath, JSON.stringify(cfg, null, 2), 'utf8');
+    console.log(`[plugins] Saved config to ${pluginConfigPath}:`, JSON.stringify(cfg, null, 2));
+  } catch (e) {
+    console.error('Failed to write plugins-config.json', e);
+  }
+}
+
+let mainWindow;
+let tray = null;
+let remoteServer;
+let currentTrackMetadata = null;
+// Pending files opened before app is ready
+const pendingOpenFiles = [];
+
+// Playback queue and modes
+let playbackQueue = [];
+let queueIndex = -1;
+let shuffleMode = false;
+let repeatMode = 'off'; // 'off', 'all', 'one'
+let originalQueue = []; // For when shuffle is toggled off
+
+// Equalizer state
+let eqEnabled = false;
+let eqPreset = 'flat';
+let eqBands = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0]; // 10-band EQ
+
+// Ensure single instance and handle files passed to second instance (Windows)
+const gotLock = app.requestSingleInstanceLock();
+if (!gotLock) {
+  app.quit();
+}
+app.on('second-instance', (event, argv) => {
+  // argv may include file paths when a user double-clicks an associated file
+  try {
+    const files = parseArgvFiles(argv || []);
+    for (const f of files) {
+      // if mainWindow ready, handle immediately; otherwise queue
+      if (mainWindow && mainWindow.webContents && !mainWindow.isDestroyed()) {
+        if (mainWindow.isMinimized()) mainWindow.restore();
+        mainWindow.focus();
+        handleOpenFile(f);
+      } else {
+        pendingOpenFiles.push(f);
+      }
+    }
+  } catch (e) {
+    console.warn('[main] second-instance file handling failed', e);
+  }
+});
+
+// macOS: handle files opened via Finder / double-click
+app.on('open-file', (event, filePath) => {
+  try {
+    event.preventDefault();
+    if (app.isReady()) handleOpenFile(filePath);
+    else pendingOpenFiles.push(filePath);
+  } catch (err) {
+    console.warn('[main] open-file handler failed', err);
+  }
+});
+
+function broadcast(channel, ...args) {
+  if (mainWindow && !mainWindow.isDestroyed()) {
+    mainWindow.webContents.send(channel, ...args);
+  }
+  if (remoteServer) {
+    remoteServer.broadcast(channel, args);
+  }
+}
+
+// Utility: detect if an argument refers to a local audio file path
+function isAudioPath(p) {
+  if (!p) return false;
+  try {
+    // Accept file:// URLs too
+    if (p.startsWith('file://')) return true;
+    const ext = path.extname(p || '').toLowerCase();
+    return ['.flac', '.wav', '.mp3', '.m4a', '.aac', '.ogg', '.opus', '.dsf', '.dff', '.ape', '.aiff', '.caf'].includes(ext);
+  } catch {
+    return false;
+  }
+}
+
+function parseArgvFiles(argv) {
+  const files = [];
+  for (const a of argv) {
+    if (!a) continue;
+    // Skip electron executable and app path
+    if (String(a).endsWith('electron.exe') || String(a).endsWith('electron')) continue;
+    // Normalize file:// URIs
+    try {
+      if (String(a).startsWith('file://')) {
+        const u = new URL(a);
+        files.push(u.pathname);
+        continue;
+      }
+    } catch (e) {}
+    if (isAudioPath(a) && fs.existsSync(a)) files.push(a);
+  }
+  return files;
+}
+
+async function handleOpenFile(filePath) {
+  if (!filePath) return;
+  try {
+    // Normalize file:// URI
+    if (String(filePath).startsWith('file://')) {
+      try { filePath = fileURLToPath(filePath); } catch {}
+    }
+
+    // If it's a local file, ensure it exists
+    if (!filePath.startsWith('http') && !fs.existsSync(filePath)) {
+      console.warn('[main] open-file requested but file not found:', filePath);
+      return;
+    }
+
+    // Add to DB (processAndAddTrack handles idempotency)
+    if (!filePath.startsWith('http')) {
+      const added = await processAndAddTrack(filePath).catch(() => null);
+      // Play the file
+      if (added) {
+        await handlers['audio:play'](filePath, {});
+      } else {
+        // Still attempt to play even if DB add failed
+        await handlers['audio:play'](filePath, {});
+      }
+    } else {
+      // remote URL: call existing add-remote handler then play
+      const r = await handlers['library:add-remote'](null, { url: filePath }).catch(() => null);
+      await handlers['audio:play'](filePath, {});
+    }
+  } catch (e) {
+    console.error('[main] handleOpenFile failed for', filePath, e);
+  }
+}
+
+function getPlayerState() {
+  const status = audioEngine.getStatus();
+  return {
+    ...status,
+    track: currentTrackMetadata
+  };
+}
+
+function broadcastState() {
+  broadcast('player:state', getPlayerState());
+}
+
+function createWindow() {
+  // Prefer bunded app icon when available
+  let winIcon = undefined;
+  try {
+    const winIconPath = path.join(__dirname, 'images', 'icon.png');
+    if (fs.existsSync(winIconPath)) winIcon = winIconPath;
+  } catch (e) {}
+
+  mainWindow = new BrowserWindow({
+    width: 1200,
+    height: 800,
+    icon: winIcon,
+    webPreferences: {
+      preload: path.join(__dirname, 'preload.js'),
+      contextIsolation: true,
+      nodeIntegration: false,
+      webSecurity: false // Allow loading local resources (cover art)
+    },
+    backgroundColor: '#121212',
+    titleBarStyle: 'hiddenInset' // Mac style, looks okay on Windows too usually or just remove
+  });
+
+  // Handle minimize to tray on Windows
+  mainWindow.on('minimize', (event) => {
+    if (process.platform === 'win32' && tray) {
+      event.preventDefault();
+      mainWindow.hide();
+    }
+  });
+
+  mainWindow.on('close', (event) => {
+    if (process.platform === 'win32' && !app.isQuitting && tray) {
+      event.preventDefault();
+      mainWindow.hide();
+    }
+  });
+
+  mainWindow.loadFile(path.join(__dirname, 'renderer/index.html'));
+  // mainWindow.webContents.openDevTools();
+}
+
+// Helper to resolve special URI schemes like object-storage://
+async function resolveTrackPath(filePath) {
+  if (typeof filePath === 'string' && filePath.startsWith('object-storage://')) {
+    const plugin = loadedPlugins.get('object-storage');
+    if (plugin && plugin.module && plugin.module.ObjectStorageAPI && plugin.module.ObjectStorageAPI.resolvePath) {
+      try {
+        const resolved = await plugin.module.ObjectStorageAPI.resolvePath(filePath);
+        if (resolved) return resolved;
+      } catch (e) {
+        console.warn('[main] Failed to resolve URI:', filePath, e);
+      }
+    }
+  }
+  return filePath;
+}
+
+// Shared handlers for IPC and Remote Server
+const handlers = {
+  'library:get': () => db.getAllTracks(),
+  'library:remove-track': (id) => db.removeTrack(id),
+  'library:update-track': (id, data) => db.updateTrack(id, data),
+  'library:get-albums': () => db.getAlbums(),
+  'library:get-cover-image': async (coverPath) => {
+    if (!coverPath || coverPath.startsWith('http')) return coverPath;
+    try {
+      const imageBuffer = await fs.promises.readFile(coverPath);
+      const ext = path.extname(coverPath).toLowerCase();
+      let mimeType = 'image/jpeg';
+      if (ext === '.png') mimeType = 'image/png';
+      else if (ext === '.webp') mimeType = 'image/webp';
+      else if (ext === '.gif') mimeType = 'image/gif';
+      return `data:${mimeType};base64,${imageBuffer.toString('base64')}`;
+    } catch (err) {
+      console.error('Error reading cover image:', coverPath, err);
+      return null;
+    }
+  },
+
+    // Allow renderer to relink a track whose file has moved
+    'track:relink': async (event, info) => {
+      console.log('track:relink called with', info);
+      // Allow relinking even if renderer didn't provide the track object.
+      const requestedFilePath = info?.filePath || null;
+      const requestedTrack = info?.track || null;
+
+      // Prefer provided track, otherwise fall back to currentTrackMetadata or DB lookup by path
+      let targetTrack = requestedTrack || currentTrackMetadata || (requestedFilePath ? db.getTrackByPath(requestedFilePath) : null);
+
+      // Open dialog regardless so user can pick replacement file
+      const { canceled, filePaths } = await dialog.showOpenDialog({
+        title: 'Locate audio file',
+        defaultPath: requestedFilePath || (targetTrack && targetTrack.path) || undefined,
+        properties: ['openFile'],
+        filters: [
+          { name: 'Audio Files', extensions: ['flac','wav','mp3','m4a','aac','ogg','opus','dsf','dff'] },
+          { name: 'All Files', extensions: ['*'] }
+        ]
+      });
+      console.log('track:relink dialog result:', { canceled, filePaths });
+      if (canceled || !filePaths || !filePaths.length) return { ok: false };
+
+      const newPath = filePaths[0];
+      try {
+        // If we can identify a track id, update DB path; otherwise skip DB update but still attempt playback
+        const trackId = targetTrack?.id || (requestedFilePath ? (db.getTrackByPath(requestedFilePath)?.id) : null);
+        if (trackId) {
+          try {
+            db.updateTrackPath(trackId, newPath);
+            console.log(`Updated DB track ${trackId} path ->`, newPath);
+          } catch (dbErr) {
+            console.error('Failed to update DB track path:', dbErr);
+          }
+        } else {
+          console.log('No track id found to update; skipping DB update');
+        }
+
+        // Try to play again with updated path
+        await audioEngine.playFile(newPath, () => {
+          broadcast('audio:ended');
+          broadcastState();
+        }, (err) => {
+          console.error('Playback error after relink:', err);
+          broadcast('audio:error', {
+            message: String(err?.message || err),
+            filePath: newPath,
+            track: currentTrackMetadata
+          });
+          broadcastState();
+        }, { ...currentPlaybackOptions, track: currentTrackMetadata });
+
+        return { ok: true, newPath };
+      } catch (e) {
+        console.error('Failed to relink and play track', e);
+        return { ok: false, error: String(e?.message || e) };
+      }
+    },
+  'audio:play': async (filePath, options = {}) => {
+    try {
+      const playPath = await resolveTrackPath(filePath);
+
+      if (options.volume !== undefined) {
+        options.volume = Number(options.volume);
+      }
+      
+      // Store track metadata if provided
+      if (options.track) {
+        currentTrackMetadata = options.track;
+      } else {
+        // Try to find it in DB or just use path
+        const track = db.getTrackByPath(filePath);
+        currentTrackMetadata = track || { path: filePath, title: path.basename(filePath) };
+      }
+
+      await audioEngine.playFile(playPath, () => {
+        emitPluginEvent('track-stopped', currentTrackMetadata);
+        broadcast('audio:ended');
+        broadcastState();
+      }, (err) => {
+        console.error('Playback error:', err);
+        // Notify renderer about playback error (e.g. missing file)
+        broadcast('audio:error', {
+          message: String(err && err.message ? err.message : err),
+          filePath,
+          track: currentTrackMetadata
+        });
+        broadcastState();
+      }, options);
+      
+      // Emit track started event to plugins
+      emitPluginEvent('track-started', currentTrackMetadata);
+      
+      broadcastState();
+    } catch (e) {
+      console.error('Play failed:', e);
+      broadcast('audio:error', {
+          message: String(e && e.message ? e.message : e),
+          filePath,
+          track: currentTrackMetadata
+        });
+    }
+  },
+  'audio:get-devices': () => audioEngine.getDevices(),
+  'audio:get-status': () => {
+    try {
+      return audioEngine.getStatus();
+    } catch (e) {
+      return { error: String(e) };
+    }
+  },
+  // Playlists
+  'playlists:create': (name) => db.createPlaylist(name),
+  'playlists:list': () => db.getAllPlaylists(),
+  'playlists:get-tracks': (playlistId) => db.getPlaylistTracks(playlistId),
+  'playlists:export': async (playlistId) => {
+    try {
+      // Find playlist metadata
+      const pls = db.getAllPlaylists();
+      const pl = pls.find(p => String(p.id) === String(playlistId));
+      if (!pl) return { success: false, error: 'Playlist not found' };
+
+      // Ask user where to save
+      const defaultName = `${pl.name || 'playlist'}.playlist`;
+      const defaultDir = app.getPath('downloads') || app.getPath('home') || __dirname;
+      const { canceled, filePath } = await dialog.showSaveDialog(mainWindow, {
+        title: 'Export playlist',
+        defaultPath: path.join(defaultDir, defaultName),
+        filters: [{ name: 'Spectra Playlist', extensions: ['playlist'] }, { name: 'All Files', extensions: ['*'] }]
+      });
+      if (canceled || !filePath) return { success: false, canceled: true };
+
+      // Create a new sqlite DB at the chosen path and populate with playlist + tracks
+      const outDb = new Database(filePath);
+      outDb.exec(`
+        CREATE TABLE playlists (id INTEGER PRIMARY KEY, name TEXT NOT NULL, created_at DATETIME, updated_at DATETIME);
+        CREATE TABLE tracks (id INTEGER PRIMARY KEY, path TEXT UNIQUE NOT NULL, title TEXT, artist TEXT, album TEXT, album_artist TEXT, duration REAL, format TEXT, cover_path TEXT, lyrics TEXT, created_at DATETIME);
+        CREATE TABLE playlist_tracks (playlist_id INTEGER, track_id INTEGER, track_order INTEGER, PRIMARY KEY (playlist_id, track_id));
+      `);
+
+      // Insert playlist row (keep original id for portability)
+      const insertPl = outDb.prepare('INSERT INTO playlists (id, name, created_at, updated_at) VALUES (?, ?, ?, ?)');
+      insertPl.run(pl.id, pl.name, pl.created_at || null, pl.updated_at || pl.created_at || null);
+
+      // Insert tracks and playlist_tracks
+      const tracks = db.getPlaylistTracks(playlistId) || [];
+      const insertTrack = outDb.prepare(`INSERT INTO tracks (id, path, title, artist, album, album_artist, duration, format, cover_path, lyrics, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`);
+      const insertPT = outDb.prepare('INSERT INTO playlist_tracks (playlist_id, track_id, track_order) VALUES (?, ?, ?)');
+      let order = 1;
+      for (const t of tracks) {
+        insertTrack.run(t.id, t.path, t.title || null, t.artist || null, t.album || null, t.album_artist || null, t.duration || null, t.format || null, t.cover_path || null, t.lyrics || null, t.created_at || null);
+        insertPT.run(pl.id, t.id, order++);
+      }
+
+      outDb.close();
+      return { success: true, path: filePath };
+    } catch (e) {
+      console.error('playlists:export failed', e);
+      return { success: false, error: String(e) };
+    }
+  },
+  'playlists:import': async () => {
+    try {
+      const { canceled, filePaths } = await dialog.showOpenDialog(mainWindow, {
+        title: 'Import playlist',
+        properties: ['openFile'],
+        filters: [{ name: 'Spectra Playlist', extensions: ['playlist'] }, { name: 'All Files', extensions: ['*'] }]
+      });
+      if (canceled || !filePaths || !filePaths.length) return { success: false, canceled: true };
+      const impPath = filePaths[0];
+
+      // Open provided sqlite file and read playlist + tracks
+      const srcDb = new Database(impPath, { readonly: true });
+      // Read playlists (take first)
+      const plRow = srcDb.prepare('SELECT * FROM playlists ORDER BY id LIMIT 1').get();
+      if (!plRow) { srcDb.close(); return { success: false, error: 'No playlist data found' }; }
+
+      // Create playlist in main DB
+      const res = db.createPlaylist(plRow.name || 'Imported Playlist');
+      const newPlaylistId = res && res.lastInsertRowid ? res.lastInsertRowid : null;
+      // Read tracks joined to playlist_tracks if available
+      let rows = [];
+      try {
+        rows = srcDb.prepare(`SELECT t.*, pt.track_order FROM tracks t JOIN playlist_tracks pt ON t.id = pt.track_id WHERE pt.playlist_id = ? ORDER BY pt.track_order ASC`).all(plRow.id);
+      } catch (e) {
+        // Fallback: read tracks table alone
+        try { rows = srcDb.prepare('SELECT * FROM tracks ORDER BY id ASC').all(); } catch (ee) { rows = []; }
+      }
+
+      // For each track, insert/update into main DB and add to playlist in order
+      for (const r of rows) {
+        try {
+          // Use db.addTrack which does insert/update on path
+          db.addTrack({ path: r.path, title: r.title, artist: r.artist, album: r.album, album_artist: r.album_artist, duration: r.duration, format: r.format, cover_path: r.cover_path });
+          const existing = db.getTrackByPath(r.path);
+          if (existing && newPlaylistId) db.addTrackToPlaylist(newPlaylistId, existing.id);
+        } catch (e) {
+          console.warn('Failed to import track', r.path, e);
+        }
+      }
+
+      srcDb.close();
+      return { success: true, playlistId: newPlaylistId };
+    } catch (e) {
+      console.error('playlists:import failed', e);
+      return { success: false, error: String(e) };
+    }
+  },
+  'playlists:add-track': (playlistId, trackId) => db.addTrackToPlaylist(playlistId, trackId),
+  'playlists:rename': (playlistId, name) => db.renamePlaylist(playlistId, name),
+  'playlists:delete': (playlistId) => db.deletePlaylist(playlistId),
+  'playlists:remove-track': (playlistId, trackId) => db.removeTrackFromPlaylist(playlistId, trackId),
+  'playlists:reorder': (playlistId, orderedTrackIds) => db.reorderPlaylist(playlistId, orderedTrackIds),
+  // Queue management
+  'queue:get': () => ({ queue: playbackQueue, index: queueIndex }),
+  'queue:set': (tracks) => {
+    playbackQueue = Array.isArray(tracks) ? tracks : [];
+    queueIndex = playbackQueue.length > 0 ? 0 : -1;
+    originalQueue = [...playbackQueue];
+    return { queue: playbackQueue, index: queueIndex };
+  },
+  'queue:add': (track) => {
+    playbackQueue.push(track);
+    if (queueIndex === -1) queueIndex = 0;
+    return { queue: playbackQueue, index: queueIndex };
+  },
+  'queue:remove': (index) => {
+    if (index >= 0 && index < playbackQueue.length) {
+      playbackQueue.splice(index, 1);
+      if (queueIndex >= index && queueIndex > 0) queueIndex--;
+      if (playbackQueue.length === 0) queueIndex = -1;
+    }
+    return { queue: playbackQueue, index: queueIndex };
+  },
+  'queue:clear': () => {
+    playbackQueue = [];
+    queueIndex = -1;
+    originalQueue = [];
+    return { queue: playbackQueue, index: queueIndex };
+  },
+  'queue:next': () => {
+    if (playbackQueue.length === 0) return null;
+    if (repeatMode === 'one') return playbackQueue[queueIndex];
+    queueIndex++;
+    if (queueIndex >= playbackQueue.length) {
+      if (repeatMode === 'all') queueIndex = 0;
+      else return null;
+    }
+    return playbackQueue[queueIndex];
+  },
+  'queue:previous': () => {
+    if (playbackQueue.length === 0) return null;
+    queueIndex--;
+    if (queueIndex < 0) queueIndex = playbackQueue.length - 1;
+    return playbackQueue[queueIndex];
+  },
+  // Shuffle and Repeat
+  'player:set-shuffle': (enabled) => {
+    if (enabled && !shuffleMode) {
+      // Enable shuffle: save original and shuffle current queue
+      originalQueue = [...playbackQueue];
+      const currentTrack = queueIndex >= 0 ? playbackQueue[queueIndex] : null;
+      // Fisher-Yates shuffle
+      for (let i = playbackQueue.length - 1; i > 0; i--) {
+        const j = Math.floor(Math.random() * (i + 1));
+        [playbackQueue[i], playbackQueue[j]] = [playbackQueue[j], playbackQueue[i]];
+      }
+      // Ensure current track stays at current position
+      if (currentTrack) {
+        const newIdx = playbackQueue.findIndex(t => t.id === currentTrack.id);
+        if (newIdx !== -1 && newIdx !== queueIndex) {
+          [playbackQueue[queueIndex], playbackQueue[newIdx]] = [playbackQueue[newIdx], playbackQueue[queueIndex]];
+        }
+      }
+    } else if (!enabled && shuffleMode) {
+      // Disable shuffle: restore original queue
+      const currentTrack = queueIndex >= 0 ? playbackQueue[queueIndex] : null;
+      playbackQueue = [...originalQueue];
+      if (currentTrack) {
+        queueIndex = playbackQueue.findIndex(t => t.id === currentTrack.id);
+        if (queueIndex === -1) queueIndex = 0;
+      }
+    }
+    shuffleMode = enabled;
+    return { shuffle: shuffleMode, repeat: repeatMode };
+  },
+  'player:set-repeat': (mode) => {
+    if (['off', 'all', 'one'].includes(mode)) {
+      repeatMode = mode;
+    }
+    return { shuffle: shuffleMode, repeat: repeatMode };
+  },
+  'player:get-modes': () => ({ shuffle: shuffleMode, repeat: repeatMode }),
+  // Equalizer
+  'eq:get': () => ({ enabled: eqEnabled, preset: eqPreset, bands: eqBands }),
+  'eq:set-enabled': (enabled) => {
+    eqEnabled = !!enabled;
+    return { enabled: eqEnabled, preset: eqPreset, bands: eqBands };
+  },
+  'eq:set-preset': (preset) => {
+    const presets = {
+      flat: [0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+      rock: [5, 4, 3, 1, -1, -1, 1, 3, 4, 5],
+      pop: [2, 3, 4, 3, 0, -1, -1, 0, 2, 3],
+      jazz: [3, 2, 1, 1, -1, -1, 0, 1, 2, 3],
+      classical: [4, 3, 2, 0, -1, -1, 0, 2, 3, 4],
+      bass: [6, 5, 4, 2, 0, 0, 0, 0, 0, 0],
+      treble: [0, 0, 0, 0, 0, 2, 4, 5, 6, 6],
+      vocal: [0, 1, 3, 4, 3, 1, 0, 0, 0, 0]
+    };
+    if (presets[preset]) {
+      eqPreset = preset;
+      eqBands = presets[preset];
+    }
+    return { enabled: eqEnabled, preset: eqPreset, bands: eqBands };
+  },
+  'eq:set-bands': (bands) => {
+    if (Array.isArray(bands) && bands.length === 10) {
+      eqBands = bands.map(v => Math.max(-12, Math.min(12, Number(v) || 0)));
+      eqPreset = 'custom';
+    }
+    return { enabled: eqEnabled, preset: eqPreset, bands: eqBands };
+  },
+  'player:get-state': () => getPlayerState(),
+  'lyrics:get': async (opts = {}) => {
+    const { filePath, external = false, artist, title } = opts || {};
+    if (filePath) {
+      try {
+        const embedded = await extractLyrics(filePath);
+        if (embedded && typeof embedded === 'string' && embedded !== '[object Object]') {
+          return { source: 'embedded', lyrics: embedded };
+        }
+      } catch (e) {
+        console.error('[main] extractLyrics error:', e);
+      }
+    }
+    if (external && artist && title) {
+      try {
+        const url = `https://lrclib.net/api/get?artist_name=${encodeURIComponent(artist)}&track_name=${encodeURIComponent(title)}`;
+        const res = await fetch(url, { timeout: 5000 }).catch(() => null);
+        if (res && res.ok) {
+          const body = await res.json().catch(() => null);
+          if (body) {
+            if (body.syncedLyrics) {
+              return { source: 'online', lyrics: body.syncedLyrics, isSynced: true };
+            }
+            const text = body.plainLyrics || body.lyrics; 
+            if (text) {
+              return { source: 'online', lyrics: text, isSynced: false };
+            }
+          }
+        }
+      } catch (e) {
+        console.error('[main] online lyrics fetch failed', e);
+      }
+    }
+    return { source: 'none', lyrics: null };
+  },
+  'lyrics:save': async (opts = {}) => {
+    const { trackId, lyrics } = opts || {};
+    try {
+      if (!trackId) return { success: false, error: 'missing trackId' };
+      const updated = db.updateTrackLyrics(trackId, String(lyrics || ''));
+      return { success: true, changes: updated.changes };
+    } catch (e) {
+      console.error('[main] lyrics:save failed', e);
+      return { success: false, error: String(e) };
+    }
+  },
+  'audio:pause': () => { 
+    audioEngine.pause(); 
+    emitPluginEvent('track-paused', currentTrackMetadata);
+    broadcastState(); 
+  },
+  'audio:resume': () => { 
+    audioEngine.resume(); 
+    emitPluginEvent('track-resumed', currentTrackMetadata);
+    broadcastState(); 
+  },
+  'audio:stop': () => { 
+    audioEngine.stop(); 
+    emitPluginEvent('track-stopped', currentTrackMetadata);
+    broadcastState(); 
+  },
+  'audio:set-volume': (val) => { audioEngine.setVolume(val); broadcastState(); },
+  'audio:seek': (time) => { audioEngine.seek(time); broadcastState(); },
+  'audio:get-time': () => audioEngine.getTime(),
+  'remote:toggle': (enable) => {
+      if (enable) remoteServer.start();
+      else remoteServer.stop();
+      return remoteServer.isRunning;
+  },
+  'plugins:list': async () => {
+    const plugins = [];
+    const cfg = loadPluginConfig();
+    
+    const searchDirs = [repoPluginsDir, pluginsDir];
+    const seen = new Set();
+    
+    for (const searchDir of searchDirs) {
+      if (!fs.existsSync(searchDir)) continue;
+      
+      const dirs = fs.readdirSync(searchDir, { withFileTypes: true });
+      for (const d of dirs) {
+        if (!d.isDirectory()) continue;
+        const manifestPath = path.join(searchDir, d.name, 'manifest.json');
+        if (!fs.existsSync(manifestPath)) continue;
+        
+        try {
+          const manifest = JSON.parse(fs.readFileSync(manifestPath, 'utf8'));
+          const pluginId = manifest.id || d.name;
+          
+          if (seen.has(pluginId)) continue;
+          seen.add(pluginId);
+          
+          const enabled = cfg[pluginId]?.enabled !== false;
+          const savedSettings = cfg[pluginId]?.settings || manifest.settings || {};
+          plugins.push({
+            id: pluginId,
+            enabled,
+            ...manifest,
+            settings: savedSettings,
+          });
+        } catch (e) {
+          console.error('Failed to load plugin manifest', d.name, e);
+        }
+      }
+    }
+    return plugins;
+  },
+  'plugins:set-enabled': async (id, enabled) => {
+    console.log(`[plugins] Setting plugin ${id} enabled=${enabled}`);
+    const cfg = loadPluginConfig();
+    cfg[id] = { ...(cfg[id] || {}), enabled: !!enabled };
+    console.log(`[plugins] Updated config for ${id}:`, cfg[id]);
+    savePluginConfig(cfg);
+
+    // If plugin is currently loaded and is being disabled, deactivate it now
+    try {
+      const isEnabled = !!enabled;
+      const loaded = loadedPlugins.get(id);
+      if (!isEnabled && loaded) {
+        try {
+          if (loaded.module.deactivate) {
+            console.log(`[plugins] Deactivating plugin due to disable request: ${id}`);
+            loaded.module.deactivate();
+          }
+        } catch (e) { console.error(`[plugins] Error deactivating plugin ${id}:`, e); }
+        loadedPlugins.delete(id);
+      }
+
+      // If plugin is being enabled and not yet loaded, attempt to load and activate it
+      if (isEnabled && !loaded) {
+        // Try to locate plugin folder in user plugins then repo plugins
+        const tryDirs = [pluginsDir, repoPluginsDir];
+        for (const base of tryDirs) {
+          const candidate = path.join(base, id);
+          const manifestPath = path.join(candidate, 'manifest.json');
+          if (!fs.existsSync(manifestPath)) continue;
+          try {
+            const manifest = JSON.parse(fs.readFileSync(manifestPath, 'utf8'));
+            const pluginMainPath = path.join(candidate, manifest.main || 'plugin.js');
+            if (!fs.existsSync(pluginMainPath)) continue;
+            const pluginUrl = new URL(`file:///${pluginMainPath.replace(/\\/g, '/')}`);
+            const pluginModule = await import(pluginUrl.href);
+            if (pluginModule.activate) {
+              const savedSettings = cfg[id]?.settings || manifest.settings || {};
+              const context = { settings: savedSettings, on: (event, handler) => {
+                const handlers = pluginEventHandlers.get(event);
+                if (handlers) handlers.push(handler); else pluginEventHandlers.set(event, [handler]);
+              } };
+              console.log(`[plugins] Activating plugin due to enable request: ${id}`);
+              pluginModule.activate(context);
+              loadedPlugins.set(id, { id, module: pluginModule, manifest, context });
+            }
+            break; // stop after first successful load
+          } catch (e) {
+            console.error(`[plugins] Failed to load enabled plugin ${id} from ${candidate}:`, e);
+            continue;
+          }
+        }
+      }
+    } catch (err) {
+      console.error('[plugins] Error handling set-enabled:', err);
+    }
+
+    return cfg[id];
+  },
+  'plugins:update-settings': async (id, settings) => {
+    const cfg = loadPluginConfig();
+    cfg[id] = { ...(cfg[id] || {}), settings: settings };
+    savePluginConfig(cfg);
+    // Update the loaded plugin's context settings
+    const plugin = loadedPlugins.get(id);
+    if (plugin && plugin.context) {
+      plugin.context.settings = settings;
+    }
+    return cfg[id];
+  },
+  'plugins:reload': async () => {
+    // Notify renderer so it can cleanup plugin DOM/UI before reload
+    try {
+      if (mainWindow && mainWindow.webContents) mainWindow.webContents.send('plugins:will-reload');
+    } catch (notifyErr) {
+      console.warn('Failed to notify renderer about plugin reload', notifyErr);
+    }
+    // Wait for renderer to acknowledge cleanup to avoid race conditions
+    try {
+      await new Promise((resolve) => {
+        let done = false;
+        const timeout = setTimeout(() => {
+          if (!done) {
+            done = true;
+            console.warn('[plugins] Timeout waiting for renderer cleanup ack; continuing reload');
+            resolve();
+          }
+        }, 2000); // 2s timeout
+
+        const handler = () => {
+          if (!done) {
+            done = true;
+            clearTimeout(timeout);
+            try { ipcMain.removeListener('plugins:ready-for-reload', handler); } catch (e) { console.warn('ipc removeListener failed', e); }
+            resolve();
+          }
+        };
+        try { ipcMain.once('plugins:ready-for-reload', handler); } catch (e) { console.warn('ipc once failed', e); resolve(); }
+      });
+    } catch (_) {
+      console.warn('[plugins] Error while waiting for renderer ack; continuing');
+    }
+
+    // Deactivate all plugins
+    for (const [id, plugin] of loadedPlugins) {
+      try {
+        if (plugin.module.deactivate) {
+          console.log(`[plugins] Deactivating plugin: ${id}`);
+          plugin.module.deactivate();
+        }
+      } catch (e) { console.warn('error waiting for renderer ack', e); resolve(); }
+    }
+    loadedPlugins.clear();
+    pluginEventHandlers.clear();
+    
+    // Reload plugins
+    await loadPlugins();
+    try {
+      if (mainWindow && mainWindow.webContents) mainWindow.webContents.send('plugins:reloaded');
+    } catch (notifyErr) {
+      console.warn('Failed to notify renderer after plugin reload', notifyErr);
+    }
+    return { success: true, count: loadedPlugins.size };
+  },
+  // Allow renderer/plugins to request saving/downloading a track file to disk
+  // This starts the save task and returns immediately with a download id; progress
+  // events are broadcast using `download:*` channels so UIs can subscribe.
+  'track:download': async (opts = {}) => {
+    const { filePath, suggestedName } = opts || {};
+    if (!filePath) return { success: false, error: 'missing filePath' };
+
+    const id = `dl_${Date.now()}_${Math.floor(Math.random() * 10000)}`;
+
+    // Kick off background task (do not block the IPC response)
+    (async () => {
+      try {
+        broadcast('download:start', { id, filePath, suggestedName });
+
+        const defaultName = suggestedName || path.basename(filePath);
+        const defaultDir = app.getPath('downloads') || app.getPath('home') || __dirname;
+        const { canceled, filePath: savePath } = await dialog.showSaveDialog(mainWindow, {
+          title: 'Save track as',
+          defaultPath: path.join(defaultDir, defaultName),
+          filters: [ { name: 'Audio', extensions: ['mp3','flac','wav','m4a','aac','ogg','dsf','dff'] }, { name: 'All Files', extensions: ['*'] } ]
+        });
+
+        if (canceled || !savePath) {
+          broadcast('download:canceled', { id });
+          return;
+        }
+
+        // Helper to emit progress
+        const emitProgress = (data) => broadcast('download:progress', Object.assign({ id }, data));
+
+        if (/^https?:\/\//i.test(filePath)) {
+          // Remote download with progress
+          const res = await fetch(filePath);
+          if (!res || !res.ok) {
+            broadcast('download:error', { id, error: `Download failed: ${res?.status || 'error'}` });
+            return;
+          }
+
+          const total = Number(res.headers.get && res.headers.get('content-length')) || null;
+          const writeStream = fs.createWriteStream(savePath);
+
+          const body = res.body;
+          let downloaded = 0;
+
+          if (body && typeof body.pipe === 'function') {
+            // Node-style stream
+            body.on('data', (chunk) => {
+              downloaded += chunk.length;
+              emitProgress({ downloaded, total });
+            });
+            body.on('error', (err) => broadcast('download:error', { id, error: String(err) }));
+            body.on('end', () => {
+              writeStream.end();
+              broadcast('download:complete', { id, savedPath: savePath });
+            });
+            body.pipe(writeStream);
+          } else if (body && typeof body.getReader === 'function') {
+            // WHATWG ReadableStream
+            const reader = body.getReader();
+            async function pump() {
+              while (true) {
+                const { done, value } = await reader.read();
+                if (done) break;
+                const chunk = Buffer.from(value);
+                downloaded += chunk.length;
+                writeStream.write(chunk);
+                emitProgress({ downloaded, total });
+              }
+              writeStream.end();
+              broadcast('download:complete', { id, savedPath: savePath });
+            }
+            pump().catch((err) => broadcast('download:error', { id, error: String(err) }));
+          } else {
+            // Fallback: read whole body
+            const ab = await res.arrayBuffer();
+            await fs.promises.writeFile(savePath, Buffer.from(ab));
+            broadcast('download:complete', { id, savedPath: savePath });
+          }
+        } else {
+          // Local file copy with progress
+          try {
+            const stat = await fs.promises.stat(filePath);
+            const total = stat.size;
+            const read = fs.createReadStream(filePath);
+            const write = fs.createWriteStream(savePath);
+            let copied = 0;
+            read.on('data', (chunk) => {
+              copied += chunk.length;
+              emitProgress({ downloaded: copied, total });
+            });
+            read.on('error', (err) => broadcast('download:error', { id, error: String(err) }));
+            read.on('end', () => {
+              write.end();
+              broadcast('download:complete', { id, savedPath: savePath });
+            });
+            read.pipe(write);
+          } catch (err) {
+            // If stat fails, fallback to simple copy
+            try {
+              await fs.promises.copyFile(filePath, savePath);
+              broadcast('download:complete', { id, savedPath: savePath });
+            } catch (copyErr) {
+              broadcast('download:error', { id, error: String(copyErr) });
+            }
+          }
+        }
+      } catch (e) {
+        console.error('[main] download task failed', e);
+        broadcast('download:error', { id, error: String(e && e.message ? e.message : e) });
+      }
+    })();
+
+    return { started: true, id };
+  }
+};
+
+function createTray() {
+  if (process.platform !== 'win32') return; // Only create tray on Windows for now
+  // Prefer a packaged app icon at `images/icon.png` when available; fall back to an embedded data URL.
+  let trayImage = null;
+  try {
+    const iconPath = path.join(__dirname, 'images', 'icon.png');
+    if (fs.existsSync(iconPath)) {
+      trayImage = nativeImage.createFromPath(iconPath);
+    }
+  } catch (e) {
+    // ignore
+  }
+
+  if (!trayImage) {
+    trayImage = nativeImage.createFromDataURL('data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAABAAAAAQCAYAAAAf8/9hAAAABHNCSVQICAgIfAhkiAAAAAlwSFlzAAAAdgAAAHYBTnsmCAAAABl0RVh0U29mdHdhcmUAd3d3Lmlua3NjYXBlLm9yZ5vuPBoAAAFJSURBVDiNpZO9SgNBFIW/2U0kIGKhYGVhYWVrYWOhYGNhYWNhIWLhH1hYWFhYWFhY+AAWFhYWFhYWFhYWFhYWFhYWFhY+gIWFhYWFhYVfMTPZzO4mG0jIgYGZe+6ZM/fHGGNwiQiKCCKCiKCIICIoIogIiggigvw3RASMMZgLMMZgjMEYgzEGYwzGGIwxGGMwxmCMwRiDMQZjDMYYjDH/AowxGGMwxnABxhiMMZwDjDEYYzgDGGMwxnAKMMZgjOEEYIzBGMMxwBiDMYYjgDEGYwyHAGMMxhgOAMYYjDHsA4wxGGPYAxhjMMawCzDGYIxhB2CMwRjDNsAYgzGGLYAxBmMMmwBjDMYYNgDGGIwxrAOMMRhjWAMYYzDGsAowxmCMYQVgjMEYwzLAGIMxhiWAMQZjDIsAYwzGGBYAxhiMMcwDjDEYY5gDGGMwxjAL+AA8VFf3p3YAAAAASUVORK5CYII=');
+  }
+
+  tray = new Tray(trayImage);
+  tray.setToolTip('Spectra Music Player');
+  
+  const contextMenu = Menu.buildFromTemplate([
+    {
+      label: 'Show Spectra',
+      click: () => {
+        if (mainWindow) {
+          mainWindow.show();
+          mainWindow.focus();
+        }
+      }
+    },
+    {
+      label: 'Play/Pause',
+      click: async () => {
+        try {
+          const status = await audioEngine.getStatus();
+          if (status.playing && status.paused) {
+            await audioEngine.resume();
+          } else if (status.playing) {
+            await audioEngine.pause();
+          }
+        } catch (err) {
+          console.error('Tray play/pause error:', err);
+        }
+      }
+    },
+    { type: 'separator' },
+    {
+      label: 'Quit',
+      click: () => {
+        app.isQuitting = true;
+        app.quit();
+      }
+    }
+  ]);
+  
+  tray.setContextMenu(contextMenu);
+  
+  // Double-click to show window
+  tray.on('double-click', () => {
+    if (mainWindow) {
+      mainWindow.show();
+      mainWindow.focus();
+    }
+  });
+}
+
+app.whenReady().then(async () => {
+  protocol.registerFileProtocol('plugins', (request, callback) => {
+    const url = request.url.slice('plugins://'.length);
+    
+    // Check repo plugins first (source/dev)
+    let p = path.join(repoPluginsDir, url);
+    if (fs.existsSync(p)) {
+      callback({ path: p });
+      return;
+    }
+    
+    // Check user data plugins
+    p = path.join(pluginsDir, url);
+    if (fs.existsSync(p)) {
+      callback({ path: p });
+      return;
+    }
+    
+    callback({ error: -2 });
+  });
+
+  // Load app settings so we can respect minimize-to-tray preference
+  loadAppSettings();
+
+  createWindow();
+  // Create tray only if enabled in app settings
+  if (appSettings.minimizeToTray) createTray();
+
+  // Process any files that were requested before the app was ready
+  try {
+    // Files passed on the command line at startup
+    const initialFiles = parseArgvFiles(process.argv || []);
+    for (const f of initialFiles) pendingOpenFiles.push(f);
+    // Handle queued files
+    while (pendingOpenFiles.length) {
+      const fp = pendingOpenFiles.shift();
+      await handleOpenFile(fp);
+    }
+  } catch (e) {
+    console.warn('[main] initial file open processing failed', e);
+  }
+
+  // Initialize Remote Server
+  remoteServer = new RemoteServer(path.join(__dirname, 'renderer'), async (channel, ...args) => {
+    if (handlers[channel]) {
+      return handlers[channel](...args);
+    }
+    throw new Error(`Unknown channel: ${channel}`);
+  });
+  
+  // Start remote server by default or check settings (here we start it for convenience)
+  remoteServer.start(3000);
+  
+  // Load plugins after app is ready
+  await loadPlugins();
+
+  // Register global keyboard shortcuts
+  const registerShortcuts = () => {
+    globalShortcut.register('MediaPlayPause', () => {
+      const status = audioEngine.getStatus();
+      if (status.playing && !status.paused) {
+        handlers['audio:pause']();
+      } else {
+        handlers['audio:resume']();
+      }
+    });
+    globalShortcut.register('MediaNextTrack', () => {
+      const nextTrack = handlers['queue:next']();
+      if (nextTrack) handlers['audio:play'](nextTrack.path, { track: nextTrack });
+    });
+    globalShortcut.register('MediaPreviousTrack', () => {
+      const prevTrack = handlers['queue:previous']();
+      if (prevTrack) handlers['audio:play'](prevTrack.path, { track: prevTrack });
+    });
+    globalShortcut.register('MediaStop', () => {
+      handlers['audio:stop']();
+    });
+    
+    // Custom shortcuts
+    globalShortcut.register('CommandOrControl+Shift+P', () => {
+      const status = audioEngine.getStatus();
+      if (status.playing && !status.paused) {
+        handlers['audio:pause']();
+      } else {
+        handlers['audio:resume']();
+      }
+    });
+    globalShortcut.register('CommandOrControl+Right', () => {
+      const nextTrack = handlers['queue:next']();
+      if (nextTrack) handlers['audio:play'](nextTrack.path, { track: nextTrack });
+    });
+    globalShortcut.register('CommandOrControl+Left', () => {
+      const prevTrack = handlers['queue:previous']();
+      if (prevTrack) handlers['audio:play'](prevTrack.path, { track: prevTrack });
+    });
+  };
+  
+  registerShortcuts();
+
+  app.on('activate', function () {
+    if (BrowserWindow.getAllWindows().length === 0) createWindow();
+  });
+});
+
+app.on('window-all-closed', function () {
+  if (process.platform !== 'darwin') app.quit();
+});
+
+app.on('before-quit', () => {
+  app.isQuitting = true;
+});
+
+app.on('will-quit', () => {
+  // Unregister all shortcuts
+  globalShortcut.unregisterAll();
+  
+  // Clean up system tray
+  if (tray) {
+    tray.destroy();
+    tray = null;
+  }
+  
+  // Deactivate all plugins on quit
+  for (const [id, plugin] of loadedPlugins) {
+    try {
+      if (plugin.module.deactivate) {
+        console.log(`[plugins] Deactivating plugin: ${id}`);
+        plugin.module.deactivate();
+      }
+    } catch (e) {
+      console.error(`[plugins] Error deactivating plugin ${id}:`, e);
+    }
+  }
+});
+
+// Register IPC Handlers
+for (const [channel, handler] of Object.entries(handlers)) {
+  ipcMain.handle(channel, (event, ...args) => handler(...args));
+}
+
+// Allow renderer to toggle minimize-to-tray preference (persisted)
+ipcMain.handle('app:set-minimize-to-tray', (event, enabled) => {
+  try {
+    appSettings.minimizeToTray = !!enabled;
+    if (appSettings.minimizeToTray) {
+      if (!tray) createTray();
+    } else {
+      if (tray) {
+        try { tray.destroy(); } catch (e) { console.warn('Failed to destroy tray', e); }
+        tray = null;
+      }
+    }
+    saveAppSettings();
+    return { minimizeToTray: appSettings.minimizeToTray };
+  } catch (e) {
+    console.error('[settings] app:set-minimize-to-tray handler failed', e);
+    return { error: String(e) };
+  }
+});
+
+// Specific IPC handlers that need event.sender or are local-only
+ipcMain.handle('context-menu:show-track', async (event, tracks) => {
+  // `tracks` may be a single object or an array of track objects
+  const items = Array.isArray(tracks) ? tracks : (tracks ? [tracks] : []);
+  const first = items[0] || null;
+  const template = [];
+  if (items.length === 1) {
+    template.push({
+      label: 'Edit Info',
+      click: () => { event.sender.send('track:edit', first); }
+    });
+    template.push({ type: 'separator' });
+  }
+  template.push({
+    label: items.length > 1 ? `Remove ${items.length} tracks from Library` : 'Remove from Library',
+    click: () => {
+      const ids = items.map(t => t.id).filter(Boolean);
+      if (ids.length === 1) event.sender.send('track:remove', ids[0]);
+      else event.sender.send('tracks:remove', ids);
+    }
+  });
+
+  // Add 'Add to Playlist' submenu if playlists exist
+  try {
+    const playlists = db.getAllPlaylists();
+    if (playlists && playlists.length) {
+      const submenu = playlists.map(p => ({
+        label: p.name,
+        click: () => {
+          const ids = items.map(t => t.id).filter(Boolean);
+          for (const tid of ids) {
+            try {
+              db.addTrackToPlaylist(p.id, tid);
+            } catch (err) {
+              console.error('[main] addTrackToPlaylist failed', err);
+            }
+          }
+          // Notify renderer that tracks were added
+          event.sender.send('playlist:added', { playlistId: p.id, trackIds: ids });
+        }
+      }));
+      // Add a separator and 'New playlist...' action at the end
+      submenu.push({ type: 'separator' });
+      submenu.push({
+        label: 'New playlist...',
+        click: () => {
+          const ids = items.map(t => t.id).filter(Boolean);
+          // Ask renderer to prompt for a name and create+add
+          event.sender.send('playlist:create-from-selection', { trackIds: ids });
+        }
+      });
+
+      template.push({
+        label: items.length > 1 ? `Add ${items.length} tracks to Playlist` : 'Add to Playlist',
+        submenu
+      });
+    } else {
+      // No playlists yet, provide quick 'New playlist...' option
+      template.push({
+        label: 'Add to Playlist',
+        submenu: [{
+          label: 'New playlist...',
+          click: () => {
+            const ids = items.map(t => t.id).filter(Boolean);
+            event.sender.send('playlist:create-from-selection', { trackIds: ids });
+          }
+        }]
+      });
+    }
+  } catch (err) {
+    console.error('[main] Failed to build playlist submenu', err);
+  }
+
+  // Allow plugins to add context menu items
+  for (const [id, plugin] of loadedPlugins) {
+    if (plugin.module && typeof plugin.module.getTrackContextMenuItems === 'function') {
+      try {
+        const pluginItems = await plugin.module.getTrackContextMenuItems(items, mainWindow);
+        if (Array.isArray(pluginItems) && pluginItems.length > 0) {
+          template.push({ type: 'separator' });
+          template.push(...pluginItems);
+        }
+      } catch (e) {
+        console.error(`[main] Plugin ${id} failed to provide context menu items:`, e);
+      }
+    }
+  }
+
+  const menu = Menu.buildFromTemplate(template);
+  menu.popup(BrowserWindow.fromWebContents(event.sender));
+});
+
+ipcMain.handle('library:import-file', async () => {
+  const { canceled, filePaths } = await dialog.showOpenDialog(mainWindow, {
+    properties: ['openFile', 'multiSelections'],
+    filters: [{ name: 'Audio', extensions: ['flac', 'wav', 'mp3', 'aac', 'ogg', 'm4a', 'alac', 'wma','dsf','dff', 'ape', 'dsd', 'aiff', 'caf'] }]
+  });
+
+  if (canceled) return;
+  await processFileList(filePaths);
+});
+
+ipcMain.handle('library:import-folder', async () => {
+  const { canceled, filePaths } = await dialog.showOpenDialog(mainWindow, {
+    properties: ['openDirectory']
+  });
+
+  if (canceled) return;
+  const folderPath = filePaths[0];
+  const files = await getAudioFiles(folderPath);
+  await processFileList(files);
+});
+
+ipcMain.handle('library:add-files', async (event, filePaths) => {
+  let allFiles = [];
+  for (const filePath of filePaths) {
+    const stat = await fs.promises.stat(filePath).catch(() => null);
+    if (!stat) continue;
+    
+    if (stat.isDirectory()) {
+      const dirFiles = await getAudioFiles(filePath);
+      allFiles = allFiles.concat(dirFiles);
+    } else {
+      const ext = path.extname(filePath).toLowerCase();
+      if (['.flac', '.wav', '.mp3', '.aac', '.ogg', '.m4a'].includes(ext)) {
+        allFiles.push(filePath);
+      }
+    }
+  }
+  await processFileList(allFiles);
+});
+
+ipcMain.handle('library:add-remote', async (event, remoteInfo = {}) => {
+  try {
+    const { url, title: providedTitle, artist: providedArtist, album: providedAlbum, duration: providedDuration } = remoteInfo || {};
+    if (!url) return { success: false, error: 'missing url' };
+
+    // Basic fallback track info
+    let track = {
+      path: url,
+      title: providedTitle || path.basename(url),
+      artist: providedArtist || 'Remote',
+      album: providedAlbum || '',
+      album_artist: null,
+      duration: providedDuration || 0,
+      format: 'remote',
+      cover_path: null,
+    };
+
+    // Try to fetch initial bytes of the remote file and extract metadata from buffer
+    try {
+      const fetchUrl = await resolveTrackPath(url);
+      let meta = null;
+
+      if (fetchUrl !== url && !fetchUrl.startsWith('http')) {
+        // Resolved to local file (e.g. object-storage cache)
+        meta = await extractMetadata(fetchUrl).catch(() => null);
+      } else {
+        const MAX_BYTES = 2 * 1024 * 1024; // 2 MB
+        const headers = { Range: `bytes=0-${MAX_BYTES - 1}` };
+        const res = await fetch(fetchUrl, { method: 'GET', headers, redirect: 'follow', timeout: 10000 }).catch(() => null);
+        if (res && (res.status === 206 || res.status === 200)) {
+          const ab = await res.arrayBuffer();
+          const buf = Buffer.from(ab);
+          meta = await extractMetadataFromBuffer(buf, url).catch(() => null);
+        }
+      }
+
+      if (meta) {
+        track.title = providedTitle || meta.title || track.title;
+        track.artist = providedArtist || meta.artist || track.artist;
+        track.album = providedAlbum || meta.album || track.album;
+        track.album_artist = meta.albumArtist || null;
+        track.duration = providedDuration || meta.duration || track.duration;
+        track.format = meta.format || 'remote';
+        if (meta.coverPath) track.cover_path = meta.coverPath;
+      }
+    } catch (inner) {
+      console.warn('[main] remote metadata fetch failed', inner);
+    }
+
+    const id = db.addTrack(track);
+    return { success: true, id, track: { id, ...track } };
+  } catch (e) {
+    console.error('[main] library:add-remote failed', e);
+    return { success: false, error: String(e) };
+  }
+});
+
+ipcMain.handle('window:set-fullscreen', (event, flag) => {
+  if (mainWindow) {
+    mainWindow.setFullScreen(flag);
+    mainWindow.setMenuBarVisibility(!flag);
+  }
+});
+
+// Helper to recursively get all audio files
+async function getAudioFiles(dir) {
+  let results = [];
+  async function scan(d) {
+    try {
+      const files = await fs.promises.readdir(d, { withFileTypes: true });
+      for (const file of files) {
+        const res = path.resolve(d, file.name);
+        if (file.isDirectory()) {
+          await scan(res);
+        } else {
+          const ext = path.extname(res).toLowerCase();
+          if (['.flac', '.wav', '.mp3', '.aac', '.ogg', '.m4a'].includes(ext)) {
+            results.push(res);
+          }
+        }
+      }
+    } catch (e) {
+      console.error('Error scanning directory:', d, e);
+    }
+  }
+  await scan(dir);
+  return results;
+}
+
+// Helper to process a list of files with progress
+async function processFileList(files) {
+  const total = files.length;
+  if (total === 0) return;
+
+  broadcast('import:start', { total });
+
+  for (let i = 0; i < total; i++) {
+    await processAndAddTrack(files[i]);
+    broadcast('import:progress', { 
+      current: i + 1, 
+      total, 
+      filename: path.basename(files[i]) 
+    });
+  }
+
+  broadcast('import:complete');
+}
+
+async function processAndAddTrack(filePath) {
+  // Skip if already in DB
+  const existing = db.getTrackByPath(filePath);
+  if (existing) return existing;
+
+  try {
+    const meta = await extractMetadata(filePath);
+
+    const track = {
+      path: filePath,
+      title: meta.title || path.basename(filePath, path.extname(filePath)),
+      artist: meta.artist || 'Unknown Artist',
+      album: meta.album || 'Unknown Album',
+      album_artist: meta.albumArtist || null,
+      duration: meta.duration || 0,
+      format: meta.format || path.extname(filePath).slice(1),
+      cover_path: meta.coverPath || null,
+    };
+
+    // Normalize album artist from DB if available
+    if (track.album) {
+      const normalizedAlbumArtist = db.getAlbumArtist(track.album, track.artist);
+      if (normalizedAlbumArtist) {
+        track.album_artist = normalizedAlbumArtist;
+      }
+    }
+
+    // If no cover yet, try existing DB cover for this album/artist
+    if (!track.cover_path) {
+      const existingCover = db.getAlbumCover(track.album, track.album_artist || track.artist);
+      if (existingCover) {
+        track.cover_path = existingCover;
+        console.log(`[main] Reusing existing cover for album "${track.album}": ${existingCover}`);
+      }
+    }
+
+    const id = db.addTrack(track);
+    console.log(`[main] Added track: ${track.title}, cover: ${track.cover_path}`);
+    return { id, ...track };
+  } catch (e) {
+    console.error('Failed to process track', filePath, e);
+    throw e;
+  }
+}
+
+// Plugin loading system
+async function loadPlugins() {
+  console.log('[plugins] Loading plugins...');
+  const cfg = loadPluginConfig();
+  
+  // Check both user data plugins and repo plugins (prefer user plugins)
+  const searchDirs = [pluginsDir, repoPluginsDir];
+  
+  for (const searchDir of searchDirs) {
+    if (!fs.existsSync(searchDir)) continue;
+    
+    const dirs = fs.readdirSync(searchDir, { withFileTypes: true });
+    for (const d of dirs) {
+      if (!d.isDirectory()) continue;
+      
+      const pluginDir = path.join(searchDir, d.name);
+      const manifestPath = path.join(pluginDir, 'manifest.json');
+      
+      if (!fs.existsSync(manifestPath)) continue;
+      
+      try {
+        const manifest = JSON.parse(fs.readFileSync(manifestPath, 'utf8'));
+        const pluginId = manifest.id || d.name;
+        
+        // Skip if already loaded from a different location
+        if (loadedPlugins.has(pluginId)) continue;
+        
+        // Check if plugin is enabled (default: true)
+        const enabled = cfg[pluginId]?.enabled !== false;
+        if (!enabled) {
+          console.log(`[plugins] Skipping disabled plugin: ${pluginId}`);
+          continue;
+        }
+        
+        // Load the plugin module
+        const pluginMainPath = path.join(pluginDir, manifest.main || 'plugin.js');
+        if (!fs.existsSync(pluginMainPath)) {
+          console.error(`[plugins] Plugin main file not found: ${pluginMainPath}`);
+          continue;
+        }
+        
+        // Import the plugin (ESM)
+        const pluginUrl = new URL(`file:///${pluginMainPath.replace(/\\/g, '/')}`);
+        const pluginModule = await import(pluginUrl.href);
+        
+        if (!pluginModule.activate) {
+          console.error(`[plugins] Plugin ${pluginId} missing activate function`);
+          continue;
+        }
+        
+        // Create plugin context with settings from config (or defaults from manifest)
+        const savedSettings = cfg[pluginId]?.settings || manifest.settings || {};
+        const context = {
+          settings: savedSettings,
+          on: (event, handler) => {
+            const handlers = pluginEventHandlers.get(event);
+            if (handlers) {
+              handlers.push(handler);
+            } else {
+              pluginEventHandlers.set(event, [handler]);
+            }
+          },
+          registerRemoteHandler: (channel, handler) => {
+            handlers[channel] = handler;
+          }
+        };
+        
+        // Activate the plugin
+        console.log(`[plugins] Activating plugin: ${pluginId}`);
+        pluginModule.activate(context);
+        
+        loadedPlugins.set(pluginId, {
+          id: pluginId,
+          module: pluginModule,
+          manifest,
+          context,
+        });
+        
+        console.log(`[plugins] OK Loaded plugin: ${pluginId}`);
+      } catch (e) {
+        console.error(`[plugins] Failed to load plugin ${d.name}:`, e);
+      }
+    }
+  }
+  
+  console.log(`[plugins] Loaded ${loadedPlugins.size} plugin(s)`);
+}
+
+// Plugin event system
+const pluginEventHandlers = new Map();
+
+function emitPluginEvent(eventName, data) {
+  const handlers = pluginEventHandlers.get(eventName);
+  if (!handlers || handlers.length === 0) return;
+  
+  for (const handler of handlers) {
+    try {
+      handler(data);
+    } catch (e) {
+      console.error(`[plugins] Error in ${eventName} handler:`, e);
+    }
+  }
+}
+
+

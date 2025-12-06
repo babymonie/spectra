@@ -1,0 +1,15 @@
+{
+  "id": "discord-presence",
+  "name": "Discord Rich Presence",
+  "version": "1.0.0",
+  "author": "Spectra",
+  "description": "Show what you're listening to on Discord",
+  "main": "plugin.js",
+  "settings": {
+    "showAlbum": true,
+    "showArtist": true,
+    "showTimeElapsed": true,
+    "showAlbumCover": true,
+    "largeImageText": "Spectra Player"
+  }
+}

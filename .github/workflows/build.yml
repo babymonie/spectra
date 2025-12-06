@@ -1,0 +1,64 @@
+name: Build and Package
+
+on:
+  push:
+    branches: [ main ]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      matrix:
+        platform: [windows, macos, linux]
+        include:
+          - platform: windows
+            runner: windows-latest
+          - platform: macos
+            runner: macos-latest
+          - platform: linux
+            runner: ubuntu-latest
+    env:
+      CI: true
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+
+      - name: Install build dependencies (mac)
+        if: matrix.platform == 'macos'
+        run: |
+          brew update || true
+          brew install pkg-config cmake || true
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Rebuild native addon for Electron
+        run: npx electron-rebuild -f -w exclusive_audio
+
+      - name: Package for platform
+        run: |
+          if [ "${{ matrix.platform }}" = "windows" ]; then
+            npx electron-builder --win --x64 --config.arch=x64
+          elif [ "${{ matrix.platform }}" = "macos" ]; then
+            npx electron-builder --mac --x64
+          else
+            npx electron-builder --linux --x64
+          fi
+        shell: bash
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: spectra-${{ matrix.platform }}
+          path: |
+            dist
+
+  # optional lint/test job could be added here

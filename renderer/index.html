@@ -1,0 +1,368 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Spectra</title>
+  <link rel="stylesheet" href="styles.css">
+  <link rel="stylesheet" href="settings.css">
+  <!-- Material Icons -->
+  <link href="https://fonts.googleapis.com/icon?family=Material+Icons" rel="stylesheet">
+</head>
+<body>
+  <!-- Notification Bar -->
+  <div id="notification-bar" class="notification-bar">
+    <div class="notification-content">
+      <span id="notification-message">Adding tracks...</span>
+      <div class="progress-track">
+        <div id="notification-progress" class="progress-fill"></div>
+      </div>
+      <span id="notification-count">0/0</span>
+    </div>
+  </div>
+
+  <div class="app-container">
+    <!-- Sidebar -->
+    <div class="sidebar">
+<div class="logo">
+  <img src="../images/icon.png" class="logo-icon">
+  <span>Spectra</span>
+</div>
+
+      <nav>
+        <ul>
+          <li class="active" id="nav-library"><span class="material-icons">library_music</span> Library</li>
+          <li id="nav-albums"><span class="material-icons">album</span> Albums</li>
+          <li id="nav-playlists"><span class="material-icons">queue_music</span> Playlists</li>
+          <li id="nav-settings"><span class="material-icons">settings</span> Settings</li>
+        </ul>
+      </nav>
+      <!-- sidebar playlists removed: playlists are shown on the Playlists page -->
+    </div>
+
+    <!-- Main Content -->
+    <div class="main-content">
+      <header>
+        <div class="search-bar">
+          <span class="material-icons">search</span>
+          <input type="text" id="search-input" placeholder="Search library...">
+        </div>
+        <div class="user-controls">
+          <button id="btn-import-file" class="btn-secondary">Import File</button>
+          <button id="btn-import-folder" class="btn-secondary">Import Folder</button>
+          <button id="btn-import-url" class="btn-secondary">Import URL</button>
+        </div>
+      </header>
+
+      <div id="view-library" class="view active">
+        <h2>Library</h2>
+        <div class="track-list-header">
+          <div class="col-title">Title</div>
+          <div class="col-artist">Artist</div>
+          <div class="col-album">Album</div>
+          <div class="col-duration"><span class="material-icons">schedule</span></div>
+        </div>
+        <div class="track-list" id="track-list">
+          <!-- Tracks will be injected here -->
+        </div>
+      </div>
+
+      <div id="view-albums" class="view" style="display: none;">
+        <h2>Albums</h2>
+        <div id="albums-container" class="albums-container">
+          <!-- Albums will be injected here -->
+        </div>
+      </div>
+
+      <div id="view-playlists" class="view" style="display: none;">
+        <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:20px;">
+          <h2 style="margin:0;">Playlists</h2>
+          <div style="display:flex;gap:8px;align-items:center;">
+            <button id="btn-new-playlist" class="btn-secondary"><span class="material-icons" style="vertical-align:middle;font-size:18px;margin-right:4px;">add</span> New Playlist</button>
+            <button id="btn-import-playlist" class="btn-secondary"><span class="material-icons" style="vertical-align:middle;font-size:18px;margin-right:4px;">file_upload</span> Import Playlist</button>
+          </div>
+        </div>
+        <div id="playlists-container"></div>
+      </div>
+
+      <div id="view-settings" class="view" style="display: none;">
+        <h2>Settings</h2>
+        <div class="settings-group">
+          <h3>Audio Output</h3>
+          <div class="setting-item">
+            <label for="device-select">Output Device</label>
+            <select id="device-select">
+              <option value="">Default</option>
+            </select>
+          </div>
+          <div class="setting-item">
+            <label for="mode-select">Mode</label>
+            <select id="mode-select">
+              <option value="shared">Shared</option>
+              <option value="exclusive">Exclusive</option>
+            </select>
+          </div>
+          <div class="setting-item">
+            <label for="samplerate-select">Sample Rate (Hz)</label>
+            <div style="display:flex;gap:8px;align-items:center;">
+              <select id="samplerate-select">
+                <option value="">Auto (Default)</option>
+                <option value="44100">44100</option>
+                <option value="48000">48000</option>
+                <option value="88200">88200</option>
+                <option value="96000">96000</option>
+                <option value="176400">176400</option>
+                <option value="192000">192000</option>
+                <option value="custom">Custom…</option>
+              </select>
+              <input type="number" id="samplerate-custom" placeholder="Enter sample rate" min="8000" step="1" style="display:none;width:140px;">
+            </div>
+          </div>
+          <div class="setting-item checkbox">
+            <input type="checkbox" id="bitperfect-checkbox">
+            <label for="bitperfect-checkbox">Bit Perfect</label>
+          </div>
+          <div class="setting-item checkbox">
+            <input type="checkbox" id="strict-bitperfect-checkbox">
+            <label for="strict-bitperfect-checkbox">Strict Bit Perfect</label>
+          </div>
+        </div>
+
+        <!-- Remote control moved into Misc section below -->
+
+        <div class="settings-group">
+          <h3>Misc</h3>
+          <div class="setting-item checkbox">
+            <input type="checkbox" id="remote-enable-checkbox">
+            <label for="remote-enable-checkbox">Enable Remote Output</label>
+          </div>
+          <div class="setting-item">
+             <label>Remote URL: <span id="remote-url-display">http://localhost:3000</span></label>
+          </div>
+          <div class="setting-item checkbox">
+            <input type="checkbox" id="minimize-tray-checkbox">
+            <label for="minimize-tray-checkbox">Minimize to tray when closed</label>
+          </div>
+        </div>
+
+        <div class="settings-group">
+          <h3>Plugins</h3>
+          <div style="margin-bottom: 16px;">
+            <button id="btn-reload-plugins" class="btn-secondary">Reload Plugins</button>
+          </div>
+          <div id="plugins-list" class="plugins-list"><!-- Filled dynamically --></div>
+        </div>
+      </div>
+    </div>
+
+    <!-- Now Playing Bar -->
+    <div class="now-playing-bar">
+      <div class="now-playing-info">
+        <img id="np-art" src="" alt="" class="album-art">
+        <div class="track-details">
+          <div id="np-title" class="track-title">Not Playing</div>
+          <div id="np-artist" class="track-artist"></div>
+        </div>
+      </div>
+
+      <div class="player-controls">
+        <div class="control-buttons">
+          <button id="btn-queue" class="icon-btn" title="Queue"><span class="material-icons">queue_music</span></button>
+          <button id="btn-shuffle" class="icon-btn" title="Shuffle"><span class="material-icons">shuffle</span></button>
+          <button id="btn-prev" class="icon-btn" title="Previous"><span class="material-icons">skip_previous</span></button>
+          <button id="btn-play" class="icon-btn large" title="Play/Pause"><span class="material-icons">play_circle_filled</span></button>
+          <button id="btn-next" class="icon-btn" title="Next"><span class="material-icons">skip_next</span></button>
+          <button id="btn-repeat" class="icon-btn" title="Repeat"><span class="material-icons">repeat</span></button>
+        </div>
+        <div class="progress-bar-container">
+          <span id="current-time">0:00</span>
+          <input type="range" id="seek-slider" min="0" max="100" value="0">
+          <span id="total-time">0:00</span>
+        </div>
+      </div>
+
+      <div class="volume-controls">
+        <span class="material-icons">volume_up</span>
+        <input type="range" id="volume-slider" min="0" max="100" value="100">
+      </div>
+      <div id="plugin-controls" class="plugin-controls"></div>
+    </div>
+
+    <!-- Queue Panel -->
+    <div id="queue-panel" class="queue-panel hidden">
+      <div class="queue-header">
+        <h3>Queue</h3>
+        <button id="btn-close-queue" class="icon-btn small">
+          <span class="material-icons">close</span>
+        </button>
+      </div>
+      <div class="queue-actions">
+        <button id="btn-clear-queue" class="btn-text">
+          <span class="material-icons">clear_all</span>
+          Clear Queue
+        </button>
+      </div>
+      <div id="queue-list" class="queue-list">
+        <!-- Queue items will be rendered here -->
+      </div>
+    </div>
+  </div>
+
+  <!-- Plugin Overlays -->
+  <div id="plugin-overlays"></div>
+
+  <!-- Edit Modal -->
+  <div id="edit-modal" class="modal">
+    <div class="modal-content">
+      <h3>Edit Track Info</h3>
+      <div class="form-group">
+        <label>Title</label>
+        <input type="text" id="edit-title">
+      </div>
+      <div class="form-group">
+        <label>Artist</label>
+        <input type="text" id="edit-artist">
+      </div>
+      <div class="form-group">
+        <label>Album</label>
+        <input type="text" id="edit-album">
+      </div>
+      <div class="modal-actions">
+        <button id="btn-cancel-edit" class="btn-text">Cancel</button>
+        <button id="btn-save-edit" class="btn-secondary">Save</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- Playlist Editor Modal -->
+  <div id="playlist-editor-modal" class="modal">
+    <div class="modal-content playlist-editor">
+      <div class="playlist-editor-header">
+        <input type="text" id="playlist-name-input" class="playlist-name-input" placeholder="Playlist Name">
+        <button id="btn-delete-playlist" class="btn-text danger">
+          <span class="material-icons">delete</span>
+          Delete Playlist
+        </button>
+      </div>
+      <div class="playlist-editor-tracks" id="playlist-editor-tracks">
+        <!-- Tracks will be rendered here -->
+      </div>
+      <div class="modal-actions">
+        <button id="btn-cancel-playlist-edit" class="btn-text">Cancel</button>
+        <button id="btn-save-playlist-edit" class="btn-secondary">Save Changes</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- Fullscreen Now Playing Overlay -->
+  <div id="fullscreen-player" class="fullscreen-overlay hidden">
+    <img id="fs-bg-art" class="fs-bg-art" src="" alt="">
+    <div class="fullscreen-backdrop"></div>
+    <div class="fullscreen-content">
+      <button id="fs-close" class="fs-close" aria-label="Close">✕</button>
+      <div class="fs-left">
+        <img id="fs-art" class="fs-art" src="" alt="Album art">
+        
+        <div class="fs-progress-container">
+           <span id="fs-current-time">0:00</span>
+           <div class="fs-progress-bar">
+             <div id="fs-progress-fill" class="fs-progress-fill"></div>
+           </div>
+           <span id="fs-total-time">0:00</span>
+        </div>
+
+        <div class="fs-meta">
+          <div id="fs-title" class="fs-title">Title</div>
+          <div id="fs-artist" class="fs-artist">Artist</div>
+        </div>
+
+        <div class="fs-controls">
+          <button id="fs-btn-shuffle" class="icon-btn" title="Shuffle"><span class="material-icons">shuffle</span></button>
+          <button id="fs-btn-prev" class="icon-btn large" title="Previous"><span class="material-icons">skip_previous</span></button>
+          <button id="fs-btn-play" class="icon-btn large" title="Play/Pause"><span class="material-icons">play_circle_filled</span></button>
+          <button id="fs-btn-next" class="icon-btn large" title="Next"><span class="material-icons">skip_next</span></button>
+          <button id="fs-btn-repeat" class="icon-btn" title="Repeat"><span class="material-icons">repeat</span></button>
+        </div>
+
+        <!-- Equalizer Panel -->
+        <div class="fs-eq-panel">
+          <div class="fs-eq-header">
+            <label class="eq-toggle">
+              <input type="checkbox" id="fs-eq-enabled">
+              <span>Equalizer</span>
+            </label>
+            <select id="fs-eq-preset" class="eq-preset-select">
+              <option value="flat">Flat</option>
+              <option value="rock">Rock</option>
+              <option value="pop">Pop</option>
+              <option value="jazz">Jazz</option>
+              <option value="classical">Classical</option>
+              <option value="bass">Bass Boost</option>
+              <option value="treble">Treble Boost</option>
+              <option value="vocal">Vocal</option>
+              <option value="custom">Custom</option>
+            </select>
+          </div>
+          <div class="fs-eq-sliders" id="fs-eq-sliders">
+            <div class="eq-band">
+              <input type="range" min="-12" max="12" value="0" step="0.5" class="eq-slider" data-band="0">
+              <label>32Hz</label>
+            </div>
+            <div class="eq-band">
+              <input type="range" min="-12" max="12" value="0" step="0.5" class="eq-slider" data-band="1">
+              <label>64Hz</label>
+            </div>
+            <div class="eq-band">
+              <input type="range" min="-12" max="12" value="0" step="0.5" class="eq-slider" data-band="2">
+              <label>125Hz</label>
+            </div>
+            <div class="eq-band">
+              <input type="range" min="-12" max="12" value="0" step="0.5" class="eq-slider" data-band="3">
+              <label>250Hz</label>
+            </div>
+            <div class="eq-band">
+              <input type="range" min="-12" max="12" value="0" step="0.5" class="eq-slider" data-band="4">
+              <label>500Hz</label>
+            </div>
+            <div class="eq-band">
+              <input type="range" min="-12" max="12" value="0" step="0.5" class="eq-slider" data-band="5">
+              <label>1kHz</label>
+            </div>
+            <div class="eq-band">
+              <input type="range" min="-12" max="12" value="0" step="0.5" class="eq-slider" data-band="6">
+              <label>2kHz</label>
+            </div>
+            <div class="eq-band">
+              <input type="range" min="-12" max="12" value="0" step="0.5" class="eq-slider" data-band="7">
+              <label>4kHz</label>
+            </div>
+            <div class="eq-band">
+              <input type="range" min="-12" max="12" value="0" step="0.5" class="eq-slider" data-band="8">
+              <label>8kHz</label>
+            </div>
+            <div class="eq-band">
+              <input type="range" min="-12" max="12" value="0" step="0.5" class="eq-slider" data-band="9">
+              <label>16kHz</label>
+            </div>
+          </div>
+        </div>
+      </div>
+      <div class="fs-right">
+        <div class="fs-lyrics-toolbar">
+          <button id="fs-edit-lyrics" class="btn-text">Edit</button>
+        </div>
+        <div id="fs-lyrics" class="fs-lyrics">No lyrics available</div>
+        <div id="fs-lyrics-editor" class="fs-lyrics-editor hidden">
+          <textarea id="fs-lyrics-textarea" rows="10" placeholder="Paste or edit lyrics here"></textarea>
+          <div class="fs-lyrics-actions">
+            <button id="fs-lyrics-save" class="btn-secondary">Save</button>
+            <button id="fs-lyrics-cancel" class="btn-text">Cancel</button>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <script src="renderer.js" type="module"></script>
+</body>
+</html>
