@@ -144,6 +144,26 @@ Includes:
   * Real-time playback state
   * Invoke API for remote commands
 
+## Plugins & Remote
+- See `plugins/README.md` for details (Discord Presence, Object Storage, Last.fm).
+- Plugin API docs: `plugins/API_DOCS.md` — describes `manifest.json`, `plugin.js` lifecycle, `context.invoke` channels, events and examples.
+- Remote server: `remoteServer.js` (Express + Socket.IO) serves UI and provides invoke API.
+
+Plugin setup (quick steps)
+
+1. Copy the plugin folder into the repository `plugins/` directory (e.g. `plugins/my-plugin`).
+2. If the plugin has a `package.json`, install its dependencies:
+
+```powershell
+cd plugins\my-plugin
+npm install
+```
+
+3. Restart Spectra (or reload plugins from the app settings) and enable the plugin in Settings → Plugins.
+
+Notes:
+- Plugins should include a valid `manifest.json` and export `activate(context)` from `plugin.js`.
+- Use `plugins/API_DOCS.md` for recommended `context` usage and example code.
 Launches automatically when user enables it in settings.
 
 ---
