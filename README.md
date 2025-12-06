@@ -5,6 +5,8 @@ A high-quality desktop audio player built with **Electron**, featuring native ex
 
 ![Screenshot](images/screenshot.png)
 
+Download binaries, installers and extras at: https://spectra.f4ust.com — download for free.
+
 ---
 
 ## **✨ Features**
@@ -164,14 +166,17 @@ Launches automatically when user enables it in settings.
 
 ---
 
-## **💎 Roadmap / Paid Features (Planned)**
+## **💎 Paid Features (coming next year)**
 
-These are future premium extensions:
+The core Spectra player and most features are available for free. Planned paid additions targeted for next year include:
 
-* 🎧 **ASIO driver plugin** (Windows native audio with ultra-low latency)
-* 📱 **Advanced remote mobile app** (iOS / Android)
-* 💿 **CD ripping module** (secure rip with FLAC/ALAC/MP3 encoding)
-* 🎨 **Custom themes / full skinning engine**
+- Full ASIO driver support (Windows)
+- Dedicated ASIO driver plugin
+- CD ripping plugin (FLAC, WAV, MP3 pipelines + metadata lookup)
+- Mobile Remote App (Wi‑Fi control of the player)
+- Themes system (dark/light/color themes, paid-only unlocks)
+- Last.fm plugin integration (pending)
+- Improved album organization and metadata correction tools
 
 ---
 
