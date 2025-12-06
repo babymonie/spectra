@@ -1,146 +1,136 @@
-# **Spectra Source-Available License**
+Spectra Source-Available License
+Version 1.0 — January 2025
+Copyright © 2025 Aloysius (“babymonie”). All rights reserved.
 
-**Version 1.0 — January 2025**
-**Copyright © 2025 Aloysius (“babymonie”). All rights reserved.**
+1. Definitions
 
-## **1. Definitions**
+“Software” refers to the Spectra application, including but not limited to source code, compiled binaries, assets, documentation, build scripts, plugins, configuration files, and all intellectual property contained within the repository.
 
-* **“Software”** refers to the Spectra application, including but not limited to source code, compiled binaries, assets, documentation, build scripts, plugins, configuration files, and all intellectual property contained within the repository.
-* **“Author”** refers to Aloysius (“babymonie”), the sole copyright holder.
-* **“User”** refers to any individual who accesses, views, clones, downloads, compiles, or runs the Software.
-* **“Personal Use”** means use by an individual **solely on their own equipment**, for private, non-commercial purposes.
+“Author” refers to Aloysius (“babymonie”), the sole copyright holder.
 
----
+“User” refers to any individual who accesses, views, clones, downloads, compiles, or runs the Software.
 
-## **2. Grant of Permission**
+“Personal Use” means use by an individual solely on their own equipment, for private, non-commercial purposes.
+
+-----------------------------------------------------------------------
+
+2. Grant of Permission
 
 Subject to full compliance with this License, the Author grants the User the following limited rights:
 
-1. **Right to View**
-   The User may access and view the source code for personal education, research, or curiosity.
+2.1. Right to View  
+The User may access and view the source code for personal education, research, or curiosity.
 
-2. **Right to Study**
-   The User may analyze the Software’s architecture, design, implementation, and techniques **for learning purposes only**.
+2.2. Right to Study  
+The User may analyze the Software’s architecture, design, implementation, and techniques for learning purposes only.
 
-3. **Right to Execute**
-   The User may compile and run the Software on their own personal computer for private use.
+2.3. Right to Execute  
+The User may compile and run the Software on their own personal computer for private use.
 
-These rights are **non-exclusive, non-transferable, revocable**, and granted **solely for Personal Use**.
+These rights are non-exclusive, non-transferable, revocable, and granted solely for Personal Use.
 
----
+-----------------------------------------------------------------------
 
-## **3. Prohibited Actions**
+3. Prohibited Actions
 
-The User **may not**, under any circumstances, perform any of the following:
+The User may not, under any circumstances, perform any of the following actions:
 
-### **3.1 Modification Restrictions**
+3.1. Modification Restrictions  
+The User may not modify, alter, patch, translate, or create derivative works of the Software.  
+This includes but is not limited to:
+- Forking the repository  
+- Changing or editing source files  
+- Merging the Software with other software  
+- Extracting, copying, or reusing components of the Software  
 
-* Modify, alter, patch, translate, or create derivative works of the Software.
-  This includes:
-* Forking the repository
-* Changing source files
-* Merging with other software
-* Extracting or reusing components
+3.2. Distribution Restrictions  
+The User may not redistribute the Software or any portion of it.  
+This includes but is not limited to:
+- Uploading or mirroring the Software publicly  
+- Publishing modified or unmodified versions  
+- Hosting the Software online, including remote client versions  
 
-### **3.2 Distribution Restrictions**
+These restrictions apply to:
+- Source code  
+- Compiled binaries  
+- Screenshots or recordings  
+- Assets or artwork  
+- Documentation or internal text  
 
-The User may NOT:
+3.3. Commercial Restrictions  
+The User may not sell, rent, lease, license, or commercialize the Software.  
+Use of the Software for business, institutional, governmental, or organizational purposes is prohibited.  
+The Software may not be included in commercial or non-commercial packages.
 
-* Redistribute the Software or any portion of it
-* Upload or mirror the Software publicly
-* Publish modified or unmodified versions
-* Host the Software online (including any remote client versions)
+3.4. Sub-licensing Restrictions  
+The User may not grant rights to others, sublicense the Software, distribute copies, or circumvent the restrictions of this License.
 
-This applies to:
+-----------------------------------------------------------------------
 
-* Source code
-* Binaries
-* Screenshots
-* Assets
-* Documentation
+4. Intellectual Property
 
-### **3.3 Commercial Restrictions**
+All intellectual property rights are retained by the Author.  
+The Software is not open-source despite having visible source code.
 
-The User may NOT:
+Nothing in this License shall be interpreted as transferring ownership, granting perpetual rights, or waiving any rights belonging to the Author.
 
-* Sell, rent, lease, license, or commercialize the Software
-* Use the Software for business, institutional, or organizational purposes
-* Include the Software in commercial or non-commercial packages
+-----------------------------------------------------------------------
 
-### **3.4 Sub-licensing Restrictions**
+5. Termination
 
-The User may not:
+Any violation of this License results in the immediate termination of all granted rights.
 
-* Grant rights to others
-* Provide access to third parties
-* Circumvent restrictions of this License
-
-## **4. Intellectual Property**
-
-All intellectual property rights are retained by the Author.
-The Software is **not open-source** despite having visible source code.
-
-Nothing in this License shall be interpreted as:
-
-* Transferring ownership
-* Granting long-term or perpetual rights
-* Waiving any of the Author’s rights
-
----
-
-## **5. Termination**
-
-Any violation of this License results in the **immediate termination** of all granted rights.
 Upon termination, the User must:
-
-1. Delete all copies of the Software
-2. Cease all use
-3. Not attempt to regain access through new accounts or redistribution
+1. Delete all copies of the Software in their possession  
+2. Cease all use of the Software  
+3. Not attempt to regain access through redistribution or alternate accounts  
 
 The Author reserves the right to pursue legal remedies where applicable.
 
----
+-----------------------------------------------------------------------
 
-## **6. No Warranty**
+6. No Warranty
 
-THE SOFTWARE IS PROVIDED “AS IS”, WITHOUT WARRANTY OF ANY KIND.
-THE AUTHOR DISCLAIMS ALL LIABILITY FOR:
-
-* Loss of data
-* Damages of any kind
-* Hardware or software malfunction
-* Security vulnerabilities
-* Incorrect behavior or audio output defects
+THE SOFTWARE IS PROVIDED “AS IS”, WITHOUT WARRANTY OF ANY KIND.  
+THE AUTHOR DISCLAIMS ALL LIABILITY FOR ANY DAMAGES OR LOSSES ARISING FROM THE USE OF THE SOFTWARE, INCLUDING BUT NOT LIMITED TO:
+- Loss of data  
+- Hardware or software malfunction  
+- Security vulnerabilities  
+- Incorrect behavior or defective audio output  
 
 The User assumes all risks associated with running the Software.
 
----
+-----------------------------------------------------------------------
 
-## **7. No Support Obligation**
+7. No Support Obligation
 
-The Author is **not required** to:
+The Author is not required to:
+- Provide updates  
+- Fix bugs  
+- Maintain compatibility  
+- Offer technical support  
+- Continue development  
 
-* Provide updates
-* Fix bugs
-* Maintain compatibility
-* Offer technical support
-* Continue development
+The Software may be altered, unpublished, or discontinued at any time.
 
-The Software may be modified, unpublished, or discontinued at any time.
+-----------------------------------------------------------------------
 
----
+8. Governing Law
 
+This License is governed by the laws of the Author’s country of residence.  
+Any legal disputes shall be handled exclusively in that jurisdiction.
 
-## **9. Entire Agreement**
+-----------------------------------------------------------------------
 
-This License constitutes the complete agreement between the User and the Author.
+9. Entire Agreement
+
+This License constitutes the complete agreement between the User and the Author.  
 No additional rights are granted, whether implied or explicit.
 
----
+-----------------------------------------------------------------------
 
-## **10. Acceptance**
+10. Acceptance
 
 By downloading, viewing, cloning, copying, compiling, or running the Software, the User acknowledges and agrees to all terms of this License.
 
 If the User does not agree, they must not download, access, or use the Software.
-
