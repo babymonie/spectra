@@ -1,7 +1,3 @@
-Here is an **improved, corrected, fully polished version** of your Spectra README.
-Everything is rewritten to look **professional, clean, and ready for GitHub** — with clearer sections, consistent terminology, corrected build steps, better explanations, and improved formatting.
-
----
 
 # **Spectra**
 
