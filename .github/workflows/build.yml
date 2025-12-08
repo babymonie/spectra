@@ -3,21 +3,48 @@ name: Build and Package
 on:
   push:
     branches: [ main ]
+  pull_request:
+    branches: [ main ]
   workflow_dispatch:
 
 jobs:
-  build:
-    runs-on: ${{ matrix.runner }}
-    strategy:
-      matrix:
-        platform: [windows, macos, linux]
-        include:
-          - platform: windows
-            runner: windows-latest
-          - platform: macos
-            runner: macos-latest
-          - platform: linux
-            runner: ubuntu-latest
+  build-windows:
+    runs-on: windows-latest
+    env:
+      CI: true
+      CSC_IDENTITY_AUTO_DISCOVERY: false
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Rebuild native addon for Electron
+        run: npx electron-rebuild -f
+
+      - name: Package for Windows
+        run: npm run package
+
+      - name: Upload Windows artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: spectra-windows
+          path: |
+            dist/*.exe
+            dist/*.nsis.*
+          retention-days: 30
+
+  build-linux:
+    runs-on: ubuntu-latest
+    needs: build-windows
     env:
       CI: true
 
@@ -31,8 +58,42 @@ jobs:
           node-version: '20'
           cache: 'npm'
 
-      - name: Install build dependencies (mac)
-        if: matrix.platform == 'macos'
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Rebuild native addon for Electron
+        run: npx electron-rebuild -f
+
+      - name: Package for Linux
+        run: npx electron-builder --linux
+
+      - name: Upload Linux artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: spectra-linux
+          path: |
+            dist/*.AppImage
+            dist/*.deb
+            dist/*.rpm
+          retention-days: 30
+
+  build-macos:
+    runs-on: macos-latest
+    needs: build-linux
+    env:
+      CI: true
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+
+      - name: Install build dependencies
         run: |
           brew update || true
           brew install pkg-config cmake || true
@@ -41,24 +102,16 @@ jobs:
         run: npm ci
 
       - name: Rebuild native addon for Electron
-        run: npx electron-rebuild -f -w exclusive_audio
+        run: npx electron-rebuild -f
 
-      - name: Package for platform
-        run: |
-          if [ "${{ matrix.platform }}" = "windows" ]; then
-            npx electron-builder --win --x64 --config.arch=x64
-          elif [ "${{ matrix.platform }}" = "macos" ]; then
-            npx electron-builder --mac --x64
-          else
-            npx electron-builder --linux --x64
-          fi
-        shell: bash
+      - name: Package for macOS
+        run: npx electron-builder --mac
 
-      - name: Upload artifacts
+      - name: Upload macOS artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: spectra-${{ matrix.platform }}
+          name: spectra-macos
           path: |
-            dist
-
-  # optional lint/test job could be added here
+            dist/*.dmg
+            dist/*.zip
+          retention-days: 30
