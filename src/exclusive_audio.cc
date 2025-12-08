@@ -1942,15 +1942,13 @@ static Napi::Array GetAlsaDevices(const Napi::Env &env) {
                     Napi::Object dev = Napi::Object::New(env);
                     dev.Set("id", Napi::String::New(env, deviceName));
                     dev.Set("name", Napi::String::New(env, deviceDesc));
-                    dev.Set("isDefault", Napi::Boolean::New(env, false));
-                    
-                    Napi::Array devRates = Napi::Array::New(env);
-                    devRates.Set(0, Napi::Number::New(env, 44100));
-                    devRates.Set(1, Napi::Number::New(env, 48000));
-                    devRates.Set(2, Napi::Number::New(env, 96000));
-                    dev.Set("sampleRates", devRates);
-                    
-                    arr.Set(outIdx++, dev);
+                dev.Set("isDefault", Napi::Boolean::New(env, false));
+                
+                Napi::Array devRates = Napi::Array::New(env);
+                devRates.Set((uint32_t)0, Napi::Number::New(env, 44100));
+                devRates.Set((uint32_t)1, Napi::Number::New(env, 48000));
+                devRates.Set((uint32_t)2, Napi::Number::New(env, 96000));
+                dev.Set("sampleRates", devRates);                    arr.Set(outIdx++, dev);
                 }
             }
             
