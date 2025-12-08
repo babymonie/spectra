@@ -28,7 +28,7 @@ jobs:
         run: npm ci
 
       - name: Rebuild native addon for Electron
-        run: npx electron-rebuild -f
+        run: npx @electron/rebuild -f
 
       - name: Package for Windows
         run: npm run package
@@ -68,7 +68,7 @@ jobs:
         run: npm ci
 
       - name: Rebuild native addon for Electron
-        run: npx electron-rebuild -f
+        run: npx @electron/rebuild -f
 
       - name: Package for Linux
         run: npx electron-builder --linux --publish never
@@ -94,6 +94,11 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
       - name: Setup Node.js
         uses: actions/setup-node@v4
         with:
@@ -109,7 +114,7 @@ jobs:
         run: npm ci
 
       - name: Rebuild native addon for Electron
-        run: npx electron-rebuild -f
+        run: npx @electron/rebuild -f
 
       - name: Package for macOS
         run: npx electron-builder --mac --publish never
