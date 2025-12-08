@@ -243,8 +243,8 @@ function createWindow() {
       webSecurity: false // Allow loading local resources (cover art)
     },
     backgroundColor: '#121212',
-    // Platform-specific title bar: hidden on macOS, default on Windows, frameless on Linux
-    ...(process.platform === 'darwin' ? { titleBarStyle: 'hidden' } : {}),
+    // Platform-specific title bar: hiddenInset on macOS for draggable region, default on Windows, frameless on Linux
+    ...(process.platform === 'darwin' ? { titleBarStyle: 'hiddenInset', trafficLightPosition: { x: 10, y: 10 } } : {}),
     ...(process.platform === 'linux' ? { frame: false } : {})
   });
 

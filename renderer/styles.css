@@ -161,7 +161,8 @@ header {
   align-items: center;
   margin-bottom: 32px;
   -webkit-app-region: drag; /* Make header draggable on macOS/Linux */
-  padding-top: 8px; /* Extra space for dragging on macOS */
+  padding-top: 12px; /* Extra space for dragging on macOS */
+  padding-left: 80px; /* Space for macOS traffic lights */
 }
 
 .user-controls {
@@ -1456,4 +1457,11 @@ input[type="range"]:hover::-webkit-slider-runnable-track {
   display: flex; 
   gap: 12px; 
   justify-content: flex-end;
+}
+
+/* macOS-specific: Remove traffic light padding on Windows/Linux */
+@media not all and (prefers-color-scheme) {
+  header {
+    padding-left: 40px !important;
+  }
 }
