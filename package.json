@@ -5,6 +5,7 @@
   "main": "main.js",
   "scripts": {
     "start": "electron .",
+    "setup": "powershell -NoProfile -ExecutionPolicy Bypass -File ./scripts/setup.ps1",
     "build": "powershell -NoProfile -ExecutionPolicy Bypass -File ./scripts/build.ps1",
     "package": "electron-builder",
     "build:electron": "powershell -NoProfile -ExecutionPolicy Bypass -File ./scripts/build.ps1 -mode electron",
@@ -36,7 +37,11 @@
     },
     "files": [
       "**/*",
-      "!node_modules/*/{CHANGELOG.md,README.md,README,readme.md,readme}"
+      "!node_modules/*/{CHANGELOG.md,README.md,README,readme.md,readme}",
+      "node_modules/ffmpeg-static/**/*"
+    ],
+    "asarUnpack": [
+      "node_modules/ffmpeg-static/**/*"
     ],
     "mac": {
       "target": [
