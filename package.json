@@ -57,7 +57,8 @@
     "linux": {
       "target": [
         "AppImage"
-      ]
+      ],
+      "category": "AudioVideo;Audio;Player"
     },
     "nsis": {
       "oneClick": false,
