@@ -706,8 +706,8 @@ const loadLibrary = async () => {
   let base = libraryCache;
   if (currentAlbumFilter && currentAlbumFilter.album) {
     base = libraryCache.filter(t => {
-      const trackAlbum = (t.album || '').toString().toLowerCase();
-      const trackArtist = (t.artist || '').toString().toLowerCase();
+      const trackAlbum = (t.album || '').toString().trim().toLowerCase();
+      const trackArtist = (t.artist || '').toString().trim().toLowerCase();
       if (currentAlbumFilter.artist) {
         return trackAlbum === currentAlbumFilter.album && trackArtist === currentAlbumFilter.artist;
       }
@@ -797,15 +797,25 @@ function renderAlbums() {
       card.onclick = ((albumToFilter) => {
         return async () => {
           const allTracks = await electron.getLibrary();
-          const nameToMatch = (albumToFilter.album || albumToFilter.name || '').toLowerCase();
-          const artistToMatch = (albumToFilter.artist || albumToFilter.artist_name || '').toLowerCase() || null;
+          // Get album name, handling both 'album' and 'name' properties
+          const albumNameRaw = albumToFilter.album || albumToFilter.name || '';
+          const nameToMatch = albumNameRaw.toString().trim().toLowerCase();
+          
+          const artistNameRaw = albumToFilter.artist || albumToFilter.artist_name || '';
+          const artistToMatch = artistNameRaw.toString().trim().toLowerCase() || null;
+
+          // Don't filter if album name is empty
+          if (!nameToMatch) {
+            console.warn('Album click: empty album name, skipping filter');
+            return;
+          }
 
           // Set the global album filter so searches are scoped to this album
           currentAlbumFilter = { album: nameToMatch, artist: artistToMatch };
 
           tracks = allTracks.filter(t => {
-            const trackAlbum = (t.album || '').toString().toLowerCase();
-            const trackArtist = (t.artist || '').toString().toLowerCase();
+            const trackAlbum = (t.album || '').toString().trim().toLowerCase();
+            const trackArtist = (t.artist || '').toString().trim().toLowerCase();
             if (artistToMatch) {
               return trackAlbum === nameToMatch && trackArtist === artistToMatch;
             }
