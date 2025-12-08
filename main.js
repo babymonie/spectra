@@ -4,7 +4,7 @@ import path from 'path';
 import { fileURLToPath } from 'url';
 import fs from 'fs';
 import audioEngine from './audioEngine.js';
-import Database from 'better-sqlite3';
+import initSqlJs from 'sql.js';
 import { extractMetadata, extractMetadataFromBuffer } from './metadataLookup.js';
 import { extractLyrics } from './metadataLookup.js';
 import db from './database.js';
@@ -243,7 +243,9 @@ function createWindow() {
       webSecurity: false // Allow loading local resources (cover art)
     },
     backgroundColor: '#121212',
-    titleBarStyle: 'hiddenInset' // Mac style, looks okay on Windows too usually or just remove
+    // Platform-specific title bar: hidden on macOS, default on Windows, frameless on Linux
+    ...(process.platform === 'darwin' ? { titleBarStyle: 'hidden' } : {}),
+    ...(process.platform === 'linux' ? { frame: false } : {})
   });
 
   // Handle minimize to tray on Windows
@@ -436,27 +438,28 @@ const handlers = {
       if (canceled || !filePath) return { success: false, canceled: true };
 
       // Create a new sqlite DB at the chosen path and populate with playlist + tracks
-      const outDb = new Database(filePath);
-      outDb.exec(`
+      const SQL = await initSqlJs();
+      const outDb = new SQL.Database();
+      outDb.run(`
         CREATE TABLE playlists (id INTEGER PRIMARY KEY, name TEXT NOT NULL, created_at DATETIME, updated_at DATETIME);
         CREATE TABLE tracks (id INTEGER PRIMARY KEY, path TEXT UNIQUE NOT NULL, title TEXT, artist TEXT, album TEXT, album_artist TEXT, duration REAL, format TEXT, cover_path TEXT, lyrics TEXT, created_at DATETIME);
         CREATE TABLE playlist_tracks (playlist_id INTEGER, track_id INTEGER, track_order INTEGER, PRIMARY KEY (playlist_id, track_id));
       `);
 
       // Insert playlist row (keep original id for portability)
-      const insertPl = outDb.prepare('INSERT INTO playlists (id, name, created_at, updated_at) VALUES (?, ?, ?, ?)');
-      insertPl.run(pl.id, pl.name, pl.created_at || null, pl.updated_at || pl.created_at || null);
+      outDb.run('INSERT INTO playlists (id, name, created_at, updated_at) VALUES (?, ?, ?, ?)', [pl.id, pl.name, pl.created_at || null, pl.updated_at || pl.created_at || null]);
 
       // Insert tracks and playlist_tracks
       const tracks = db.getPlaylistTracks(playlistId) || [];
-      const insertTrack = outDb.prepare(`INSERT INTO tracks (id, path, title, artist, album, album_artist, duration, format, cover_path, lyrics, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`);
-      const insertPT = outDb.prepare('INSERT INTO playlist_tracks (playlist_id, track_id, track_order) VALUES (?, ?, ?)');
       let order = 1;
       for (const t of tracks) {
-        insertTrack.run(t.id, t.path, t.title || null, t.artist || null, t.album || null, t.album_artist || null, t.duration || null, t.format || null, t.cover_path || null, t.lyrics || null, t.created_at || null);
-        insertPT.run(pl.id, t.id, order++);
+        outDb.run('INSERT INTO tracks (id, path, title, artist, album, album_artist, duration, format, cover_path, lyrics, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)', [t.id, t.path, t.title || null, t.artist || null, t.album || null, t.album_artist || null, t.duration || null, t.format || null, t.cover_path || null, t.lyrics || null, t.created_at || null]);
+        outDb.run('INSERT INTO playlist_tracks (playlist_id, track_id, track_order) VALUES (?, ?, ?)', [pl.id, t.id, order++]);
       }
 
+      // Export to file
+      const data = outDb.export();
+      fs.writeFileSync(filePath, data);
       outDb.close();
       return { success: true, path: filePath };
     } catch (e) {
@@ -475,10 +478,16 @@ const handlers = {
       const impPath = filePaths[0];
 
       // Open provided sqlite file and read playlist + tracks
-      const srcDb = new Database(impPath, { readonly: true });
+      const SQL = await initSqlJs();
+      const buffer = fs.readFileSync(impPath);
+      const srcDb = new SQL.Database(buffer);
+      
       // Read playlists (take first)
-      const plRow = srcDb.prepare('SELECT * FROM playlists ORDER BY id LIMIT 1').get();
-      if (!plRow) { srcDb.close(); return { success: false, error: 'No playlist data found' }; }
+      const stmt1 = srcDb.prepare('SELECT * FROM playlists ORDER BY id LIMIT 1');
+      stmt1.step();
+      const plRow = stmt1.getAsObject();
+      stmt1.free();
+      if (!plRow || !plRow.id) { srcDb.close(); return { success: false, error: 'No playlist data found' }; }
 
       // Create playlist in main DB
       const res = db.createPlaylist(plRow.name || 'Imported Playlist');
@@ -486,10 +495,21 @@ const handlers = {
       // Read tracks joined to playlist_tracks if available
       let rows = [];
       try {
-        rows = srcDb.prepare(`SELECT t.*, pt.track_order FROM tracks t JOIN playlist_tracks pt ON t.id = pt.track_id WHERE pt.playlist_id = ? ORDER BY pt.track_order ASC`).all(plRow.id);
+        const stmt2 = srcDb.prepare(`SELECT t.*, pt.track_order FROM tracks t JOIN playlist_tracks pt ON t.id = pt.track_id WHERE pt.playlist_id = ? ORDER BY pt.track_order ASC`);
+        stmt2.bind([plRow.id]);
+        while (stmt2.step()) {
+          rows.push(stmt2.getAsObject());
+        }
+        stmt2.free();
       } catch (e) {
         // Fallback: read tracks table alone
-        try { rows = srcDb.prepare('SELECT * FROM tracks ORDER BY id ASC').all(); } catch (ee) { rows = []; }
+        try {
+          const stmt3 = srcDb.prepare('SELECT * FROM tracks ORDER BY id ASC');
+          while (stmt3.step()) {
+            rows.push(stmt3.getAsObject());
+          }
+          stmt3.free();
+        } catch (ee) { rows = []; }
       }
 
       // For each track, insert/update into main DB and add to playlist in order
@@ -1484,6 +1504,73 @@ async function processAndAddTrack(filePath) {
 }
 
 // Plugin loading system
+async function checkPluginDependencies(pluginDir, pluginId) {
+  const packageJsonPath = path.join(pluginDir, 'package.json');
+  
+  // If no package.json, no dependencies to check
+  if (!fs.existsSync(packageJsonPath)) {
+    return;
+  }
+  
+  try {
+    const packageJson = JSON.parse(fs.readFileSync(packageJsonPath, 'utf8'));
+    const dependencies = packageJson.dependencies || {};
+    
+    // If no dependencies defined, nothing to do
+    if (Object.keys(dependencies).length === 0) {
+      return;
+    }
+    
+    // Check if node_modules exists and has the required packages
+    const nodeModulesPath = path.join(pluginDir, 'node_modules');
+    let needsInstall = !fs.existsSync(nodeModulesPath);
+    
+    if (!needsInstall) {
+      // Check if all dependencies are installed
+      for (const dep of Object.keys(dependencies)) {
+        const depPath = path.join(nodeModulesPath, dep);
+        if (!fs.existsSync(depPath)) {
+          needsInstall = true;
+          break;
+        }
+      }
+    }
+    
+    if (needsInstall) {
+      console.log(`[plugins] Installing dependencies for ${pluginId}...`);
+      
+      // Run npm install in the plugin directory
+      const { spawn } = await import('child_process');
+      
+      await new Promise((resolve) => {
+        const npmCmd = process.platform === 'win32' ? 'npm.cmd' : 'npm';
+        const installProcess = spawn(npmCmd, ['install'], {
+          cwd: pluginDir,
+          stdio: 'inherit',
+          shell: true
+        });
+        
+        installProcess.on('close', (code) => {
+          if (code === 0) {
+            console.log(`[plugins] Dependencies installed for ${pluginId}`);
+            resolve();
+          } else {
+            console.error(`[plugins] Failed to install dependencies for ${pluginId} (exit code: ${code})`);
+            resolve(); // Don't reject, just continue
+          }
+        });
+        
+        installProcess.on('error', (err) => {
+          console.error(`[plugins] Error installing dependencies for ${pluginId}:`, err);
+          resolve(); // Don't reject, just continue
+        });
+      });
+    }
+  } catch (e) {
+    console.error(`[plugins] Error checking dependencies for ${pluginId}:`, e);
+  }
+}
+
 async function loadPlugins() {
   console.log('[plugins] Loading plugins...');
   const cfg = loadPluginConfig();
@@ -1516,6 +1603,9 @@ async function loadPlugins() {
           console.log(`[plugins] Skipping disabled plugin: ${pluginId}`);
           continue;
         }
+        
+        // Check and install plugin dependencies if needed
+        await checkPluginDependencies(pluginDir, pluginId);
         
         // Load the plugin module
         const pluginMainPath = path.join(pluginDir, manifest.main || 'plugin.js');

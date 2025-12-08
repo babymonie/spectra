@@ -1,4 +1,4 @@
-import Database from 'better-sqlite3';
+import initSqlJs from 'sql.js';
 import path from 'path';
 import { app } from 'electron';
 import fs from 'fs';
@@ -7,12 +7,64 @@ const userDataPath = app.getPath('userData');
 console.log('User Data Path:', userDataPath);
 const dbPath = path.join(userDataPath, 'spectra.db');
 
-// Ensure the database file exists
-const db = new Database(dbPath);
+let db = null;
+let dbReady = false;
+
+// Initialize sql.js database
+const initDb = async () => {
+  const SQL = await initSqlJs();
+  try {
+    const buffer = fs.readFileSync(dbPath);
+    db = new SQL.Database(buffer);
+  } catch (err) {
+    // Database doesn't exist yet, create new one
+    db = new SQL.Database();
+  }
+  dbReady = true;
+};
+
+// Save database to disk
+const saveDb = () => {
+  if (!db) return;
+  const data = db.export();
+  fs.writeFileSync(dbPath, data);
+};
+
+// Helper to run SQL and save
+const run = (sql, params = []) => {
+  if (!db) throw new Error('Database not initialized');
+  db.run(sql, params);
+  saveDb();
+};
+
+// Helper to get one row
+const get = (sql, params = []) => {
+  if (!db) throw new Error('Database not initialized');
+  const stmt = db.prepare(sql);
+  stmt.bind(params);
+  const result = stmt.step() ? stmt.getAsObject() : null;
+  stmt.free();
+  return result;
+};
+
+// Helper to get all rows
+const all = (sql, params = []) => {
+  if (!db) throw new Error('Database not initialized');
+  const stmt = db.prepare(sql);
+  stmt.bind(params);
+  const results = [];
+  while (stmt.step()) {
+    results.push(stmt.getAsObject());
+  }
+  stmt.free();
+  return results;
+};
 
 // Initialize schema
 const initSchema = () => {
-  db.exec(`
+  if (!db) return;
+  
+  db.run(`
     CREATE TABLE IF NOT EXISTS tracks (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
       path TEXT UNIQUE NOT NULL,
@@ -25,41 +77,43 @@ const initSchema = () => {
       cover_path TEXT,
       lyrics TEXT,
       created_at DATETIME DEFAULT CURRENT_TIMESTAMP
-    );
+    )
   `);
 
-  // Migration: Add cover_path if it doesn't exist (for existing DBs)
+  // Migration: Add columns if they don't exist (for existing DBs)
   try {
-    db.prepare('ALTER TABLE tracks ADD COLUMN cover_path TEXT').run();
+    db.run('ALTER TABLE tracks ADD COLUMN cover_path TEXT');
   } catch (e) {
     // Column likely already exists
   }
   try {
-    db.prepare('ALTER TABLE tracks ADD COLUMN album_artist TEXT').run();
+    db.run('ALTER TABLE tracks ADD COLUMN album_artist TEXT');
   } catch (e) {
     // Column likely already exists
   }
   try {
-    db.prepare('ALTER TABLE tracks ADD COLUMN lyrics TEXT').run();
+    db.run('ALTER TABLE tracks ADD COLUMN lyrics TEXT');
   } catch (e) {
     // Column likely already exists
   }
 
   // Ensure playlists.updated_at exists for older DBs
   try {
-    db.prepare('ALTER TABLE playlists ADD COLUMN updated_at DATETIME').run();
+    db.run('ALTER TABLE playlists ADD COLUMN updated_at DATETIME');
   } catch (e) {
     // ignore if already exists
   }
 
-  db.exec(`
+  db.run(`
     CREATE TABLE IF NOT EXISTS playlists (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
       name TEXT NOT NULL,
       created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
       updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
-    );
+    )
+  `);
 
+  db.run(`
     CREATE TABLE IF NOT EXISTS playlist_tracks (
       playlist_id INTEGER,
       track_id INTEGER,
@@ -67,135 +121,137 @@ const initSchema = () => {
       FOREIGN KEY(playlist_id) REFERENCES playlists(id) ON DELETE CASCADE,
       FOREIGN KEY(track_id) REFERENCES tracks(id) ON DELETE CASCADE,
       PRIMARY KEY (playlist_id, track_id)
-    );
+    )
   `);
+  
+  saveDb();
 };
 
+// Initialize database asynchronously
+await initDb();
 initSchema();
 
 export const addTrack = (track) => {
+  if (!db) return null;
   const stmt = db.prepare(`
     INSERT INTO tracks (path, title, artist, album, album_artist, duration, format, cover_path)
-    VALUES (@path, @title, @artist, @album, @album_artist, @duration, @format, @cover_path)
-    ON CONFLICT(path) DO UPDATE SET
-      title = excluded.title,
-      artist = excluded.artist,
-      album = excluded.album,
-      album_artist = excluded.album_artist,
-      duration = excluded.duration,
-      format = excluded.format,
-      cover_path = excluded.cover_path
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
   `);
-  return stmt.run(track);
+  stmt.run([track.path, track.title, track.artist, track.album, track.album_artist, track.duration, track.format, track.cover_path]);
+  stmt.free();
+  
+  // Handle conflict manually - if exists, update
+  const existing = get('SELECT id FROM tracks WHERE path = ?', [track.path]);
+  if (existing) {
+    const updateStmt = db.prepare(`
+      UPDATE tracks 
+      SET title = ?, artist = ?, album = ?, album_artist = ?, duration = ?, format = ?, cover_path = ?
+      WHERE path = ?
+    `);
+    updateStmt.run([track.title, track.artist, track.album, track.album_artist, track.duration, track.format, track.cover_path, track.path]);
+    updateStmt.free();
+  }
+  saveDb();
+  return existing || { lastInsertRowid: db.exec('SELECT last_insert_rowid() as id')[0].values[0][0] };
 };
 
 export const getAllTracks = () => {
-  return db.prepare('SELECT * FROM tracks ORDER BY title ASC').all();
+  return all('SELECT * FROM tracks ORDER BY title ASC');
 };
 
-export const getTrackByPath = (path) => {
-  return db.prepare('SELECT * FROM tracks WHERE path = ?').get(path);
+export const getTrackByPath = (filePath) => {
+  return get('SELECT * FROM tracks WHERE path = ?', [filePath]);
 };
 
 export const getTrackById = (id) => {
-  return db.prepare('SELECT * FROM tracks WHERE id = ?').get(id);
+  return get('SELECT * FROM tracks WHERE id = ?', [id]);
 };
 
 export const updateTrackLyrics = (id, lyrics) => {
-  return db.prepare(`
-    UPDATE tracks
-    SET lyrics = @lyrics
-    WHERE id = @id
-  `).run({ id, lyrics });
+  run('UPDATE tracks SET lyrics = ? WHERE id = ?', [lyrics, id]);
+  return { changes: 1 };
 };
 
 export const createPlaylist = (name) => {
-  return db.prepare('INSERT INTO playlists (name) VALUES (?)').run(name);
+  run('INSERT INTO playlists (name) VALUES (?)', [name]);
+  return { lastInsertRowid: db.exec('SELECT last_insert_rowid() as id')[0].values[0][0] };
 };
 
 export const getAllPlaylists = () => {
-  return db.prepare('SELECT * FROM playlists ORDER BY name ASC').all();
+  return all('SELECT * FROM playlists ORDER BY name ASC');
 };
 
 export const addTrackToPlaylist = (playlistId, trackId) => {
   // Get current max order
-  const maxOrder = db.prepare('SELECT MAX(track_order) as maxOrder FROM playlist_tracks WHERE playlist_id = ?').get(playlistId).maxOrder || 0;
-  const res = db.prepare('INSERT OR IGNORE INTO playlist_tracks (playlist_id, track_id, track_order) VALUES (?, ?, ?)').run(playlistId, trackId, maxOrder + 1);
+  const maxOrderRow = get('SELECT MAX(track_order) as maxOrder FROM playlist_tracks WHERE playlist_id = ?', [playlistId]);
+  const maxOrder = maxOrderRow?.maxOrder || 0;
+  
   try {
-    db.prepare('UPDATE playlists SET updated_at = CURRENT_TIMESTAMP WHERE id = ?').run(playlistId);
-  } catch (e) {
+    run('INSERT OR IGNORE INTO playlist_tracks (playlist_id, track_id, track_order) VALUES (?, ?, ?)', [playlistId, trackId, maxOrder + 1]);
+    run('UPDATE playlists SET updated_at = CURRENT_TIMESTAMP WHERE id = ?', [playlistId]);
+  } catch (_) {
     // ignore
   }
-  return res;
+  return { changes: 1 };
 };
 
 export const renamePlaylist = (playlistId, newName) => {
-  const res = db.prepare('UPDATE playlists SET name = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?').run(newName, playlistId);
-  return res;
+  run('UPDATE playlists SET name = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?', [newName, playlistId]);
+  return { changes: 1 };
 };
 
 export const deletePlaylist = (playlistId) => {
-  // Delete playlist and its tracks via FK cascade
-  const res = db.prepare('DELETE FROM playlists WHERE id = ?').run(playlistId);
-  return res;
+  run('DELETE FROM playlists WHERE id = ?', [playlistId]);
+  return { changes: 1 };
 };
 
 export const removeTrackFromPlaylist = (playlistId, trackId) => {
-  const res = db.prepare('DELETE FROM playlist_tracks WHERE playlist_id = ? AND track_id = ?').run(playlistId, trackId);
+  run('DELETE FROM playlist_tracks WHERE playlist_id = ? AND track_id = ?', [playlistId, trackId]);
   try {
-    db.prepare('UPDATE playlists SET updated_at = CURRENT_TIMESTAMP WHERE id = ?').run(playlistId);
-  } catch (e) {}
-  return res;
+    run('UPDATE playlists SET updated_at = CURRENT_TIMESTAMP WHERE id = ?', [playlistId]);
+  } catch (_) {
+    // ignore
+  }
+  return { changes: 1 };
 };
 
 export const reorderPlaylist = (playlistId, orderedTrackIds = []) => {
-  const trx = db.transaction((ids) => {
-    let i = 1;
-    for (const tid of ids) {
-      db.prepare('UPDATE playlist_tracks SET track_order = ? WHERE playlist_id = ? AND track_id = ?').run(i++, playlistId, tid);
-    }
-    db.prepare('UPDATE playlists SET updated_at = CURRENT_TIMESTAMP WHERE id = ?').run(playlistId);
-  });
-  trx(orderedTrackIds);
+  let i = 1;
+  for (const tid of orderedTrackIds) {
+    run('UPDATE playlist_tracks SET track_order = ? WHERE playlist_id = ? AND track_id = ?', [i++, playlistId, tid]);
+  }
+  run('UPDATE playlists SET updated_at = CURRENT_TIMESTAMP WHERE id = ?', [playlistId]);
   return { ok: true };
 };
 
 export const getPlaylistTracks = (playlistId) => {
-  return db.prepare(`
+  return all(`
     SELECT t.* 
     FROM tracks t
     JOIN playlist_tracks pt ON t.id = pt.track_id
     WHERE pt.playlist_id = ?
     ORDER BY pt.track_order ASC
-  `).all(playlistId);
+  `, [playlistId]);
 };
 
 export const removeTrack = (id) => {
-  return db.prepare('DELETE FROM tracks WHERE id = ?').run(id);
+  run('DELETE FROM tracks WHERE id = ?', [id]);
+  return { changes: 1 };
 };
 
 export const updateTrack = (id, { title, artist, album }) => {
-  return db.prepare(`
-    UPDATE tracks 
-    SET title = @title, artist = @artist, album = @album
-    WHERE id = @id
-  `).run({ id, title, artist, album });
+  run('UPDATE tracks SET title = ?, artist = ?, album = ? WHERE id = ?', [title, artist, album, id]);
+  return { changes: 1 };
 };
 
-export const updateTrackPath = (id, path) => {
-  return db.prepare(`
-    UPDATE tracks 
-    SET path = @path
-    WHERE id = @id
-  `).run({ id, path });
+export const updateTrackPath = (id, filePath) => {
+  run('UPDATE tracks SET path = ? WHERE id = ?', [filePath, id]);
+  return { changes: 1 };
 };
 
 export const updateTrackWithAlbumArtist = (id, { title, artist, album, albumArtist }) => {
-  return db.prepare(`
-    UPDATE tracks
-    SET title = @title, artist = @artist, album = @album, album_artist = @albumArtist
-    WHERE id = @id
-  `).run({ id, title, artist, album, albumArtist });
+  run('UPDATE tracks SET title = ?, artist = ?, album = ?, album_artist = ? WHERE id = ?', [title, artist, album, albumArtist, id]);
+  return { changes: 1 };
 };
 
 export const getAlbumArtist = (album, artistFallback) => {
@@ -203,7 +259,7 @@ export const getAlbumArtist = (album, artistFallback) => {
   
   // Early return if no tracks exist yet
   try {
-    const count = db.prepare('SELECT COUNT(*) as cnt FROM tracks').get();
+    const count = get('SELECT COUNT(*) as cnt FROM tracks');
     if (!count || count.cnt === 0) return null;
   } catch (err) {
     console.error('[database] getAlbumArtist: table check failed', err);
@@ -212,22 +268,22 @@ export const getAlbumArtist = (album, artistFallback) => {
   
   try {
     // Prefer an explicit album_artist if present
-    const explicit = db.prepare('SELECT album_artist FROM tracks WHERE album = ? AND album_artist IS NOT NULL AND album_artist != ? LIMIT 1').get(album, '');
+    const explicit = get('SELECT album_artist FROM tracks WHERE album = ? AND album_artist IS NOT NULL AND album_artist != ? LIMIT 1', [album, '']);
     if (explicit?.album_artist) return explicit.album_artist;
     
     // Most common artist for this album
-    const row = db.prepare(`
+    const row = get(`
       SELECT artist, COUNT(*) as cnt
       FROM tracks
       WHERE album = ? AND artist IS NOT NULL
       GROUP BY artist
       ORDER BY cnt DESC
       LIMIT 1
-    `).get(album);
+    `, [album]);
     if (row?.artist) return row.artist;
     
     if (artistFallback) {
-      const r2 = db.prepare('SELECT artist FROM tracks WHERE album = ? AND artist = ? LIMIT 1').get(album, artistFallback);
+      const r2 = get('SELECT artist FROM tracks WHERE album = ? AND artist = ? LIMIT 1', [album, artistFallback]);
       return r2?.artist || null;
     }
     return null;
@@ -238,7 +294,7 @@ export const getAlbumArtist = (album, artistFallback) => {
 };
 
 export const getAlbums = () => {
-  return db.prepare(`
+  return all(`
     SELECT
       album AS name,
       COALESCE(cover_path, '') AS cover_path,
@@ -262,20 +318,16 @@ export const getAlbums = () => {
     WHERE album IS NOT NULL AND album != ''
     GROUP BY album
     ORDER BY artist ASC, album ASC
-  `).all();
+  `);
 };
 
 export const getAlbumCover = (album, artist) => {
   if (!album || album === 'Unknown Album') return null;
   // Try to find a track with the same album (and artist if possible) that has a cover
-  let stmt = db.prepare('SELECT cover_path FROM tracks WHERE album = ? AND cover_path IS NOT NULL LIMIT 1');
-  let res = stmt.get(album);
+  let res = get('SELECT cover_path FROM tracks WHERE album = ? AND cover_path IS NOT NULL LIMIT 1', [album]);
   
   if (!res && artist && artist !== 'Unknown Artist') {
-    // Fallback: try matching both if just album failed (though usually album is unique enough or we want to be specific)
-    // Actually, if album name is common like "Greatest Hits", we definitely need artist.
-    stmt = db.prepare('SELECT cover_path FROM tracks WHERE album = ? AND artist = ? AND cover_path IS NOT NULL LIMIT 1');
-    res = stmt.get(album, artist);
+    res = get('SELECT cover_path FROM tracks WHERE album = ? AND artist = ? AND cover_path IS NOT NULL LIMIT 1', [album, artist]);
   }
   
   return res ? res.cover_path : null;

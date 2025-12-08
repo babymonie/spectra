@@ -160,12 +160,15 @@ header {
   justify-content: space-between;
   align-items: center;
   margin-bottom: 32px;
+  -webkit-app-region: drag; /* Make header draggable on macOS/Linux */
+  padding-top: 8px; /* Extra space for dragging on macOS */
 }
 
 .user-controls {
   display: flex;
   gap: 12px;
   align-items: center;
+  -webkit-app-region: no-drag; /* Buttons should be clickable, not drag window */
 }
 
 .search-bar {
@@ -177,6 +180,7 @@ header {
   gap: 12px;
   width: 360px;
   transition: background-color 0.2s, box-shadow 0.2s;
+  -webkit-app-region: no-drag; /* Search input should be interactive */
 }
 
 .search-bar:focus-within {

@@ -30,6 +30,15 @@ class RemoteServer {
       }
     }));
     
+    // Serve images folder (logo, etc.)
+    const imagesPath = path.join(path.dirname(this.rendererPath), 'images');
+    this.app.use('/images', express.static(imagesPath, {
+      setHeaders: (res) => {
+        res.set('Access-Control-Allow-Origin', '*');
+        res.set('Cache-Control', 'public, max-age=86400');
+      }
+    }));
+    
     // Serve static files, but intercept index.html
     this.app.get('/', (req, res) => {
       const indexPath = path.join(this.rendererPath, 'index.html');
