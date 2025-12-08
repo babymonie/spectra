@@ -41,8 +41,11 @@
       "node_modules/ffmpeg-static/**/*"
     ],
     "asarUnpack": [
-      "node_modules/ffmpeg-static/**/*"
+      "node_modules/ffmpeg-static/**/*",
+      "build/**/*",
+      "bin/**/*"
     ],
+    "afterPack": "./scripts/afterPack.js",
     "mac": {
       "target": [
         "dmg",
