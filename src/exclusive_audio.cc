@@ -1089,9 +1089,9 @@ static Napi::Array GetCoreAudioDevices(const Napi::Env &env) {
         
         // If no specific rates found, add defaults
         if (rateIdx == 0) {
-            ratesArray.Set(0, Napi::Number::New(env, 44100.0));
-            ratesArray.Set(1, Napi::Number::New(env, 48000.0));
-            ratesArray.Set(2, Napi::Number::New(env, 96000.0));
+            ratesArray.Set((uint32_t)0, Napi::Number::New(env, 44100.0));
+            ratesArray.Set((uint32_t)1, Napi::Number::New(env, 48000.0));
+            ratesArray.Set((uint32_t)2, Napi::Number::New(env, 96000.0));
         }
         
         // Create device object
