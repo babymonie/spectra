@@ -161,22 +161,14 @@ jobs:
           path: artifacts/macos
 
       - name: Determine last tag and changelog
-        id: changelog
         run: |
           set -euo pipefail
           git fetch --tags
           LAST_TAG=$(git describe --tags --abbrev=0 2>/dev/null || echo '')
-          printf "LAST_TAG=%s\n" "$LAST_TAG" >> $GITHUB_OUTPUT
-          # Use a unique delimiter to avoid collisions with commit messages
-          DELIM="GH_CHANGELOG_$(date +%s%N)"
           if [ -z "$LAST_TAG" ]; then
-            printf "CHANGELOG<<%s\n" "$DELIM" >> $GITHUB_OUTPUT
-            git log --pretty=format:'- %s (%h)' --reverse HEAD >> $GITHUB_OUTPUT
-            printf "%s\n" "$DELIM" >> $GITHUB_OUTPUT
+            git log --pretty=format:'- %s (%h)' --reverse HEAD > changelog.txt
           else
-            printf "CHANGELOG<<%s\n" "$DELIM" >> $GITHUB_OUTPUT
-            git log ${LAST_TAG}..HEAD --pretty=format:'- %s (%h)' --reverse >> $GITHUB_OUTPUT
-            printf "%s\n" "$DELIM" >> $GITHUB_OUTPUT
+            git log ${LAST_TAG}..HEAD --pretty=format:'- %s (%h)' --reverse > changelog.txt
           fi
 
       - name: Bump package.json patch version
@@ -227,5 +219,5 @@ jobs:
         with:
           tag: v${{ steps.bump.outputs.NEW_VERSION }}
           name: v${{ steps.bump.outputs.NEW_VERSION }}
-          body: ${{ steps.changelog.outputs.CHANGELOG }}
-          files: release-artifacts/*
+          bodyFile: changelog.txt
+          artifacts: release-artifacts/*
