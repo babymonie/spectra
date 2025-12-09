@@ -321,6 +321,20 @@ export const getAlbums = () => {
   `);
 };
 
+export const getArtists = () => {
+  return all(`
+    SELECT
+      artist AS name,
+      COUNT(*) AS track_count,
+      COUNT(DISTINCT album) AS album_count,
+      (SELECT cover_path FROM tracks t2 WHERE t2.artist = tracks.artist AND cover_path IS NOT NULL LIMIT 1) as cover_path
+    FROM tracks
+    WHERE artist IS NOT NULL AND artist != ''
+    GROUP BY artist
+    ORDER BY artist ASC
+  `);
+};
+
 export const getAlbumCover = (album, artist) => {
   if (!album || album === 'Unknown Album') return null;
   // Try to find a track with the same album (and artist if possible) that has a cover
@@ -352,6 +366,7 @@ const api = {
   getAlbumCover,
   getAlbumArtist,
   getAlbums,
+  getArtists,
   getTrackById,
   updateTrackLyrics
 };

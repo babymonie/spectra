@@ -32,6 +32,7 @@
       <nav>
         <ul>
           <li class="active" id="nav-library"><span class="material-icons">library_music</span> Library</li>
+          <li id="nav-artists"><span class="material-icons">person</span> Artists</li>
           <li id="nav-albums"><span class="material-icons">album</span> Albums</li>
           <li id="nav-playlists"><span class="material-icons">queue_music</span> Playlists</li>
           <li id="nav-settings"><span class="material-icons">settings</span> Settings</li>
@@ -64,6 +65,13 @@
         </div>
         <div class="track-list" id="track-list">
           <!-- Tracks will be injected here -->
+        </div>
+      </div>
+
+      <div id="view-artists" class="view" style="display: none;">
+        <h2>Artists</h2>
+        <div id="artists-container" class="albums-container">
+          <!-- Artists will be injected here -->
         </div>
       </div>
 
@@ -125,6 +133,71 @@
           <div class="setting-item checkbox">
             <input type="checkbox" id="strict-bitperfect-checkbox">
             <label for="strict-bitperfect-checkbox">Strict Bit Perfect</label>
+          </div>
+        </div>
+
+        <div class="settings-group">
+          <h3>Equalizer</h3>
+          <div class="eq-panel">
+            <div class="eq-header">
+              <div class="setting-item checkbox">
+                <input type="checkbox" id="eq-enabled">
+                <label for="eq-enabled">Enable Equalizer</label>
+              </div>
+              <select id="eq-preset" class="eq-preset-select">
+                <option value="flat">Flat</option>
+                <option value="rock">Rock</option>
+                <option value="pop">Pop</option>
+                <option value="jazz">Jazz</option>
+                <option value="classical">Classical</option>
+                <option value="bass">Bass Boost</option>
+                <option value="treble">Treble Boost</option>
+                <option value="vocal">Vocal</option>
+                <option value="custom">Custom</option>
+              </select>
+            </div>
+            <div class="eq-sliders" id="eq-sliders">
+              <div class="eq-band">
+                <input type="range" min="-12" max="12" value="0" step="0.5" class="eq-slider" data-band="0">
+                <label>32Hz</label>
+              </div>
+              <div class="eq-band">
+                <input type="range" min="-12" max="12" value="0" step="0.5" class="eq-slider" data-band="1">
+                <label>64Hz</label>
+              </div>
+              <div class="eq-band">
+                <input type="range" min="-12" max="12" value="0" step="0.5" class="eq-slider" data-band="2">
+                <label>125Hz</label>
+              </div>
+              <div class="eq-band">
+                <input type="range" min="-12" max="12" value="0" step="0.5" class="eq-slider" data-band="3">
+                <label>250Hz</label>
+              </div>
+              <div class="eq-band">
+                <input type="range" min="-12" max="12" value="0" step="0.5" class="eq-slider" data-band="4">
+                <label>500Hz</label>
+              </div>
+              <div class="eq-band">
+                <input type="range" min="-12" max="12" value="0" step="0.5" class="eq-slider" data-band="5">
+                <label>1kHz</label>
+              </div>
+              <div class="eq-band">
+                <input type="range" min="-12" max="12" value="0" step="0.5" class="eq-slider" data-band="6">
+                <label>2kHz</label>
+              </div>
+              <div class="eq-band">
+                <input type="range" min="-12" max="12" value="0" step="0.5" class="eq-slider" data-band="7">
+                <label>4kHz</label>
+              </div>
+              <div class="eq-band">
+                <input type="range" min="-12" max="12" value="0" step="0.5" class="eq-slider" data-band="8">
+                <label>8kHz</label>
+              </div>
+              <div class="eq-band">
+                <input type="range" min="-12" max="12" value="0" step="0.5" class="eq-slider" data-band="9">
+                <label>16kHz</label>
+              </div>
+            </div>
           </div>
         </div>
 
@@ -282,69 +355,6 @@
           <button id="fs-btn-play" class="icon-btn large" title="Play/Pause"><span class="material-icons">play_circle_filled</span></button>
           <button id="fs-btn-next" class="icon-btn large" title="Next"><span class="material-icons">skip_next</span></button>
           <button id="fs-btn-repeat" class="icon-btn" title="Repeat"><span class="material-icons">repeat</span></button>
-        </div>
-
-        <!-- Equalizer Panel -->
-        <div class="fs-eq-panel">
-          <div class="fs-eq-header">
-            <label class="eq-toggle">
-              <input type="checkbox" id="fs-eq-enabled">
-              <span>Equalizer</span>
-            </label>
-            <select id="fs-eq-preset" class="eq-preset-select">
-              <option value="flat">Flat</option>
-              <option value="rock">Rock</option>
-              <option value="pop">Pop</option>
-              <option value="jazz">Jazz</option>
-              <option value="classical">Classical</option>
-              <option value="bass">Bass Boost</option>
-              <option value="treble">Treble Boost</option>
-              <option value="vocal">Vocal</option>
-              <option value="custom">Custom</option>
-            </select>
-          </div>
-          <div class="fs-eq-sliders" id="fs-eq-sliders">
-            <div class="eq-band">
-              <input type="range" min="-12" max="12" value="0" step="0.5" class="eq-slider" data-band="0">
-              <label>32Hz</label>
-            </div>
-            <div class="eq-band">
-              <input type="range" min="-12" max="12" value="0" step="0.5" class="eq-slider" data-band="1">
-              <label>64Hz</label>
-            </div>
-            <div class="eq-band">
-              <input type="range" min="-12" max="12" value="0" step="0.5" class="eq-slider" data-band="2">
-              <label>125Hz</label>
-            </div>
-            <div class="eq-band">
-              <input type="range" min="-12" max="12" value="0" step="0.5" class="eq-slider" data-band="3">
-              <label>250Hz</label>
-            </div>
-            <div class="eq-band">
-              <input type="range" min="-12" max="12" value="0" step="0.5" class="eq-slider" data-band="4">
-              <label>500Hz</label>
-            </div>
-            <div class="eq-band">
-              <input type="range" min="-12" max="12" value="0" step="0.5" class="eq-slider" data-band="5">
-              <label>1kHz</label>
-            </div>
-            <div class="eq-band">
-              <input type="range" min="-12" max="12" value="0" step="0.5" class="eq-slider" data-band="6">
-              <label>2kHz</label>
-            </div>
-            <div class="eq-band">
-              <input type="range" min="-12" max="12" value="0" step="0.5" class="eq-slider" data-band="7">
-              <label>4kHz</label>
-            </div>
-            <div class="eq-band">
-              <input type="range" min="-12" max="12" value="0" step="0.5" class="eq-slider" data-band="8">
-              <label>8kHz</label>
-            </div>
-            <div class="eq-band">
-              <input type="range" min="-12" max="12" value="0" step="0.5" class="eq-slider" data-band="9">
-              <label>16kHz</label>
-            </div>
-          </div>
         </div>
       </div>
       <div class="fs-right">

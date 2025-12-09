@@ -37,10 +37,12 @@ let navLibrary;
 let navPlaylists;
 let navSettings;
 let navAlbums;
+let navArtists;
 let viewLibrary;
 let viewPlaylists;
 let viewSettings;
 let viewAlbums;
+let viewArtists;
 
 // Other DOM elements assigned in init
 let btnImportFile;
@@ -60,6 +62,7 @@ let notificationCount;
 let isSeeking = false;
 // When set, searches and library view are scoped to this album (lowercase name and optional artist)
 let currentAlbumFilter = null;
+let currentArtistFilter = null;
 
 // Helper function to update repeat button visual state
 function updateRepeatButton(btn) {
@@ -406,10 +409,13 @@ const switchView = (viewId, preserveLibrary = false) => {
       if (!preserveLibrary) {
         // Clear any album-scoped filter when doing a full library load
         currentAlbumFilter = null;
+        currentArtistFilter = null;
         loadLibrary();
       }
     } else if (viewId === 'albums') {
       renderAlbums();
+    } else if (viewId === 'artists') {
+      renderArtists();
     } else if (viewId === 'settings') {
       loadSettingsUI();
     }
@@ -713,6 +719,11 @@ const loadLibrary = async () => {
       }
       return trackAlbum === currentAlbumFilter.album;
     });
+  } else if (currentArtistFilter) {
+    base = libraryCache.filter(t => {
+      const trackArtist = (t.artist || '').toString().trim().toLowerCase();
+      return trackArtist === currentArtistFilter;
+    });
   }
 
   if (query) {
@@ -833,6 +844,74 @@ function renderAlbums() {
   }).catch((err) => {
     console.error('renderAlbums error', err);
     viewAlbums.innerHTML = '<div class="empty">Failed to load albums</div>';
+  });
+}
+
+function renderArtists() {
+  viewArtists.innerHTML = '<h2>Artists</h2>';
+
+  electron.getArtists().then((artists) => {
+    if (!Array.isArray(artists) || artists.length === 0) {
+      viewArtists.innerHTML = '<div class="empty">No artists found</div>';
+      return;
+    }
+
+    const grid = document.createElement('div');
+    grid.className = 'album-grid'; // Reuse album grid styles
+
+    for (const artist of artists) {
+      const card = document.createElement('div');
+      card.className = 'album-card';
+
+      const img = document.createElement('img');
+      img.className = 'album-art';
+      // Use artist image if available (from DB query)
+      if (artist.cover_path) {
+         if (artist.cover_path.startsWith('http') || artist.cover_path.startsWith('data:')) {
+          img.src = artist.cover_path;
+        } else {
+          electron.getCoverImage(artist.cover_path).then(dataUrl => {
+            if (dataUrl) img.src = dataUrl;
+            else img.classList.add('placeholder');
+          }).catch(() => img.classList.add('placeholder'));
+        }
+      } else {
+        img.classList.add('placeholder');
+      }
+      
+      const title = document.createElement('div');
+      title.className = 'album-title';
+      title.textContent = artist.name || 'Unknown Artist';
+
+      const count = document.createElement('div');
+      count.className = 'album-artist';
+      count.textContent = `${artist.album_count} albums, ${artist.track_count} tracks`;
+
+      card.appendChild(img);
+      card.appendChild(title);
+      card.appendChild(count);
+
+      card.onclick = async () => {
+        const allTracks = await electron.getLibrary();
+        const artistToMatch = (artist.name || '').toString().trim().toLowerCase();
+        
+        currentArtistFilter = artistToMatch;
+        currentAlbumFilter = null;
+
+        tracks = allTracks.filter(t => {
+          const trackArtist = (t.artist || '').toString().trim().toLowerCase();
+          return trackArtist === artistToMatch;
+        });
+        renderLibrary();
+        switchView('library', true);
+      };
+
+      grid.appendChild(card);
+    }
+    viewArtists.appendChild(grid);
+  }).catch((err) => {
+    console.error('renderArtists error', err);
+    viewArtists.innerHTML = '<div class="empty">Failed to load artists</div>';
   });
 }
 
@@ -1074,8 +1153,8 @@ function showFullscreen() {
   }
 
   // Equalizer controls
-  const eqEnabled = document.getElementById('fs-eq-enabled');
-  const eqPreset = document.getElementById('fs-eq-preset');
+  const eqEnabled = document.getElementById('eq-enabled');
+  const eqPreset = document.getElementById('eq-preset');
   const eqSliders = document.querySelectorAll('.eq-slider');
 
   // Load current EQ state
@@ -2064,10 +2143,12 @@ async function init() {
   navPlaylists = document.getElementById('nav-playlists');
   navSettings = document.getElementById('nav-settings');
   navAlbums = document.getElementById('nav-albums');
+  navArtists = document.getElementById('nav-artists');
   viewLibrary = document.getElementById('view-library');
   viewPlaylists = document.getElementById('view-playlists');
   viewSettings = document.getElementById('view-settings');
   viewAlbums = document.getElementById('view-albums');
+  viewArtists = document.getElementById('view-artists');
 
   btnImportFile = document.getElementById('btn-import-file');
   btnImportFolder = document.getElementById('btn-import-folder');
@@ -2160,6 +2241,7 @@ async function init() {
   if (navPlaylists) navPlaylists.onclick = () => switchView('playlists');
   if (navSettings) navSettings.onclick = () => switchView('settings');
   if (navAlbums) navAlbums.onclick = () => switchView('albums');
+  if (navArtists) navArtists.onclick = () => switchView('artists');
 
   // Import buttons
   if (btnImportFile) btnImportFile.onclick = async () => { await electron.importFile(); loadLibrary(); };

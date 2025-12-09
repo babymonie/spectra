@@ -7,6 +7,7 @@ contextBridge.exposeInMainWorld('electron', {
   addRemote: (info) => ipcRenderer.invoke('library:add-remote', info),
   getLibrary: () => ipcRenderer.invoke('library:get'),
   getAlbums: () => ipcRenderer.invoke('library:get-albums'),
+  getArtists: () => ipcRenderer.invoke('library:get-artists'),
   getCoverImage: (coverPath) => ipcRenderer.invoke('library:get-cover-image', coverPath),
   removeTrack: (id) => ipcRenderer.invoke('library:remove-track', id),
   updateTrack: (id, data) => ipcRenderer.invoke('library:update-track', id, data),
