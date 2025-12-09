@@ -7,6 +7,8 @@ A high-quality desktop audio player built with **Electron**, featuring native ex
 
 Download binaries, installers and extras at: https://spectra.f4ust.com — download for free.
 
+Prebuilt binaries and installers are also published on the project's GitHub Releases page — GitHub-hosted binaries are free community builds.
+
 ---
 
 ## **✨ Features**
@@ -326,6 +328,31 @@ Spectra stores data in:
 ```
 
 ---
+
+### macOS: Gatekeeper / Unsigned app (temporary workaround)
+
+If macOS prevents Spectra from opening with messages like "App is damaged" or "can't be opened because it is from an unidentified developer", try one of these local workarounds for development/testing:
+
+- Finder: Right-click (or Control-click) the `.app` bundle → **Open** → confirm **Open** in the dialog. This bypasses Gatekeeper for that app once.
+
+- Terminal (clear the quarantine attribute):
+
+```bash
+sudo xattr -cr /path/to/Spectra.app
+```
+
+or (explicitly remove the quarantine attribute):
+
+```bash
+sudo xattr -rd com.apple.quarantine /path/to/Spectra.app
+```
+
+Replace `/path/to/Spectra.app` with the actual path (for example `~/Downloads/Spectra-darwin-x64/Spectra.app` or `/Applications/Spectra.app`). These commands are useful for locally-built or downloaded unsigned apps used for testing.
+
+Important: these are workarounds for local testing only. The recommended long-term solution for distributing macOS apps is to sign and notarize builds with an Apple Developer ID (Apple Developer Program membership required, currently an annual fee).
+
+If you'd like, I can add CI-ready instructions for signing and notarization (macOS runner + secrets) or a short checklist for producing a signed release.
+
 
 ## **🛠️ Developer: Git hooks & version bump**
 

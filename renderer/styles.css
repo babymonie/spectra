@@ -160,9 +160,30 @@ header {
   justify-content: space-between;
   align-items: center;
   margin-bottom: 32px;
+  position: relative;
   -webkit-app-region: drag; /* Make header draggable on macOS/Linux */
   padding-top: 12px; /* Extra space for dragging on macOS */
   padding-left: 80px; /* Space for macOS traffic lights */
+}
+
+/* Ensure a reliable draggable area behind header content.
+   The pseudo-element sits under interactive controls so clicks still work.
+   This helps in packaged macOS builds where layering can prevent header drags. */
+header::before {
+  content: '';
+  position: absolute;
+  top: 0;
+  left: 0;
+  right: 0;
+  height: 48px; /* safe drag strip height */
+  -webkit-app-region: drag;
+  z-index: 0; /* behind header children */
+}
+
+/* Ensure interactive elements sit above the drag strip and remain clickable */
+header > * {
+  position: relative;
+  z-index: 1;
 }
 
 .user-controls {

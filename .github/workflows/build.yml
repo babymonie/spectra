@@ -130,3 +130,127 @@ jobs:
             dist/*.dmg
             dist/*.zip
           retention-days: 30
+
+  publish:
+    runs-on: ubuntu-latest
+    needs: [build-windows, build-linux, build-macos]
+    if: ${{ github.ref == 'refs/heads/main' }}
+    steps:
+      - name: Checkout (with write access)
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: true
+          fetch-depth: 0
+
+      - name: Download Windows artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: spectra-windows
+          path: artifacts/windows
+
+      - name: Download Linux artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: spectra-linux
+          path: artifacts/linux
+
+      - name: Download macOS artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: spectra-macos
+          path: artifacts/macos
+
+      - name: Determine last tag and changelog
+        id: changelog
+        run: |
+          set -e
+          git fetch --tags
+          LAST_TAG=$(git describe --tags --abbrev=0 2>/dev/null || echo '')
+          echo "LAST_TAG=$LAST_TAG" >> $GITHUB_OUTPUT
+          if [ -z "$LAST_TAG" ]; then
+            echo "CHANGELOG=$(git log --pretty=format:'- %s (%h)' --reverse HEAD)" >> $GITHUB_OUTPUT
+          else
+            echo "CHANGELOG=$(git log ${LAST_TAG}..HEAD --pretty=format:'- %s (%h)' --reverse)" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Bump package.json patch version
+        id: bump
+        run: |
+          set -e
+          node -e "
+          const fs = require('fs');
+          const p = JSON.parse(fs.readFileSync('package.json','utf8'));
+          const parts = (p.version||'0.0.0').split('.').map(n=>parseInt(n)||0);
+          while(parts.length<3) parts.push(0);
+          parts[2]=parts[2]+1;
+          const newV = parts.join('.');
+          p.version=newV;
+          fs.writeFileSync('package.json', JSON.stringify(p,null,2)+"\n");
+          console.log(newV);
+          " > newversion.txt
+          NEW_VERSION=$(cat newversion.txt)
+          echo "NEW_VERSION=$NEW_VERSION" >> $GITHUB_OUTPUT
+
+      - name: Commit and push version bump
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -e
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add package.json
+          git commit -m "chore: bump version to ${{ steps.bump.outputs.NEW_VERSION }} [ci skip]" || echo 'no changes to commit'
+          git push origin HEAD:main || echo 'push failed'
+
+      - name: Create tag for release
+        run: |
+          set -e
+          TAG=v${{ steps.bump.outputs.NEW_VERSION }}
+          git tag -a "$TAG" -m "Release $TAG"
+          git push origin "$TAG"
+
+      - name: Archive release artifacts
+        run: |
+          mkdir -p release-artifacts
+          if [ -d artifacts/windows ]; then zip -r release-artifacts/spectra-windows-${{ steps.bump.outputs.NEW_VERSION }}.zip artifacts/windows || true; fi
+          if [ -d artifacts/linux ]; then zip -r release-artifacts/spectra-linux-${{ steps.bump.outputs.NEW_VERSION }}.zip artifacts/linux || true; fi
+          if [ -d artifacts/macos ]; then zip -r release-artifacts/spectra-macos-${{ steps.bump.outputs.NEW_VERSION }}.zip artifacts/macos || true; fi
+
+      - name: Create GitHub Release with changelog
+        id: create_release
+        uses: actions/create-release@v1
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          tag_name: v${{ steps.bump.outputs.NEW_VERSION }}
+          release_name: v${{ steps.bump.outputs.NEW_VERSION }}
+          body: |
+            ${{ steps.changelog.outputs.CHANGELOG }}
+          draft: false
+          prerelease: false
+
+      - name: Upload release assets (windows)
+        uses: actions/upload-release-asset@v1
+        with:
+          upload_url: ${{ steps.create_release.outputs.upload_url }}
+          asset_path: release-artifacts/spectra-windows-${{ steps.bump.outputs.NEW_VERSION }}.zip
+          asset_name: spectra-windows-${{ steps.bump.outputs.NEW_VERSION }}.zip
+          asset_content_type: application/zip
+
+      - name: Upload release assets (linux)
+        if: always()
+        uses: actions/upload-release-asset@v1
+        with:
+          upload_url: ${{ steps.create_release.outputs.upload_url }}
+          asset_path: release-artifacts/spectra-linux-${{ steps.bump.outputs.NEW_VERSION }}.zip
+          asset_name: spectra-linux-${{ steps.bump.outputs.NEW_VERSION }}.zip
+          asset_content_type: application/zip
+
+      - name: Upload release assets (macos)
+        if: always()
+        uses: actions/upload-release-asset@v1
+        with:
+          upload_url: ${{ steps.create_release.outputs.upload_url }}
+          asset_path: release-artifacts/spectra-macos-${{ steps.bump.outputs.NEW_VERSION }}.zip
+          asset_name: spectra-macos-${{ steps.bump.outputs.NEW_VERSION }}.zip
+          asset_content_type: application/zip
