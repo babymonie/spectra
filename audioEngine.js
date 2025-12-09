@@ -1,13 +1,64 @@
 // audioEngine.js (ESM, no Speaker/portaudio)
 // Native PCM pipeline: FFmpeg -> exclusive_audio addon (WASAPI/CoreAudio)
 
-import { spawn } from 'child_process';
+import { spawn, spawnSync } from 'node:child_process';
 import { Transform } from 'stream';
 import ffmpegPath from 'ffmpeg-static';
 import { parseFile } from 'music-metadata';
+import { existsSync } from 'node:fs';
+import path from 'node:path';
 
 let exclusiveAudio = null;
 let exclusiveLoadError = null;
+
+// Normalize ffmpeg binary path for packaged apps (asar/app.asar.unpacked)
+const resolvedFfmpegPath = (() => {
+  try {
+    if (!ffmpegPath) {
+      console.error('[audioEngine] ffmpeg-static did not provide a binary path');
+      // Try to fall back to system ffmpeg
+      const probe = spawnSync('ffmpeg', ['-version'], { stdio: 'ignore' });
+      if (probe.status === 0) {
+        console.log('[audioEngine] Falling back to system FFmpeg from PATH');
+        return 'ffmpeg';
+      }
+      return null;
+    }
+    let p = ffmpegPath;
+    // If running from app.asar, use the unpacked path instead
+    if (p.includes('app.asar')) {
+      p = p.replace('app.asar', 'app.asar.unpacked');
+    }
+
+    // If the bundled/static path exists, use it
+    if (existsSync(p)) {
+      console.log('[audioEngine] Using bundled FFmpeg binary at:', p);
+      return p;
+    }
+
+    // Check for a locally installed FFmpeg from ensure-deps at ./bin/ffmpeg(.exe)
+    const ffmpegName = process.platform === 'win32' ? 'ffmpeg.exe' : 'ffmpeg';
+    const baseDir = process.resourcesPath || process.cwd();
+    const localBinPath = path.join(baseDir, 'bin', ffmpegName);
+    if (existsSync(localBinPath)) {
+      console.log('[audioEngine] Using local FFmpeg binary at:', localBinPath);
+      return localBinPath;
+    }
+
+    console.warn('[audioEngine] Bundled FFmpeg not found at expected path, probing system FFmpeg...');
+    const probe = spawnSync('ffmpeg', ['-version'], { stdio: 'ignore' });
+    if (probe.status === 0) {
+      console.log('[audioEngine] Using system FFmpeg from PATH');
+      return 'ffmpeg';
+    }
+
+    console.error('[audioEngine] No FFmpeg binary found (bundled or system).');
+    return null;
+  } catch (e) {
+    console.error('[audioEngine] Failed to resolve FFmpeg path:', e?.message ?? e);
+    return ffmpegPath || null;
+  }
+})();
 
 // Load the JS wrapper around your native addon
 try {
@@ -244,7 +295,14 @@ async function playFile(filePath, onEnd, onError, options = {}) {
   );
 
   // Spawn FFmpeg to decode to raw PCM s16le
-  ffmpegProc = spawn(ffmpegPath, args);
+  if (!resolvedFfmpegPath) {
+    const err = new Error('FFmpeg binary path is not available');
+    console.error('[audioEngine] Cannot start FFmpeg:', err.message);
+    if (onError) onError(err);
+    return;
+  }
+
+  ffmpegProc = spawn(resolvedFfmpegPath, args);
 
   if (ffmpegProc.stderr) {
     ffmpegProc.stderr.on('data', (data) => {

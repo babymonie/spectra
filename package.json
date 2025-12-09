@@ -4,6 +4,7 @@
   "type": "module",
   "main": "main.js",
   "scripts": {
+    "prestart": "node ./scripts/ensure-deps.js",
     "start": "electron .",
     "setup": "powershell -NoProfile -ExecutionPolicy Bypass -File ./scripts/setup.ps1",
     "build": "powershell -NoProfile -ExecutionPolicy Bypass -File ./scripts/build.ps1",

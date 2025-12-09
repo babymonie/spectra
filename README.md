@@ -50,42 +50,26 @@ cd spectra
 
 ---
 
-### **2. Install dependencies**
+### **2. Install dependencies & build native addon (automatic)**
+
+From the repo root, you can simply run:
 
 ```powershell
-npm install
+npm start
 ```
+
+On first run, Spectra will automatically:
+
+* Run `npm install` if `node_modules` is missing
+* Build the native audio addon for Electron if needed
+
+After this initial setup completes, `npm start` will launch the Electron app directly.
 
 If you see native build errors, ensure:
 
 * Visual Studio Build Tools (Windows)
 * Xcode CLI Tools (macOS)
 * build-essential + libasound2-dev (Linux)
-
----
-
-### **3. Rebuild the native audio addon for Electron**
-
-> Spectra uses a **C++ Node-API addon** (`exclusive_audio.node`).
-> It *must* match your local Electron version.
-
-Run:
-
-```powershell
-npm run rebuild-electron
-```
-
-This wraps `electron-rebuild` and fixes most ABI mismatches automatically.
-
----
-
-### **4. Start Spectra (development mode)**
-
-```powershell
-npm start
-```
-
-This launches the Electron app using your local source tree.
 
 ---
 
