@@ -7,6 +7,9 @@ on:
     branches: [ main ]
   workflow_dispatch:
 
+permissions:
+  contents: write
+
 jobs:
   build-windows:
     runs-on: windows-latest
@@ -202,10 +205,12 @@ jobs:
 
       - name: Create tag for release
         run: |
-          set -e
           TAG=v${{ steps.bump.outputs.NEW_VERSION }}
-          git tag -a "$TAG" -m "Release $TAG"
-          git push origin "$TAG"
+          if git rev-parse "$TAG" >/dev/null 2>&1; then
+            echo "Tag $TAG already exists"
+          else
+            git tag -a "$TAG" -m "Release $TAG" || echo "Failed to create local tag (will rely on release action)"
+          fi
 
       - name: Archive release artifacts
         run: |
