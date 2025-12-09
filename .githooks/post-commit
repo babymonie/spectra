@@ -1,0 +1,6 @@
+#!/usr/bin/env bash
+DIR="$(cd "$(dirname "$0")" && pwd -P)"
+NODE_SCRIPT="$DIR/../scripts/post-commit-bump.js"
+if command -v node >/dev/null 2>&1; then
+  node "$NODE_SCRIPT" || true
+fi

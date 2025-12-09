@@ -10,7 +10,8 @@
     "package": "electron-builder",
     "build:electron": "powershell -NoProfile -ExecutionPolicy Bypass -File ./scripts/build.ps1 -mode electron",
     "build:node": "powershell -NoProfile -ExecutionPolicy Bypass -File ./scripts/build.ps1 -mode node",
-    "rebuild-electron": "npx electron-rebuild -f"
+    "rebuild-electron": "npx electron-rebuild -f",
+    "bump-version": "node ./scripts/post-commit-bump.js"
   },
   "keywords": ["music", "player", "audio", "electron"],
   "author": "Spectra Team",
