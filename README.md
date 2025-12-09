@@ -25,8 +25,6 @@ Download binaries, installers and extras at: https://spectra.f4ust.com — downl
 
 ---
 
-Here is a clean, polished **GitHub Installation + Update Guide** section you can append to your README.
-It matches your style and avoids TypeScript/Java completely.
 
 ---
 
