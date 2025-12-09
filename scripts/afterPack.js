@@ -10,17 +10,28 @@ export default async function afterPack(context) {
   console.log('[afterPack] Platform:', platform);
   console.log('[afterPack] App output dir:', appOutDir);
   
-  // Determine paths based on platform
+  // Determine paths based on platform (use safe fallbacks)
   let resourcesPath, buildPath, binPath;
-  
-  if (platform === 'win32') {
-    resourcesPath = path.join(appOutDir, 'resources');
-  } else if (platform === 'darwin') {
-    resourcesPath = path.join(appOutDir, 'Spectra.app', 'Contents', 'Resources');
-  } else if (platform === 'linux') {
-    resourcesPath = path.join(appOutDir, 'resources');
+
+  try {
+    if (platform === 'win32') {
+      resourcesPath = path.join(appOutDir || process.cwd(), 'resources');
+    } else if (platform === 'darwin') {
+      resourcesPath = path.join(appOutDir || process.cwd(), 'Spectra.app', 'Contents', 'Resources');
+    } else if (platform === 'linux') {
+      resourcesPath = path.join(appOutDir || process.cwd(), 'resources');
+    } else {
+      // Unknown platform: default to appOutDir/resources
+      resourcesPath = path.join(appOutDir || process.cwd(), 'resources');
+    }
+  } catch (e) {
+    console.warn('[afterPack] Failed to determine resourcesPath, falling back to cwd:', e && e.message);
+    resourcesPath = path.join(process.cwd(), 'resources');
   }
-  
+
+  // Ensure projectDir fallback exists (context.projectDir may be undefined in some CI setups)
+  const projectDir = context.projectDir || process.cwd();
+
   const appPath = path.join(resourcesPath, 'app.asar.unpacked');
   buildPath = path.join(appPath, 'build');
   binPath = path.join(appPath, 'bin');
@@ -38,7 +49,7 @@ export default async function afterPack(context) {
     console.warn('[afterPack] ⚠ Build directory not found, trying to copy...');
     
     // Try to copy from project build directory
-    const projectBuildPath = path.join(context.projectDir, 'build');
+    const projectBuildPath = path.join(projectDir, 'build');
     if (fs.existsSync(projectBuildPath)) {
       fs.mkdirSync(buildPath, { recursive: true });
       copyRecursive(projectBuildPath, buildPath);
