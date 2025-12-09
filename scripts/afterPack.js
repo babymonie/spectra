@@ -1,9 +1,9 @@
 // afterPack.js - Ensures native addons are properly included after packaging
 
-const fs = require('fs');
-const path = require('path');
+import fs from 'fs';
+import path from 'path';
 
-exports.default = async function(context) {
+export default async function afterPack(context) {
   const appOutDir = context.appOutDir;
   const platform = context.electronPlatformName;
   
