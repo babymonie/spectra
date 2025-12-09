@@ -29,6 +29,11 @@ function loadAppSettings() {
       const j = JSON.parse(fs.readFileSync(appSettingsPath, 'utf8'));
       appSettings = Object.assign({}, appSettings, j || {});
       console.log('[settings] Loaded app settings:', appSettingsPath, appSettings);
+      
+      // Restore EQ settings if available
+      if (appSettings.eq) {
+        audioEngine.setEQ(appSettings.eq);
+      }
     } else {
       console.log('[settings] No app settings found, using defaults');
     }
@@ -415,6 +420,32 @@ const handlers = {
     } catch (e) {
       return { error: String(e) };
     }
+  },
+  // EQ
+  'audio:get-eq': () => audioEngine.getEQ(),
+  'audio:set-eq-enabled': (enabled) => {
+    const eq = audioEngine.getEQ();
+    audioEngine.setEQ({ ...eq, enabled });
+    appSettings.eq = audioEngine.getEQ();
+    saveAppSettings();
+  },
+  'audio:set-eq-preset': (preset) => {
+    const eq = audioEngine.getEQ();
+    let bands = [...eq.bands];
+    if (preset === 'flat') bands = [0,0,0,0,0,0,0,0,0,0];
+    else if (preset === 'bass') bands = [6,5,4,2,0,0,0,0,0,0];
+    else if (preset === 'treble') bands = [0,0,0,0,0,0,2,4,5,6];
+    else if (preset === 'vocal') bands = [-2,-2,-1,0,4,4,2,0,-1,-2];
+    
+    audioEngine.setEQ({ ...eq, preset, bands });
+    appSettings.eq = audioEngine.getEQ();
+    saveAppSettings();
+  },
+  'audio:set-eq-bands': (bands) => {
+    const eq = audioEngine.getEQ();
+    audioEngine.setEQ({ ...eq, bands, preset: 'custom' });
+    appSettings.eq = audioEngine.getEQ();
+    saveAppSettings();
   },
   // Playlists
   'playlists:create': (name) => db.createPlaylist(name),

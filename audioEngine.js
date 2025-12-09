@@ -29,6 +29,38 @@ let lastOnError = null;
 let lastOptions = {};
 let currentStartTime = 0;
 
+// EQ State
+let eqState = {
+  enabled: false,
+  preset: 'flat',
+  bands: [0, 0, 0, 0, 0, 0, 0, 0, 0, 0] // 32, 64, 125, 250, 500, 1k, 2k, 4k, 8k, 16k
+};
+
+function setEQ(state) {
+  console.log('[audioEngine] setEQ:', state);
+  const wasEnabled = eqState.enabled;
+  const oldBands = [...eqState.bands];
+  
+  if (state.enabled !== undefined) eqState.enabled = state.enabled;
+  if (state.preset !== undefined) eqState.preset = state.preset;
+  if (state.bands && Array.isArray(state.bands)) eqState.bands = [...state.bands];
+
+  // If playback is active and EQ changed, we need to restart to apply FFmpeg filters
+  // Only restart if enabled changed OR (enabled is true AND bands changed)
+  const bandsChanged = JSON.stringify(oldBands) !== JSON.stringify(eqState.bands);
+  const shouldRestart = (wasEnabled !== eqState.enabled) || (eqState.enabled && bandsChanged);
+
+  if (ffmpegProc && shouldRestart) {
+    console.log('[audioEngine] EQ changed, restarting playback...');
+    const time = getTime();
+    playFile(currentFile, lastOnEnd, lastOnError, { ...lastOptions, startTime: time });
+  }
+}
+
+function getEQ() {
+  return { ...eqState };
+}
+
 // Update runtime volume for the active gain stream (0-100)
 function setVolume(v) {
   const pct = Math.min(100, Math.max(0, Number.isFinite(v) ? Number(v) : 100));
@@ -186,7 +218,24 @@ async function playFile(filePath, onEnd, onError, options = {}) {
 
   args.push(
     '-i', filePath,
-    '-vn',
+    '-vn'
+  );
+
+  // Apply EQ if enabled
+  if (eqState.enabled) {
+    // Bands: 32, 64, 125, 250, 500, 1k, 2k, 4k, 8k, 16k
+    const freqs = [32, 64, 125, 250, 500, 1000, 2000, 4000, 8000, 16000];
+    let entries = '';
+    for (let i = 0; i < freqs.length; i++) {
+      const gain = eqState.bands[i] || 0;
+      if (i > 0) entries += ';';
+      entries += `entry(${freqs[i]},${gain})`;
+    }
+    // Use firequalizer for high quality EQ
+    args.push('-af', `firequalizer=gain_entry='${entries}'`);
+  }
+
+  args.push(
     '-f', ffmpegFormat,
     '-acodec', ffmpegCodec,
     '-ac', String(actualChannels),
@@ -433,4 +482,6 @@ export default {
   getTime,
   setVolume,
   seek,
+  setEQ,
+  getEQ
 };
