@@ -1,6 +1,6 @@
 {
   "name": "spectra",
-  "version": "1.0.1",
+  "version": "1.0.2",
   "type": "module",
   "main": "main.js",
   "scripts": {
@@ -13,7 +13,12 @@
     "rebuild-electron": "npx electron-rebuild -f",
     "bump-version": "node ./scripts/post-commit-bump.js"
   },
-  "keywords": ["music", "player", "audio", "electron"],
+  "keywords": [
+    "music",
+    "player",
+    "audio",
+    "electron"
+  ],
   "author": "Spectra Team",
   "license": "ISC",
   "description": "A modern, high-fidelity music player with exclusive audio support",
