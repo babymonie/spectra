@@ -1,8 +1,72 @@
 // exclusiveAudio.js
 import { Writable } from 'stream';
+import fs from 'fs';
+import path from 'path';
+import { createRequire } from 'module';
 import bindings from 'bindings';
 
-const native = bindings('exclusive_audio'); // loads build/Release/exclusive_audio.node
+// Attempt to load the native addon using the usual bindings helper first.
+// If that fails (packaged app / asar-unpacked layout), fall back to common
+// unpacked paths under `process.resourcesPath` (app.asar.unpacked) and `bin/`.
+let native = null;
+try {
+  native = bindings('exclusive_audio'); // typical dev load: build/Release/exclusive_audio.node
+} catch (e) {
+  // Fallback loader for packaged apps
+  try {
+    const require = createRequire(import.meta.url);
+    const resourcesPath = process.resourcesPath || path.join(process.cwd(), 'resources');
+    const candidates = [
+      path.join(resourcesPath, 'app.asar.unpacked', 'build', 'Release', 'exclusive_audio.node'),
+      path.join(resourcesPath, 'app.asar.unpacked', 'build', 'default', 'exclusive_audio.node'),
+      path.join(resourcesPath, 'app.asar.unpacked', 'bin', 'spectra.node'),
+      // Also allow for nested platform-specific prebuilt folders under bin/
+      path.join(resourcesPath, 'app.asar.unpacked', 'bin'),
+    ];
+
+    // If bin is a directory, try to find any .node inside it (prebuilt per-platform)
+    const tryCandidates = [];
+    for (const c of candidates) tryCandidates.push(c);
+    const binDir = path.join(resourcesPath, 'app.asar.unpacked', 'bin');
+    if (fs.existsSync(binDir) && fs.statSync(binDir).isDirectory()) {
+      const walk = (dir) => {
+        for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
+          const p = path.join(dir, entry.name);
+          if (entry.isDirectory()) walk(p);
+          else if (entry.isFile() && p.endsWith('.node')) tryCandidates.push(p);
+        }
+      };
+      try { walk(binDir); } catch (_) {}
+    }
+
+    // Try each candidate until one loads
+    for (const cand of tryCandidates) {
+      try {
+        if (fs.existsSync(cand)) {
+          native = require(cand);
+          console.log('[exclusiveAudio] loaded native addon from', cand);
+          break;
+        }
+      } catch (err) {
+        // ignore and try next
+      }
+    }
+  } catch (err) {
+    // final fallback: leave native null and allow consumer to handle unsupported platform
+    console.warn('[exclusiveAudio] native addon load failed:', (err && err.message) || e && e.message);
+  }
+}
+
+if (!native) {
+  // If native is still null, create a dummy object that throws on use to make errors clearer
+  native = {
+    isSupported: () => false,
+    openOutput: () => { throw new Error('native addon not loaded'); },
+    write: () => { throw new Error('native addon not loaded'); },
+    drain: () => {},
+    close: () => {},
+  };
+}
 
 class ExclusiveStream extends Writable {
   constructor(handleOrOptions) {
