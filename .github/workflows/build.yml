@@ -183,7 +183,7 @@ jobs:
           parts[2]=parts[2]+1;
           const newV = parts.join('.');
           p.version=newV;
-          fs.writeFileSync('package.json', JSON.stringify(p,null,2)+"\n");
+          fs.writeFileSync('package.json', JSON.stringify(p,null,2));
           console.log(newV);
           " > newversion.txt
           NEW_VERSION=$(cat newversion.txt)
