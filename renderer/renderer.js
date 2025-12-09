@@ -65,6 +65,17 @@ let currentAlbumFilter = null;
 let currentArtistFilter = null;
 
 // Helper function to update repeat button visual state
+
+// Normalizes strings for comparison: trim, lower-case, unicode normalize, and remove diacritics
+function normalizeForCompare(s) {
+  if (!s && s !== '') return '';
+  try {
+    return s.toString().trim().toLowerCase().normalize('NFKD').replace(/\p{M}/gu, '');
+  } catch (e) {
+    // Fallback for environments without full unicode property support
+    return s.toString().trim().toLowerCase().normalize('NFKD').replace(/[\u0300-\u036f]/g, '');
+  }
+}
 function updateRepeatButton(btn) {
   if (!btn) return;
   btn.classList.remove('active', 'repeat-one');
@@ -810,10 +821,10 @@ function renderAlbums() {
           const allTracks = await electron.getLibrary();
           // Get album name, handling both 'album' and 'name' properties
           const albumNameRaw = albumToFilter.album || albumToFilter.name || '';
-          const nameToMatch = albumNameRaw.toString().trim().toLowerCase();
+          const nameToMatch = normalizeForCompare(albumNameRaw);
           
           const artistNameRaw = albumToFilter.artist || albumToFilter.artist_name || '';
-          const artistToMatch = artistNameRaw.toString().trim().toLowerCase() || null;
+          const artistToMatch = normalizeForCompare(artistNameRaw) || null;
 
           // Don't filter if album name is empty
           if (!nameToMatch) {
@@ -825,13 +836,16 @@ function renderAlbums() {
           currentAlbumFilter = { album: nameToMatch, artist: artistToMatch };
 
           tracks = allTracks.filter(t => {
-            const trackAlbum = (t.album || '').toString().trim().toLowerCase();
-            const trackArtist = (t.artist || '').toString().trim().toLowerCase();
+            const trackAlbum = normalizeForCompare(t.album || '');
+            const trackArtist = normalizeForCompare(t.artist || '');
             if (artistToMatch) {
               return trackAlbum === nameToMatch && trackArtist === artistToMatch;
             }
             return trackAlbum === nameToMatch;
           });
+          if (!tracks || tracks.length === 0) {
+            console.warn('[renderAlbums] album click produced 0 matches for', { album: albumNameRaw, nameToMatch, artistToMatch });
+          }
           renderLibrary();
           switchView('library', true); // preserve current filtered library (do not auto-reload)
         };
