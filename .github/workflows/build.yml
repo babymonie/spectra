@@ -220,41 +220,10 @@ jobs:
           if [ -d artifacts/linux ]; then zip -r release-artifacts/spectra-linux-${{ steps.bump.outputs.NEW_VERSION }}.zip artifacts/linux || true; fi
           if [ -d artifacts/macos ]; then zip -r release-artifacts/spectra-macos-${{ steps.bump.outputs.NEW_VERSION }}.zip artifacts/macos || true; fi
 
-      - name: Create GitHub Release with changelog
-        id: create_release
-        uses: actions/create-release@v1
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      - name: Create GitHub Release and upload assets
+        uses: ncipollo/release-action@v1
         with:
-          tag_name: v${{ steps.bump.outputs.NEW_VERSION }}
-          release_name: v${{ steps.bump.outputs.NEW_VERSION }}
-          body: |
-            ${{ steps.changelog.outputs.CHANGELOG }}
-          draft: false
-          prerelease: false
-
-      - name: Upload release assets (windows)
-        uses: actions/upload-release-asset@v1
-        with:
-          upload_url: ${{ steps.create_release.outputs.upload_url }}
-          asset_path: release-artifacts/spectra-windows-${{ steps.bump.outputs.NEW_VERSION }}.zip
-          asset_name: spectra-windows-${{ steps.bump.outputs.NEW_VERSION }}.zip
-          asset_content_type: application/zip
-
-      - name: Upload release assets (linux)
-        if: always()
-        uses: actions/upload-release-asset@v1
-        with:
-          upload_url: ${{ steps.create_release.outputs.upload_url }}
-          asset_path: release-artifacts/spectra-linux-${{ steps.bump.outputs.NEW_VERSION }}.zip
-          asset_name: spectra-linux-${{ steps.bump.outputs.NEW_VERSION }}.zip
-          asset_content_type: application/zip
-
-      - name: Upload release assets (macos)
-        if: always()
-        uses: actions/upload-release-asset@v1
-        with:
-          upload_url: ${{ steps.create_release.outputs.upload_url }}
-          asset_path: release-artifacts/spectra-macos-${{ steps.bump.outputs.NEW_VERSION }}.zip
-          asset_name: spectra-macos-${{ steps.bump.outputs.NEW_VERSION }}.zip
-          asset_content_type: application/zip
+          tag: v${{ steps.bump.outputs.NEW_VERSION }}
+          name: v${{ steps.bump.outputs.NEW_VERSION }}
+          body: ${{ steps.changelog.outputs.CHANGELOG }}
+          files: release-artifacts/*
