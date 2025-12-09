@@ -25,15 +25,170 @@ Download binaries, installers and extras at: https://spectra.f4ust.com — downl
 
 ---
 
-## **🚀 Quick Start (Windows PowerShell)**
+Here is a clean, polished **GitHub Installation + Update Guide** section you can append to your README.
+It matches your style and avoids TypeScript/Java completely.
+
+---
+
+# **📥 Installing Spectra (Source Build Guide)**
+
+You can clone and build Spectra directly from this official GitHub repository:
+
+### **1. Clone the repository**
 
 ```powershell
-cd "C:\Users\aloys\Downloads\spectra-archive\spectra"
+git clone https://github.com/babymonie/spectra.git
+cd spectra
+```
+
+Or using SSH:
+
+```bash
+git clone git@github.com:babymonie/spectra.git
+cd spectra
+```
+
+---
+
+### **2. Install dependencies**
+
+```powershell
 npm install
-npm run rebuild-electron   # rebuild native addon for your Electron version
+```
+
+If you see native build errors, ensure:
+
+* Visual Studio Build Tools (Windows)
+* Xcode CLI Tools (macOS)
+* build-essential + libasound2-dev (Linux)
+
+---
+
+### **3. Rebuild the native audio addon for Electron**
+
+> Spectra uses a **C++ Node-API addon** (`exclusive_audio.node`).
+> It *must* match your local Electron version.
+
+Run:
+
+```powershell
+npm run rebuild-electron
+```
+
+This wraps `electron-rebuild` and fixes most ABI mismatches automatically.
+
+---
+
+### **4. Start Spectra (development mode)**
+
+```powershell
 npm start
 ```
 
+This launches the Electron app using your local source tree.
+
+---
+
+# **🔄 Updating Spectra (Git Pull Guide)**
+
+Whenever you want the latest features and bug fixes:
+
+### **1. Save or stash your local changes**
+
+If you changed files locally, do:
+
+```powershell
+git stash
+```
+
+or commit your edits:
+
+```powershell
+git add .
+git commit -m "local changes"
+```
+
+---
+
+### **2. Pull the newest changes**
+
+```powershell
+git pull
+```
+
+If you previously used `stash`:
+
+```powershell
+git stash pop
+```
+
+---
+
+### **3. Rebuild native modules again**
+
+Any update from GitHub may change Electron or the addon.
+
+```powershell
+npm run rebuild-electron
+```
+
+---
+
+### **4. Launch again**
+
+```powershell
+npm start
+```
+
+---
+
+# **🧹 Fixing Common Git Update Errors**
+
+### **❗ “Your local changes would be overwritten by merge”**
+
+Either commit or stash:
+
+```powershell
+git stash
+git pull
+git stash pop
+```
+
+---
+
+### **❗ Module compiled against wrong NODE_MODULE_VERSION**
+
+Run rebuild:
+
+```powershell
+npm run rebuild-electron
+```
+
+---
+
+### **❗ Better-SQLite3 or audio addon failing to load**
+
+Delete build artifacts → reinstall:
+
+```powershell
+rmdir /s /q node_modules
+npm install
+npm run rebuild-electron
+```
+
+---
+
+# **🌐 Where Spectra Stores Your Library**
+
+| OS          | Path                                     |
+| ----------- | ---------------------------------------- |
+| **Windows** | `%APPDATA%/Spectra/`                     |
+| **macOS**   | `~/Library/Application Support/Spectra/` |
+| **Linux**   | `~/.config/Spectra/`                     |
+
+Your database, covers, plugin configs, and settings stay intact between updates.
+
+--- 
 ### If you get errors:
 
 * Ensure **Visual Studio Build Tools** are installed
@@ -171,6 +326,45 @@ Spectra stores data in:
 ~/Library/Application Support/Spectra/
 ~/.config/Spectra/
 ```
+
+---
+
+## **🛠️ Developer: Git hooks & version bump**
+
+A lightweight post-commit version bump flow is included in the repository to keep the `package.json` patch version moving after each commit.
+
+- Tracked files:
+  - `.githooks/post-commit` — wrapper hook that runs the bump script if `core.hooksPath` is configured to `.githooks`.
+  - `scripts/post-commit-bump.js` — Node script that increments the patch version in `package.json` and commits the change with the message `chore: bump version to X.Y.Z`.
+
+How it works (local developer):
+
+1. Enable the tracked hooks directory so Git runs the tracked hook automatically for your clone:
+
+```powershell
+git config core.hooksPath .githooks
+```
+
+2. After that, each `git commit` will trigger the hook which runs the bump script. The script will:
+
+  - Skip creating a bump commit if the most recent commit message already looks like `chore: bump version to ...` (prevents an infinite loop).
+  - Read `package.json`, increment the patch number (e.g. `1.2.3` → `1.2.4`), write the file, stage and commit it.
+
+3. If you prefer to run the bump manually (for CI runs or manual control):
+
+```powershell
+npm run bump-version
+```
+
+Notes & options:
+
+- If you don't want the hook to run locally, undo step (1) to restore the default local hooks directory:
+
+```powershell
+git config --unset core.hooksPath
+```
+
+- For teams that prefer server-side versioning or CI-based bumps, I can add a GitHub Action that runs the bump when changes are merged to `main` instead of using local hooks.
 
 ---
 
