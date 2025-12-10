@@ -1982,7 +1982,21 @@ const loadPlugins = async () => {
           settingsHtml = '<div class="plugin-settings">';
           for (const [key, value] of Object.entries(p.settings)) {
             const settingId = `plugin-setting-${p.id}-${key}`;
-            if (typeof value === 'boolean') {
+            // Render a provider dropdown for the object-storage plugin
+            if (p.id === 'object-storage' && key === 'provider') {
+              const options = ['minio','s3','gcs','digitalocean','wasabi','backblaze'];
+              let optsHtml = '';
+              for (const o of options) {
+                optsHtml += `<option value="${o}" ${String(value) === o ? 'selected' : ''}>${o}</option>`;
+              }
+              settingsHtml += `
+                <div class="setting-item">
+                  <label for="${settingId}">Provider</label>
+                  <select id="${settingId}" data-setting-key="${key}">
+                    ${optsHtml}
+                  </select>
+                </div>`;
+            } else if (typeof value === 'boolean') {
               settingsHtml += `
                 <div class="setting-item checkbox">
                   <input type="checkbox" id="${settingId}" ${value ? 'checked' : ''} data-setting-key="${key}">
@@ -2074,7 +2088,7 @@ const loadPlugins = async () => {
         });
 
         // Add listeners for settings inputs
-        const settingInputs = card.querySelectorAll('.plugin-settings input');
+        const settingInputs = card.querySelectorAll('.plugin-settings input, .plugin-settings select, .plugin-settings textarea');
         settingInputs.forEach(input => {
           input.addEventListener('change', async (e) => {
             const settingKey = e.target.dataset.settingKey;
