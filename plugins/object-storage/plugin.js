@@ -88,6 +88,28 @@ export function activate(context) {
     if (context.registerRemoteHandler) {
       context.registerRemoteHandler('object-storage:upload', handleUpload);
     }
+    // Provide an IPC handler to request a presigned URL or cached path for a key
+    const handleGetUrl = async (event, key) => {
+      try {
+        if (!key) return { error: 'missing key' };
+        if (!isInitialized) return { error: 'object-storage not initialized' };
+        if (settings.cacheFiles) {
+          // Return local cached path (download if needed)
+          const local = await downloadToCache(key);
+          return { path: local };
+        }
+        const url = await getPresignedUrl(key);
+        return { url };
+      } catch (err) {
+        console.error('[object-storage] get-url failed', err);
+        return { error: String(err && err.message ? err.message : err) };
+      }
+    };
+
+    ipcMain.handle('object-storage:get-url', (event, key) => handleGetUrl(event, key));
+    if (context.registerRemoteHandler) {
+      context.registerRemoteHandler('object-storage:get-url', handleGetUrl);
+    }
   } catch (e) {
     console.warn('[object-storage] failed to register ipc upload handler', e);
   }
@@ -105,6 +127,7 @@ export function deactivate() {
   isInitialized = false;
 
   try { ipcMain.removeHandler && ipcMain.removeHandler('object-storage:upload'); } catch (e) {}
+  try { ipcMain.removeHandler && ipcMain.removeHandler('object-storage:get-url'); } catch (e) {}
   
   console.log('[object-storage] Plugin deactivated');
 }

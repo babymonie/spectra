@@ -66,6 +66,8 @@ contextBridge.exposeInMainWorld('electron', {
   importPlaylist: () => ipcRenderer.invoke('playlists:import'),
   // Object storage upload from renderer -> plugin main
   objectStorageUpload: (localPath, key) => ipcRenderer.invoke('object-storage:upload', localPath, key),
+  // Request a presigned URL or cached path for an object-storage key
+  objectStorageGetUrl: (key) => ipcRenderer.invoke('object-storage:get-url', key),
   relinkTrack: (info) => ipcRenderer.invoke('track:relink', info),
   downloadTrack: (opts) => ipcRenderer.invoke('track:download', opts),
   on: (channel, callback) => ipcRenderer.on(channel, (event, ...args) => callback(...args))

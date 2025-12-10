@@ -378,9 +378,22 @@
   window.playStorageFile = async function(key) {
     try {
       const file = storageFiles.find(f => f.Key === key) || {};
-      const url = file.url || null;
+      let url = file.url || null;
+      // If no presigned URL is present, request one from the main/plugin
+      if (!url && file.Key && window.electron && window.electron.objectStorageGetUrl) {
+        try {
+          const res = await window.electron.objectStorageGetUrl(file.Key);
+          if (res) {
+            if (res.url) url = res.url;
+            else if (res.path) url = res.path; // local cached path
+          }
+        } catch (err) {
+          console.warn('[object-storage] get-url failed', err);
+        }
+      }
+
       if (!url) return alert('No playable URL available for this file. Try Refresh/Connect.');
-      // Stream via presigned URL (preferred). Pass URL to playback API.
+      // Stream via presigned URL or play local path. Pass to playback API.
       await window.electron.playTrack(url, { track: { title: (key.split('/').pop() || key) } });
     } catch (err) {
       alert(`Failed to play: ${err.message}`);
