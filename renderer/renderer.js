@@ -738,11 +738,44 @@ const loadLibrary = async () => {
   }
 
   if (query) {
-    tracks = base.filter(t => {
+    // Support prefixes: +term (required), -term (exclude), and field:value (title:, artist:, album:)
+    const tokens = query.split(/\s+/).filter(Boolean);
+    const parsed = tokens.map(tok => {
+      let type = 'include';
+      let text = tok;
+      if (tok.startsWith('-')) { type = 'exclude'; text = tok.slice(1); }
+      else if (tok.startsWith('+')) { type = 'include'; text = tok.slice(1); }
+      // fielded search
+      const m = text.match(/^(title|artist|album):(.+)$/);
+      if (m) return { type, field: m[1], text: m[2] };
+      return { type, field: null, text };
+    });
+
+    const matchesToken = (t, token) => {
+      const text = (token.text || '').toLowerCase();
+      if (!text) return true;
+      if (token.field) {
+        const v = ((t[token.field] || '') + '').toLowerCase();
+        return v.includes(text);
+      }
+      // default: search title, artist, album
       const title = (t.title || '').toLowerCase();
       const artist = (t.artist || '').toLowerCase();
       const album = (t.album || '').toLowerCase();
-      return title.includes(query) || artist.includes(query) || album.includes(query);
+      return title.includes(text) || artist.includes(text) || album.includes(text);
+    };
+
+    tracks = base.filter(t => {
+      // All include tokens must match; no exclude tokens must match
+      for (const tok of parsed) {
+        if (tok.type === 'exclude') {
+          if (matchesToken(t, tok)) return false;
+        } else {
+          // include
+          if (!matchesToken(t, tok)) return false;
+        }
+      }
+      return true;
     });
   } else {
     tracks = base;
@@ -1502,11 +1535,39 @@ const initSearch = () => {
     if (!query) {
       tracks = base;
     } else {
-      tracks = base.filter(t => {
+      const tokens = query.split(/\s+/).filter(Boolean);
+      const parsed = tokens.map(tok => {
+        let type = 'include';
+        let text = tok;
+        if (tok.startsWith('-')) { type = 'exclude'; text = tok.slice(1); }
+        else if (tok.startsWith('+')) { type = 'include'; text = tok.slice(1); }
+        const m = text.match(/^(title|artist|album):(.+)$/);
+        if (m) return { type, field: m[1], text: m[2] };
+        return { type, field: null, text };
+      });
+
+      const matchesToken = (t, token) => {
+        const text = (token.text || '').toLowerCase();
+        if (!text) return true;
+        if (token.field) {
+          const v = ((t[token.field] || '') + '').toLowerCase();
+          return v.includes(text);
+        }
         const title = (t.title || '').toLowerCase();
         const artist = (t.artist || '').toLowerCase();
         const album = (t.album || '').toLowerCase();
-        return title.includes(query) || artist.includes(query) || album.includes(query);
+        return title.includes(text) || artist.includes(text) || album.includes(text);
+      };
+
+      tracks = base.filter(t => {
+        for (const tok of parsed) {
+          if (tok.type === 'exclude') {
+            if (matchesToken(t, tok)) return false;
+          } else {
+            if (!matchesToken(t, tok)) return false;
+          }
+        }
+        return true;
       });
     }
     renderLibrary();

@@ -1,7 +1,7 @@
 // Simple dependency bootstrap for running Spectra from source
 // This runs automatically before `npm start` (via the `prestart` script).
 
-import { existsSync, mkdirSync, createWriteStream, copyFileSync, readdirSync } from 'node:fs';
+import { existsSync, mkdirSync, createWriteStream, copyFileSync, readdirSync, chmodSync } from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { spawnSync } from 'node:child_process';
@@ -48,6 +48,9 @@ function ensureNativeAddon() {
 
 async function ensureFfmpeg() {
   const isWindows = process.platform === 'win32';
+  const isMac = process.platform === 'darwin';
+  const isLinux = process.platform === 'linux';
+  const arch = process.arch; // 'x64', 'arm64', etc.
 
   // If a local ffmpeg binary already exists under ./bin, we're done.
   const ffmpegName = isWindows ? 'ffmpeg.exe' : 'ffmpeg';
@@ -65,81 +68,115 @@ async function ensureFfmpeg() {
     return;
   }
 
-  if (!isWindows) {
-    console.warn('[ensure-deps] No FFmpeg found and auto-download is only configured for Windows.');
+  if (!isWindows && !isMac && !isLinux) {
+    console.warn('[ensure-deps] No FFmpeg found and auto-download is not supported on this platform.');
     console.warn('              Please install FFmpeg manually or add it to your PATH.');
     return;
   }
 
-  // Windows: download official static build ZIP if nothing is available.
+  // Prepare download directory
   mkdirSync(localBinDir, { recursive: true });
 
   const downloadDir = path.join(rootDir, '.spectra-tools');
   mkdirSync(downloadDir, { recursive: true });
-  const zipPath = path.join(downloadDir, 'ffmpeg-win.zip');
   const unzipDir = path.join(downloadDir, 'ffmpeg-unpacked');
 
-  const ffmpegUrl = process.env.SPECTRA_FFMPEG_ZIP_URL
-    || 'https://www.gyan.dev/ffmpeg/builds/ffmpeg-release-essentials.zip';
+  // Determine download URL based on platform/arch or env override
+  let ffmpegUrl = process.env.SPECTRA_FFMPEG_URL || '';
+  if (!ffmpegUrl) {
+    if (isWindows) {
+      ffmpegUrl = 'https://www.gyan.dev/ffmpeg/builds/ffmpeg-release-essentials.zip';
+    } else if (isLinux) {
+      if (arch === 'x64') ffmpegUrl = 'https://johnvansickle.com/ffmpeg/releases/ffmpeg-release-amd64-static.tar.xz';
+      else if (arch === 'arm64') ffmpegUrl = 'https://johnvansickle.com/ffmpeg/releases/ffmpeg-release-arm64-static.tar.xz';
+      else ffmpegUrl = '';
+    } else if (isMac) {
+      // evermeet provides macOS builds; versioned names may change so allow override
+      ffmpegUrl = 'https://evermeet.cx/ffmpeg/ffmpeg-6.0.zip';
+    }
+  }
 
-  console.log('[ensure-deps] No FFmpeg found; downloading ZIP from:', ffmpegUrl);
+  if (!ffmpegUrl) {
+    console.warn('[ensure-deps] No default FFmpeg URL available for this platform/arch.');
+    console.warn('              Set SPECTRA_FFMPEG_URL to a static FFmpeg archive (zip or tar.xz) to enable auto-download.');
+    return;
+  }
 
+  const archiveName = path.basename(new URL(ffmpegUrl).pathname);
+  const archivePath = path.join(downloadDir, archiveName);
+
+  console.log('[ensure-deps] Downloading FFmpeg from:', ffmpegUrl);
   const res = await fetch(ffmpegUrl);
   if (!res.ok || !res.body) {
-    console.error('[ensure-deps] Failed to download FFmpeg ZIP:', res.status, res.statusText);
+    console.error('[ensure-deps] Failed to download FFmpeg archive:', res.status, res.statusText);
     return;
   }
 
   await new Promise((resolve, reject) => {
-    const fileStream = createWriteStream(zipPath);
+    const fileStream = createWriteStream(archivePath);
     res.body.pipe(fileStream);
     res.body.on('error', reject);
     fileStream.on('finish', resolve);
     fileStream.on('error', reject);
   });
 
-  console.log('[ensure-deps] Downloaded FFmpeg ZIP to', zipPath);
+  console.log('[ensure-deps] Downloaded FFmpeg archive to', archivePath);
 
-  // Use PowerShell Expand-Archive to unzip (available on modern Windows).
-  console.log('[ensure-deps] Extracting FFmpeg ZIP...');
-  const expand = spawnSync('powershell', [
-    '-NoProfile',
-    '-ExecutionPolicy', 'Bypass',
-    '-Command',
-    `Remove-Item -Recurse -Force "${unzipDir}" -ErrorAction SilentlyContinue; ` +
-    `New-Item -ItemType Directory -Force -Path "${unzipDir}" | Out-Null; ` +
-    `Expand-Archive -Force -Path "${zipPath}" -DestinationPath "${unzipDir}"`
-  ], {
-    cwd: rootDir,
-    stdio: 'inherit'
-  });
+  // Extract depending on archive type
+  mkdirSync(unzipDir, { recursive: true });
+  let extractOk = false;
+  if (archivePath.endsWith('.zip')) {
+    console.log('[ensure-deps] Extracting ZIP...');
+    const unzip = spawnSync(process.platform === 'win32' ? 'powershell' : 'unzip',
+      process.platform === 'win32'
+        ? ['-NoProfile', '-ExecutionPolicy', 'Bypass', '-Command', `Expand-Archive -Force -Path "${archivePath}" -DestinationPath "${unzipDir}"`]
+        : [archivePath, '-d', unzipDir],
+      { cwd: rootDir, stdio: 'inherit', shell: process.platform === 'win32' }
+    );
+    extractOk = unzip.status === 0;
+  } else if (archivePath.endsWith('.tar.xz') || archivePath.endsWith('.txz')) {
+    console.log('[ensure-deps] Extracting tar.xz...');
+    const tar = spawnSync('tar', ['-xJf', archivePath, '-C', unzipDir], { cwd: rootDir, stdio: 'inherit' });
+    extractOk = tar.status === 0;
+  } else if (archivePath.endsWith('.tar.gz') || archivePath.endsWith('.tgz')) {
+    console.log('[ensure-deps] Extracting tar.gz...');
+    const tar = spawnSync('tar', ['-xzf', archivePath, '-C', unzipDir], { cwd: rootDir, stdio: 'inherit' });
+    extractOk = tar.status === 0;
+  } else {
+    console.warn('[ensure-deps] Unknown archive type for', archivePath);
+  }
 
-  if (expand.status !== 0) {
-    console.error('[ensure-deps] Failed to extract FFmpeg ZIP.');
+  if (!extractOk) {
+    console.error('[ensure-deps] Failed to extract FFmpeg archive.');
     return;
   }
 
-  // Recursively search for ffmpeg.exe inside the unpacked folder.
-  function findFfmpegExe(dir) {
+  // Recursively search for ffmpeg executable in unpacked folder.
+  function findFfmpegExec(dir) {
     const entries = readdirSync(dir, { withFileTypes: true });
     for (const ent of entries) {
       const full = path.join(dir, ent.name);
-      if (ent.isFile() && ent.name.toLowerCase() === 'ffmpeg.exe') return full;
+      if (ent.isFile() && (ent.name === 'ffmpeg' || ent.name.toLowerCase() === 'ffmpeg.exe')) return full;
       if (ent.isDirectory()) {
-        const found = findFfmpegExe(full);
+        const found = findFfmpegExec(full);
         if (found) return found;
       }
     }
     return null;
   }
 
-  const foundFfmpeg = findFfmpegExe(unzipDir);
+  const foundFfmpeg = findFfmpegExec(unzipDir);
   if (!foundFfmpeg) {
-    console.error('[ensure-deps] Extracted FFmpeg ZIP but could not locate ffmpeg.exe');
+    console.error('[ensure-deps] Extracted FFmpeg archive but could not locate ffmpeg binary');
     return;
   }
 
+  // Ensure executable bit and copy into local bin
+  try {
+    chmodSync(foundFfmpeg, 0o755);
+  } catch (_) {}
   copyFileSync(foundFfmpeg, localFfmpegPath);
+  try { chmodSync(localFfmpegPath, 0o755); } catch (_) {}
   console.log('[ensure-deps] Installed local FFmpeg to', localFfmpegPath);
 }
 

@@ -12,6 +12,7 @@
     "build:electron": "powershell -NoProfile -ExecutionPolicy Bypass -File ./scripts/build.ps1 -mode electron",
     "build:node": "powershell -NoProfile -ExecutionPolicy Bypass -File ./scripts/build.ps1 -mode node",
     "rebuild-electron": "npx electron-rebuild -f",
+    "postinstall": "npx electron-rebuild -f || true",
     "bump-version": "node ./scripts/post-commit-bump.js"
   },
   "keywords": [
@@ -50,9 +51,14 @@
     "asarUnpack": [
       "node_modules/ffmpeg-static/**/*",
       "build/**/*",
-      "bin/**/*"
+      "bin/**/*",
+      "**/*.node"
     ],
     "afterPack": "./scripts/afterPack.js",
+    "extraResources": [
+      "bin/**/*",
+      "build/Release/*.node"
+    ],
     "mac": {
       "target": [
         "dmg",

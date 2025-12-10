@@ -131,12 +131,26 @@
             statusIcon.textContent = 'cloud_done';
             statusIcon.style.color = '#4caf50';
           }
+          // enable controls when connected
+          const btnRefresh = document.getElementById('btn-storage-refresh');
+          const btnImportAll = document.getElementById('btn-storage-import-all');
+          const btnBrowse = document.getElementById('btn-storage-browse');
+          if (btnRefresh) btnRefresh.disabled = false;
+          if (btnImportAll) btnImportAll.disabled = false;
+          if (btnBrowse) btnBrowse.disabled = false;
         } else {
           if (statusText) statusText.textContent = status.message || 'Not connected';
           if (statusIcon) {
             statusIcon.textContent = 'cloud_off';
             statusIcon.style.color = '#ff6b6b';
           }
+          // disable refresh when not connected
+          const btnRefresh = document.getElementById('btn-storage-refresh');
+          const btnImportAll = document.getElementById('btn-storage-import-all');
+          const btnBrowse = document.getElementById('btn-storage-browse');
+          if (btnRefresh) btnRefresh.disabled = true;
+          if (btnImportAll) btnImportAll.disabled = true;
+          if (btnBrowse) btnBrowse.disabled = true;
         }
         isConnected = !!status.connected;
       });
@@ -171,7 +185,7 @@
     
     if (btnImportAll) {
       btnImportAll.onclick = async () => {
-        await importAllFiles();
+          await importAllFiles();
       };
     }
     
@@ -250,6 +264,72 @@
     if (listEl) listEl.innerHTML = '<div class="loading">Waiting for results...</div>';
     if (countEl) countEl.textContent = '';
   }
+
+  // Import all files with progress feedback using the global notification bar
+  async function importAllFiles() {
+    if (storageFiles.length === 0) {
+      alert('No files to import');
+      return;
+    }
+    if (!confirm(`Import ${storageFiles.length} files from object storage?`)) return;
+
+    const notif = document.getElementById('notification-bar');
+    const msg = document.getElementById('notification-message');
+    const prog = document.getElementById('notification-progress');
+    const cnt = document.getElementById('notification-count');
+
+    if (notif) notif.classList.add('show');
+    if (msg) msg.textContent = 'Importing from Object Storage...';
+    if (prog) prog.style.width = '0%';
+    if (cnt) cnt.textContent = `0/${storageFiles.length}`;
+
+    let success = 0;
+    for (let i = 0; i < storageFiles.length; i++) {
+      const f = storageFiles[i];
+      const name = (f.Key || '').split('/').pop() || f.Key || 'unknown';
+      try {
+        if (msg) msg.textContent = `Importing: ${name}`;
+        // Prefer cachedPath (local file) so we can add as local file and get full metadata
+        if (f.cachedPath) {
+          await window.electron.addFiles([f.cachedPath]);
+        } else if (f.url) {
+          // Add as remote reference
+          await window.electron.addRemote({ url: f.url, title: name });
+        } else if (f.Key) {
+          // Try requesting plugin to download to cache via existing API: call plugins:update-settings to nudge plugin
+          try {
+            const plugins = await window.electron.getPlugins();
+            const p = plugins.find(x => x.id === 'object-storage');
+            if (p) await window.electron.updatePluginSettings('object-storage', p.settings || {});
+          } catch (_) {}
+        }
+        success++;
+      } catch (err) {
+        console.warn('[object-storage] import item failed', f.Key, err);
+      }
+
+      // update progress
+      const percent = Math.round(((i + 1) / storageFiles.length) * 100);
+      if (prog) prog.style.width = `${percent}%`;
+      if (cnt) cnt.textContent = `${i + 1}/${storageFiles.length}`;
+      // brief pause to keep UI responsive for large batches
+      await new Promise(r => setTimeout(r, 50));
+    }
+
+    if (msg) msg.textContent = `Import complete (${success}/${storageFiles.length})`;
+    if (prog) prog.style.width = '100%';
+    // allow UI to show completion then hide and refresh library
+    setTimeout(async () => {
+      if (notif) notif.classList.remove('show');
+      try { await window.electron.getLibrary(); } catch (_) {}
+      // nudge plugin to refresh listing after import
+      try {
+        const plugins = await window.electron.getPlugins();
+        const p = plugins.find(x => x.id === 'object-storage');
+        if (p) await window.electron.updatePluginSettings('object-storage', p.settings || {});
+      } catch (_) {}
+    }, 1200);
+  }
   
   function renderFilesList(files) {
     const listEl = document.getElementById('storage-files-list');
@@ -292,20 +372,7 @@
     return Math.round(bytes / Math.pow(k, i) * 100) / 100 + ' ' + sizes[i];
   }
   
-  async function importAllFiles() {
-    if (storageFiles.length === 0) {
-      alert('No files to import');
-      return;
-    }
-    
-    if (!confirm(`Import ${storageFiles.length} files from object storage?`)) {
-      return;
-    }
-    
-    // In real implementation, would batch import files
-    console.log('Importing all files:', storageFiles);
-    alert(`Started importing ${storageFiles.length} files. This may take a while.`);
-  }
+  
   
   // Make functions available globally for inline onclick handlers
   window.playStorageFile = async function(key) {
