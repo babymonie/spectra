@@ -261,11 +261,17 @@ async function playFile(filePath, onEnd, onError, options = {}) {
   const args = [
     '-hide_banner',
     '-loglevel', 'error',
-    // Robust streaming options: auto-reconnect when HTTP stream drops
-    '-reconnect', '1',
-    '-reconnect_streamed', '1',
-    '-reconnect_delay_max', '5',
   ];
+
+  const isNetworkSource = typeof filePath === 'string' && /^https?:\/\//i.test(filePath);
+  if (isNetworkSource) {
+    // Robust streaming options: auto-reconnect when HTTP stream drops
+    args.push(
+      '-reconnect', '1',
+      '-reconnect_streamed', '1',
+      '-reconnect_delay_max', '5'
+    );
+  }
 
   if (options.startTime) {
     args.push('-ss', String(options.startTime));
@@ -534,7 +540,7 @@ function seek(time) {
   playFile(currentFile, lastOnEnd, lastOnError, { ...lastOptions, startTime: time });
 }
 
-export default {
+const audioEngineApi = {
   playFile,
   stop,
   pause,
@@ -545,5 +551,7 @@ export default {
   setVolume,
   seek,
   setEQ,
-  getEQ
+  getEQ,
 };
+
+export default audioEngineApi;

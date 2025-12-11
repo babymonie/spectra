@@ -1,4 +1,4 @@
-const { electron } = window;
+const { electron } = globalThis;
 
 // State
 let tracks = [];
@@ -71,7 +71,7 @@ function normalizeForCompare(s) {
   if (!s && s !== '') return '';
   try {
     return s.toString().trim().toLowerCase().normalize('NFKD').replace(/\p{M}/gu, '');
-  } catch (e) {
+  } catch {
     // Fallback for environments without full unicode property support
     return s.toString().trim().toLowerCase().normalize('NFKD').replace(/[\u0300-\u036f]/g, '');
   }
@@ -1600,6 +1600,102 @@ const syncState = (state) => {
 // Plugin System API (sandboxed via factory)
 const SPECTRA_PLUGIN_API_VERSION = 1;
 
+const isWebClient = typeof window !== 'undefined' && window.location && /^http/.test(window.location.protocol || '');
+
+const convertPluginProtocolUrl = (url) => {
+  if (typeof url !== 'string') return url;
+  if (!url.startsWith('plugins://')) return url;
+  const remainder = url.slice('plugins://'.length);
+  return `/plugins/${remainder}`;
+};
+
+const resolvePluginResource = (pluginId, resourcePath) => {
+  if (!resourcePath) return resourcePath;
+  let resourceUrl = resourcePath;
+  if (!resourceUrl.startsWith('plugins://') && !/^\w+:\/\//.test(resourceUrl) && !resourceUrl.startsWith('/')) {
+    resourceUrl = `plugins://${pluginId}/${resourceUrl}`;
+  }
+  if (isWebClient) {
+    return convertPluginProtocolUrl(resourceUrl);
+  }
+  return resourceUrl;
+};
+
+const removePluginAssets = (pluginId) => {
+  if (!pluginId) return;
+  const selectors = [
+    `link[href*="plugins://${pluginId}/"]`,
+    `script[src*="plugins://${pluginId}/"]`,
+    `img[src*="plugins://${pluginId}/"]`
+  ];
+  if (isWebClient) {
+    selectors.push(
+      `link[href*="/plugins/${pluginId}/"]`,
+      `script[src*="/plugins/${pluginId}/"]`,
+      `img[src*="/plugins/${pluginId}/"]`
+    );
+  }
+  selectors.forEach((selector) => {
+    try {
+      document.querySelectorAll(selector).forEach((el) => el.remove());
+    } catch (err) {
+      console.warn('Failed to remove plugin asset', selector, err);
+    }
+  });
+};
+
+if (isWebClient) {
+  const normalizeElementResourceAttrs = (element) => {
+    if (!element || element.nodeType !== 1) return;
+    if (element.hasAttribute('src')) {
+      const src = element.getAttribute('src');
+      const converted = convertPluginProtocolUrl(src);
+      if (converted !== src) element.setAttribute('src', converted);
+    }
+    if (element.hasAttribute('href')) {
+      const href = element.getAttribute('href');
+      const converted = convertPluginProtocolUrl(href);
+      if (converted !== href) element.setAttribute('href', converted);
+    }
+  };
+
+  const scanAndNormalize = (root) => {
+    if (!root) return;
+    if (root.nodeType === 1) normalizeElementResourceAttrs(root);
+    if (root.querySelectorAll) {
+      root.querySelectorAll('[src],[href]').forEach((node) => normalizeElementResourceAttrs(node));
+    }
+  };
+
+  scanAndNormalize(document);
+
+  const urlObserver = new MutationObserver((mutations) => {
+    for (const mutation of mutations) {
+      if (mutation.type === 'attributes') {
+        normalizeElementResourceAttrs(mutation.target);
+        continue;
+      }
+      if (mutation.type === 'childList') {
+        Array.from(mutation.addedNodes || []).forEach((node) => {
+          if (node.nodeType !== 1) return;
+          scanAndNormalize(node);
+        });
+      }
+    }
+  });
+
+  try {
+    urlObserver.observe(document.documentElement || document.body || document, {
+      childList: true,
+      subtree: true,
+      attributes: true,
+      attributeFilter: ['src', 'href']
+    });
+  } catch (observerErr) {
+    console.warn('Failed to initialize plugin resource normalizer', observerErr);
+  }
+}
+
 // Internal plugin registry: tracks registrations and nodes created by plugins
 const _pluginRegistry = new Map(); // pluginId -> [ { selector, initFn, nodes: Set<Element> } ]
 let _pluginMutationObserver = null;
@@ -1752,7 +1848,7 @@ const Spectra = {
               }
             } catch (e) { console.error('plugin initFn error:', e); }
           });
-        } catch (e) { /* ignore selector errors */ }
+        } catch { /* ignore selector errors */ }
 
         // Ensure we observe future DOM insertions
         _ensurePluginObserver();
@@ -1769,24 +1865,24 @@ const Spectra = {
             try {
               if (n && n.parentNode) n.parentNode.removeChild(n);
               if (n && n.dataset) delete n.dataset.pluginId;
-            } catch (e) { /* ignore per-node removal errors */ }
+            } catch { /* ignore per-node removal errors */ }
           }
           // Remove any globals the plugin promised to expose
           if (reg.globals && reg.globals.size) {
             try {
               for (const g of Array.from(reg.globals)) {
-                try { if (window && window[g]) delete window[g]; } catch (ee) {}
-                try { if (window.Spectra && window.Spectra.plugins && window.Spectra.plugins[pluginId]) delete window.Spectra.plugins[pluginId][g]; } catch (ee) {}
+                try { if (window && window[g]) delete window[g]; } catch {}
+                try { if (window.Spectra && window.Spectra.plugins && window.Spectra.plugins[pluginId]) delete window.Spectra.plugins[pluginId][g]; } catch {}
               }
-            } catch (e) {}
+            } catch {}
           }
           // Attempt to remove any IPC listeners the plugin may have registered
           try {
             if (window && window.electron && typeof window.electron.off === 'function') {
-              try { window.electron.off(`${pluginId}:files`); } catch (e) {}
-              try { window.electron.off(`${pluginId}:status`); } catch (e) {}
+              try { window.electron.off(`${pluginId}:files`); } catch {}
+              try { window.electron.off(`${pluginId}:status`); } catch {}
             }
-          } catch (e) {}
+          } catch {}
         }
         _pluginRegistry.delete(pluginId);
       } catch (e) {
@@ -1880,27 +1976,24 @@ async function cleanupPluginDOM() {
       if (p.enabled) continue;
 
       // Ensure any registered targets for this disabled plugin are removed
-      try { Spectra.ui.unregisterPluginTargets(p.id); } catch (e) {}
+      try { Spectra.ui.unregisterPluginTargets(p.id); } catch {}
 
       const pid = p.id;
       if (!pid) continue;
 
       // Remove nav/view elements specifically (common plugin UI pattern)
-      try { document.getElementById(`nav-${pid}`)?.remove(); } catch (e) {}
-      try { document.getElementById(`view-${pid}`)?.remove(); } catch (e) {}
-      
+      try { document.getElementById(`nav-${pid}`)?.remove(); } catch {}
+      try { document.getElementById(`view-${pid}`)?.remove(); } catch {}
+
       // Remove plugin-prefixed elements (but not settings UI)
       try {
-        document.querySelectorAll(`[id^="${pid}-"]`).forEach(el => el.remove());
-      } catch (e) { /* ignore selector errors */ }
+        document.querySelectorAll(`[id^="${pid}-"]`).forEach((el) => el.remove());
+      } catch { /* ignore selector errors */ }
 
-      // Remove stylesheet/script/img/link tags referencing the plugin via plugins://
-      try {
-        document.querySelectorAll(`link[href*="plugins://${pid}/"], script[src*="plugins://${pid}/"], img[src*="plugins://${pid}/"]`).forEach(el => el.remove());
-      } catch (e) {}
+      removePluginAssets(pid);
 
       // Remove a well-known style id pattern used by some plugins
-      try { document.getElementById(`style-${pid}`)?.remove(); } catch (e) {}
+      try { document.getElementById(`style-${pid}`)?.remove(); } catch {}
     }
 
   } catch (err) {
@@ -1913,15 +2006,21 @@ try {
   electron.on('plugins:will-reload', async () => {
     try {
       await cleanupPluginDOM();
-    } catch (e) {}
+    } catch {}
     // Notify main we're ready for it to proceed with deactivation
-    try { if (typeof electron.signalPluginsReadyForReload === 'function') electron.signalPluginsReadyForReload(); } catch (e) {}
+    try {
+      if (typeof electron.signalPluginsReadyForReload === 'function') {
+        Promise.resolve(electron.signalPluginsReadyForReload()).catch((err) => {
+          console.warn('Failed to notify main about plugin reload readiness', err);
+        });
+      }
+    } catch {}
   });
   electron.on('plugins:reloaded', () => {
     // Re-run plugin loading in renderer to pick up new/updated UI entries
     try { loadPlugins(); } catch (e) { console.warn('Failed to reload plugins in renderer', e); }
   });
-} catch (e) {
+} catch {
   // If electron.on is not available for some reason, ignore silently
 }
 
@@ -1943,10 +2042,10 @@ const loadPlugins = async () => {
           // Remove any elements with IDs starting with the plugin ID
           document.querySelectorAll(`[id^="${pid}-"]`).forEach(el => el.remove());
           // Remove plugin assets
-          document.querySelectorAll(`link[href*="plugins://${pid}/"], script[src*="plugins://${pid}/"], img[src*="plugins://${pid}/"]`).forEach(el => el.remove());
+          removePluginAssets(pid);
           document.getElementById(`style-${pid}`)?.remove();
-        } catch (e) {
-          console.warn(`Failed to cleanup ${pid}:`, e);
+        } catch (err) {
+          console.warn(`Failed to cleanup ${pid}:`, err);
         }
       }
     }
@@ -1973,7 +2072,7 @@ const loadPlugins = async () => {
         const card = document.createElement('div');
         card.className = 'plugin-card';
 
-        const iconSrc = p.icon ? `plugins://${p.id}/${p.icon}` : '';
+        const iconSrc = p.icon ? resolvePluginResource(p.id, p.icon) : '';
         const iconHtml = iconSrc ? `<img src="${iconSrc}" alt="${p.name || p.id} icon" style="width:100%;height:100%;object-fit:contain;">` : '<span class="material-icons">extension</span>';
 
         // Build settings HTML if settings exist
@@ -2063,10 +2162,7 @@ const loadPlugins = async () => {
                   el.remove();
                 });
                 // Remove plugin assets
-                document.querySelectorAll(`link[href*="plugins://${pid}/"], script[src*="plugins://${pid}/"], img[src*="plugins://${pid}/"]`).forEach(el => {
-                  console.log(`[renderer] Removing asset: ${el.tagName} ${el.href || el.src}`);
-                  el.remove();
-                });
+                removePluginAssets(pid);
                 document.getElementById(`style-${pid}`)?.remove();
                 // Unregister plugin UI targets
                 if (typeof Spectra !== 'undefined' && Spectra.ui && Spectra.ui.unregisterPluginTargets) {
@@ -2153,12 +2249,7 @@ const loadPlugins = async () => {
         // Resolve plugin entry path. If the manifest provides a relative path
         // (e.g. "ui.js"), fetch it via the registered `plugins://` protocol
         // so it loads from the plugin folder in the app's data or repo plugins.
-        let entryUrl = p.entry;
-        // If entry looks like a simple filename (no scheme/host), build plugins:// URL
-        if (!/^\w+:\/\//.test(entryUrl) && !entryUrl.startsWith('plugins://') && !entryUrl.startsWith('/')) {
-          entryUrl = `plugins://${p.id}/${entryUrl}`;
-        }
-
+        let entryUrl = resolvePluginResource(p.id, p.entry);
         console.log(`[renderer] Loading plugin UI: ${p.id} from ${entryUrl}`);
         const res = await fetch(entryUrl);
         const code = await res.text();
@@ -2196,7 +2287,6 @@ async function init() {
   const queuePanel = document.getElementById('queue-panel');
   const btnCloseQueue = document.getElementById('btn-close-queue');
   const btnClearQueue = document.getElementById('btn-clear-queue');
-  const queueList = document.getElementById('queue-list');
 
   deviceSelect = document.getElementById('device-select');
   modeSelect = document.getElementById('mode-select');
@@ -2426,7 +2516,7 @@ async function init() {
             await playTrack(currentTrack);
             // playTrack sets isPlaying
           }
-        } catch (e) {
+        } catch {
           // Fallback: attempt to start playback
           await playTrack(currentTrack);
         }
@@ -2459,7 +2549,7 @@ async function init() {
     // Restore saved volume or default to 100
     const savedVol = Number(localStorage.getItem('spectra_volume') || 100);
     volumeSlider.value = String(savedVol);
-    try { electron.setVolume(Number(savedVol)); } catch (e) {}
+    try { electron.setVolume(Number(savedVol)); } catch {}
 
     volumeSlider.oninput = (e) => {
       const v = Number(e.target.value);
@@ -2654,7 +2744,7 @@ async function init() {
 
   // Refresh playlists view when main notifies tracks were added
   electron.on('playlist:added', async () => {
-    try { await renderPlaylists(); } catch (_) {}
+    try { await renderPlaylists(); } catch {}
   });
 
   // Periodic UI updates

@@ -23,6 +23,8 @@ Prebuilt binaries and installers are also published on the project's GitHub Rele
 * 🗂️ **SQLite music library** (tracks, playlists, metadata, covers)
 * 🧩 **Plugin system** (`plugins/`) with Discord Presence, Object Storage & Last.fm examples
 * 🌐 **Remote control mode** (Express + Socket.IO) with full UI over LAN
+* 🖥️ **Headless server mode** for Raspberry Pi/home servers with native playback
+* ☁️ **Object Storage plugin** with desktop + web uploads, browsing, and playlist import
 * 📦 **Electron Builder packaging** for Windows, macOS, and Linux
 
 ---
@@ -246,6 +248,46 @@ Includes:
   * HTML UI
   * Real-time playback state
   * Invoke API for remote commands
+  * Plugin push events (e.g. Object Storage, playlists, downloads)
+
+#### Running in Headless Server Mode
+
+Spectra can run on a headless machine (for example a Raspberry Pi or a home server) while still playing audio locally and exposing the full web UI over the network.
+
+1. Launch Spectra with the server flag. The first `--` separates Electron args from npm:
+
+  ```powershell
+  npm start -- --server --server-port 4000
+  ```
+
+  * `--server` (or `--headless`) enables headless mode and skips the desktop window.
+  * `--server-port`/`--remote-port` changes the HTTP port (default `3000`).
+  * `--server-host`/`--remote-host` selects the bind address (default `0.0.0.0`).
+
+2. Alternatively, configure the same settings via environment variables before launching Spectra:
+
+  ```powershell
+  set SPECTRA_SERVER=1
+  set SPECTRA_SERVER_PORT=4000
+  set SPECTRA_SERVER_HOST=0.0.0.0
+  npm start
+  ```
+
+3. If you need to disable the remote web UI entirely (while keeping local playback), pass `--no-remote` or set `SPECTRA_DISABLE_REMOTE=1`.
+
+Once running, open `http://<host>:<port>` from another device on the same network to control playback, manage the library, and browse the UI. The native audio engine continues to output directly to the host machine.
+
+### Object Storage plugin (desktop & web)
+
+The bundled **Object Storage** plugin lets you mirror a bucket (S3, MinIO, Cloudflare R2, etc.) into Spectra and upload tracks directly from either the desktop or the remote web UI.
+
+1. Enable the plugin in **Settings → Plugins → Object Storage**.
+2. Enter your bucket credentials (`endpoint`, `accessKeyId`, `secretAccessKey`, `bucket`, optional `pathPrefix`).
+3. Click **Connect** — a successful connection broadcasts to desktop and web clients.
+4. Browse tracks from the **Object Storage** view: import into the library, queue them, or upload local files back to the bucket.
+5. From the track context menu (desktop and web) choose **Add to Object Storage** to upload the current selection.
+
+All plugin updates (status, file listings, uploads) now propagate to remote web clients instantly. The web UI mirrors the desktop context menu, playlist actions, and upload prompts so headless deployments can manage storage without launching the Electron shell.
 
 ## Plugins & Remote
 - See `plugins/README.md` for details (Discord Presence, Object Storage, Last.fm).

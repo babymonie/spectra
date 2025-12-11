@@ -7,7 +7,7 @@ import fs from 'fs';
 import { app } from 'electron';
 
 class RemoteServer {
-  constructor(rendererPath, invokeHandler) {
+  constructor(rendererPath, invokeHandler, options = {}) {
     this.rendererPath = rendererPath;
     this.invokeHandler = invokeHandler;
     this.app = express();
@@ -15,6 +15,7 @@ class RemoteServer {
     this.io = new Server(this.server);
     this.port = 3000;
     this.isRunning = false;
+    this.pluginRoots = Array.isArray(options.pluginRoots) ? options.pluginRoots.filter(Boolean) : [];
 
     this.setupRoutes();
     this.setupSocket();
@@ -60,7 +61,75 @@ class RemoteServer {
       });
     });
 
-    this.app.use(express.static(this.rendererPath));
+      this.app.use(express.static(this.rendererPath));
+
+      if (this.pluginRoots.length) {
+        this.app.use('/plugins', (req, res, next) => {
+          try {
+            const rawPath = req.path || '';
+            const sanitized = path.normalize(rawPath).replace(/^([/\\]+)/, '');
+            if (!sanitized) {
+              res.status(404).end();
+              return;
+            }
+            const segments = sanitized.split(/[/\\]+/);
+            if (segments.includes('..')) {
+              res.status(400).end();
+              return;
+            }
+
+            for (const root of this.pluginRoots) {
+              if (!root) continue;
+              const absoluteRoot = path.resolve(root);
+              const candidate = path.resolve(absoluteRoot, sanitized);
+              const rootCompare = absoluteRoot.toLowerCase();
+              const candidateCompare = candidate.toLowerCase();
+              if (!candidateCompare.startsWith(rootCompare)) continue;
+              if (fs.existsSync(candidate) && fs.statSync(candidate).isFile()) {
+                res.sendFile(candidate);
+                return;
+              }
+            }
+          } catch (err) {
+            console.warn('[remote] Failed to serve plugin asset', err);
+          }
+          next();
+        });
+      }
+
+    if (this.pluginRoots.length) {
+      this.app.use('/plugins', (req, res, next) => {
+        try {
+          const rawPath = req.path || '';
+          const sanitized = path.normalize(rawPath).replace(/^([/\\]+)/, '');
+          if (!sanitized) {
+            res.status(404).end();
+            return;
+          }
+          const segments = sanitized.split(/[/\\]+/);
+          if (segments.includes('..')) {
+            res.status(400).end();
+            return;
+          }
+
+          for (const root of this.pluginRoots) {
+            if (!root) continue;
+            const absoluteRoot = path.resolve(root);
+            const candidate = path.resolve(absoluteRoot, sanitized);
+            const rootCompare = absoluteRoot.toLowerCase();
+            const candidateCompare = candidate.toLowerCase();
+            if (!candidateCompare.startsWith(rootCompare)) continue;
+            if (fs.existsSync(candidate) && fs.statSync(candidate).isFile()) {
+              res.sendFile(candidate);
+              return;
+            }
+          }
+        } catch (err) {
+          console.warn('[remote] Failed to serve plugin asset', err);
+        }
+        next();
+      });
+    }
   }
 
   setupSocket() {
@@ -88,11 +157,12 @@ class RemoteServer {
     }
   }
 
-  start(port = 3000) {
+  start(port = 3000, host = '0.0.0.0') {
     if (this.isRunning) return;
     this.port = port;
-    this.server.listen(this.port, () => {
-      console.log(`Remote server running on http://localhost:${this.port}`);
+    this.server.listen(this.port, host, () => {
+      const displayHost = host === '0.0.0.0' || host === '::' ? '0.0.0.0' : host;
+      console.log(`Remote server running on http://${displayHost}:${this.port}`);
       this.isRunning = true;
     });
   }

@@ -23,6 +23,95 @@ const loadedPlugins = new Map();
 const appSettingsPath = path.join(app.getPath('userData'), 'app-settings.json');
 let appSettings = { minimizeToTray: true };
 
+const cliArgs = (process.argv || []).slice(1).filter((arg) => typeof arg === 'string');
+
+const parseEnvBoolean = (value) => {
+  if (value === undefined || value === null) return false;
+  const normalized = String(value).trim().toLowerCase();
+  return normalized === '1' || normalized === 'true' || normalized === 'yes';
+};
+
+const hasCliFlag = (...keys) => {
+  for (const rawArg of cliArgs) {
+    if (typeof rawArg !== 'string') continue;
+    for (const key of keys) {
+      const normalizedKey = key.startsWith('--') ? key : `--${key}`;
+      if (rawArg === normalizedKey) return true;
+      if (rawArg.startsWith(`${normalizedKey}=`)) return true;
+    }
+  }
+  return false;
+};
+
+const electronHasSwitch = (...keys) => {
+  try {
+    return keys.some((key) => {
+      const normalizedKey = key.replace(/^--/, '');
+      return app.commandLine.hasSwitch(normalizedKey);
+    });
+  } catch {
+    return false;
+  }
+};
+
+const isServerMode =
+  hasCliFlag('server', 'server-mode', 'headless-server', 'headless') ||
+  electronHasSwitch('server', 'server-mode', 'headless-server', 'headless') ||
+  parseEnvBoolean(process.env.SPECTRA_SERVER) ||
+  parseEnvBoolean(process.env.npm_config_server) ||
+  parseEnvBoolean(process.env.npm_config_headless);
+
+const getCliOption = (...keys) => {
+  for (let i = 0; i < cliArgs.length; i++) {
+    const arg = cliArgs[i];
+    for (const key of keys) {
+      const long = `--${key}`;
+      if (arg === long && i + 1 < cliArgs.length && !cliArgs[i + 1].startsWith('--')) {
+        return cliArgs[i + 1];
+      }
+      if (arg.startsWith(`${long}=`)) {
+        return arg.slice(long.length + 1);
+      }
+    }
+  }
+
+  if (keys && keys.length) {
+    for (const key of keys) {
+      try {
+        const normalizedKey = key.replace(/^--/, '');
+        const val = app.commandLine.getSwitchValue(normalizedKey);
+        if (val) return val;
+      } catch {
+        /* noop */
+      }
+    }
+  }
+  return undefined;
+};
+
+const serverPortValue = getCliOption('server-port', 'remote-port') ?? process.env.SPECTRA_SERVER_PORT;
+let remoteServerPort = Number(serverPortValue ?? '3000');
+if (!Number.isFinite(remoteServerPort) || remoteServerPort <= 0) {
+  remoteServerPort = 3000;
+}
+
+const remoteServerHost = getCliOption('server-host', 'remote-host') ?? process.env.SPECTRA_SERVER_HOST ?? '0.0.0.0';
+const disableRemoteServer =
+  hasCliFlag('no-remote', 'disable-remote') ||
+  electronHasSwitch('no-remote', 'disable-remote') ||
+  parseEnvBoolean(process.env.SPECTRA_DISABLE_REMOTE) ||
+  parseEnvBoolean(process.env.npm_config_no_remote) ||
+  parseEnvBoolean(process.env.npm_config_disable_remote);
+const shouldStartRemoteServer = !disableRemoteServer;
+
+if (isServerMode) {
+  app.commandLine.appendSwitch('disable-gpu');
+  app.commandLine.appendSwitch('disable-gpu-compositing');
+  console.log('[main] Server mode enabled – no desktop window will be created. CLI args:', cliArgs);
+} else {
+  console.log('[main] Desktop mode enabled.');
+}
+
 function loadAppSettings() {
   try {
     if (fs.existsSync(appSettingsPath)) {
@@ -147,7 +236,7 @@ function broadcast(channel, ...args) {
     mainWindow.webContents.send(channel, ...args);
   }
   if (remoteServer) {
-    remoteServer.broadcast(channel, args);
+    remoteServer.broadcast(channel, ...args);
   }
 }
 
@@ -309,6 +398,8 @@ const handlers = {
       return null;
     }
   },
+  'library:add-files': async (filePaths = []) => handleAddFiles(filePaths),
+  'library:add-remote': async (remoteInfo = {}) => handleAddRemote(remoteInfo),
 
     // Allow renderer to relink a track whose file has moved
     'track:relink': async (event, info) => {
@@ -532,7 +623,7 @@ const handlers = {
           rows.push(stmt2.getAsObject());
         }
         stmt2.free();
-      } catch (e) {
+      } catch {
         // Fallback: read tracks table alone
         try {
           const stmt3 = srcDb.prepare('SELECT * FROM tracks ORDER BY id ASC');
@@ -540,7 +631,7 @@ const handlers = {
             rows.push(stmt3.getAsObject());
           }
           stmt3.free();
-        } catch (ee) { rows = []; }
+        } catch { rows = []; }
       }
 
       // For each track, insert/update into main DB and add to playlist in order
@@ -762,9 +853,16 @@ const handlers = {
   'audio:seek': (time) => { audioEngine.seek(time); broadcastState(); },
   'audio:get-time': () => audioEngine.getTime(),
   'remote:toggle': (enable) => {
-      if (enable) remoteServer.start();
-      else remoteServer.stop();
-      return remoteServer.isRunning;
+    if (!remoteServer) {
+      console.warn('[main] remote:toggle invoked but remote server is unavailable');
+      return false;
+    }
+    if (enable) {
+      remoteServer.start(remoteServerPort, remoteServerHost);
+    } else {
+      remoteServer.stop();
+    }
+    return remoteServer.isRunning;
   },
   'plugins:list': async () => {
     const plugins = [];
@@ -872,6 +970,14 @@ const handlers = {
       plugin.context.settings = settings;
     }
     return cfg[id];
+  },
+  'plugins:ready-for-reload': async () => {
+    try {
+      ipcMain.emit('plugins:ready-for-reload', { sender: null });
+    } catch (e) {
+      console.warn('[plugins] Failed to forward remote reload acknowledgement', e);
+    }
+    return { acknowledged: true };
   },
   'plugins:reload': async () => {
     // Notify renderer so it can cleanup plugin DOM/UI before reload
@@ -1137,9 +1243,12 @@ app.whenReady().then(async () => {
   loadAppSettings();
   dedupeLibrary();
 
-  createWindow();
-  // Create tray only if enabled in app settings
-  if (appSettings.minimizeToTray) createTray();
+  if (!isServerMode) {
+    createWindow();
+    if (appSettings.minimizeToTray) createTray();
+  } else {
+    console.log('[main] Server mode: skipping desktop window and tray.');
+  }
 
   // Process any files that were requested before the app was ready
   try {
@@ -1156,15 +1265,18 @@ app.whenReady().then(async () => {
   }
 
   // Initialize Remote Server
-  remoteServer = new RemoteServer(path.join(__dirname, 'renderer'), async (channel, ...args) => {
-    if (handlers[channel]) {
-      return handlers[channel](...args);
-    }
-    throw new Error(`Unknown channel: ${channel}`);
-  });
-  
-  // Start remote server by default or check settings (here we start it for convenience)
-  remoteServer.start(3000);
+  if (shouldStartRemoteServer) {
+    remoteServer = new RemoteServer(path.join(__dirname, 'renderer'), async (channel, ...args) => {
+      if (handlers[channel]) {
+        return handlers[channel](...args);
+      }
+      throw new Error(`Unknown channel: ${channel}`);
+    }, { pluginRoots: [pluginsDir, repoPluginsDir] });
+
+    remoteServer.start(remoteServerPort, remoteServerHost);
+  } else {
+    console.log('[main] Remote server disabled via CLI/env flag.');
+  }
   
   // Load plugins after app is ready
   await loadPlugins();
@@ -1210,14 +1322,22 @@ app.whenReady().then(async () => {
     });
   };
   
-  registerShortcuts();
+  if (!isServerMode) {
+    registerShortcuts();
+  } else {
+    console.log('[main] Server mode: global media shortcuts disabled.');
+  }
 
   app.on('activate', function () {
-    if (BrowserWindow.getAllWindows().length === 0) createWindow();
+    if (!isServerMode && BrowserWindow.getAllWindows().length === 0) createWindow();
   });
 });
 
 app.on('window-all-closed', function () {
+  if (isServerMode) {
+    // Keep running to serve the web UI and native audio output.
+    return;
+  }
   if (process.platform !== 'darwin') app.quit();
 });
 
@@ -1386,96 +1506,9 @@ ipcMain.handle('library:import-folder', async () => {
   await processFileList(files);
 });
 
-ipcMain.handle('library:add-files', async (event, filePaths) => {
-  let allFiles = [];
-  for (const filePath of filePaths) {
-    const stat = await fs.promises.stat(filePath).catch(() => null);
-    if (!stat) continue;
-    
-    if (stat.isDirectory()) {
-      const dirFiles = await getAudioFiles(filePath);
-      allFiles = allFiles.concat(dirFiles);
-    } else {
-      const ext = path.extname(filePath).toLowerCase();
-      if (['.flac', '.wav', '.mp3', '.aac', '.ogg', '.m4a'].includes(ext)) {
-        allFiles.push(filePath);
-      }
-    }
-  }
-  await processFileList(allFiles);
-});
+ipcMain.handle('library:add-files', async (event, filePaths) => handleAddFiles(filePaths));
 
-ipcMain.handle('library:add-remote', async (event, remoteInfo = {}) => {
-  try {
-    const { url, title: providedTitle, artist: providedArtist, album: providedAlbum, duration: providedDuration } = remoteInfo || {};
-    if (!url) return { success: false, error: 'missing url' };
-
-    // Basic fallback track info
-    let track = {
-      path: url,
-      title: providedTitle || path.basename(url),
-      artist: providedArtist || 'Remote',
-      album: providedAlbum || '',
-      album_artist: null,
-      duration: providedDuration || 0,
-      format: 'remote',
-      cover_path: null,
-      bitrate: null,
-      sample_rate: null,
-      bit_depth: null,
-      channels: null,
-      lossless: null,
-      codec: null,
-      quality_score: null,
-    };
-
-    // Try to fetch initial bytes of the remote file and extract metadata from buffer
-    try {
-      const fetchUrl = await resolveTrackPath(url);
-      let meta = null;
-
-      if (fetchUrl !== url && !fetchUrl.startsWith('http')) {
-        // Resolved to local file (e.g. object-storage cache)
-        meta = await extractMetadata(fetchUrl).catch(() => null);
-      } else {
-        const MAX_BYTES = 2 * 1024 * 1024; // 2 MB
-        const headers = { Range: `bytes=0-${MAX_BYTES - 1}` };
-        const res = await fetch(fetchUrl, { method: 'GET', headers, redirect: 'follow', timeout: 10000 }).catch(() => null);
-        if (res && (res.status === 206 || res.status === 200)) {
-          const ab = await res.arrayBuffer();
-          const buf = Buffer.from(ab);
-          meta = await extractMetadataFromBuffer(buf, url).catch(() => null);
-        }
-      }
-
-      if (meta) {
-        track.title = providedTitle || meta.title || track.title;
-        track.artist = providedArtist || meta.artist || track.artist;
-        track.album = providedAlbum || meta.album || track.album;
-        track.album_artist = meta.albumArtist || null;
-        track.duration = providedDuration || meta.duration || track.duration;
-        track.format = meta.format || 'remote';
-        if (meta.coverPath) track.cover_path = meta.coverPath;
-        track.bitrate = meta.bitrate ?? track.bitrate;
-        track.sample_rate = meta.sampleRate ?? track.sample_rate;
-        track.bit_depth = meta.bitDepth ?? track.bit_depth;
-        track.channels = meta.channels ?? track.channels;
-        track.lossless = meta.lossless ?? track.lossless;
-        track.codec = meta.codec ?? track.codec;
-      }
-    } catch (inner) {
-      console.warn('[main] remote metadata fetch failed', inner);
-    }
-
-    track.quality_score = track.quality_score ?? computeQualityScore(track);
-    const stored = storeTrackWithDedup(track);
-    if (!stored) return { success: false, error: 'failed to store track' };
-    return { success: true, id: stored.id, track: stored };
-  } catch (e) {
-    console.error('[main] library:add-remote failed', e);
-    return { success: false, error: String(e) };
-  }
-});
+ipcMain.handle('library:add-remote', async (event, remoteInfo = {}) => handleAddRemote(remoteInfo));
 
 ipcMain.handle('window:set-fullscreen', (event, flag) => {
   if (mainWindow) {
@@ -1762,6 +1795,107 @@ async function processAndAddTrack(filePath) {
   }
 }
 
+async function handleAddFiles(filePaths = []) {
+  if (!Array.isArray(filePaths)) {
+    return { success: false, error: 'filePaths must be an array' };
+  }
+
+  let allFiles = [];
+  for (const filePath of filePaths) {
+    if (!filePath) continue;
+    const stat = await fs.promises.stat(filePath).catch(() => null);
+    if (!stat) continue;
+
+    if (stat.isDirectory()) {
+      const dirFiles = await getAudioFiles(filePath);
+      allFiles = allFiles.concat(dirFiles);
+    } else if (isAudioPath(filePath)) {
+      allFiles.push(filePath);
+    }
+  }
+
+  if (!allFiles.length) {
+    return { success: true, count: 0 };
+  }
+
+  await processFileList(allFiles);
+  return { success: true, count: allFiles.length };
+}
+
+async function handleAddRemote(remoteInfo = {}) {
+  try {
+    const { url, title: providedTitle, artist: providedArtist, album: providedAlbum, duration: providedDuration } = remoteInfo || {};
+    if (!url) {
+      return { success: false, error: 'missing url' };
+    }
+
+    let track = {
+      path: url,
+      title: providedTitle || path.basename(url),
+      artist: providedArtist || 'Remote',
+      album: providedAlbum || '',
+      album_artist: null,
+      duration: providedDuration || 0,
+      format: 'remote',
+      cover_path: null,
+      bitrate: null,
+      sample_rate: null,
+      bit_depth: null,
+      channels: null,
+      lossless: null,
+      codec: null,
+      quality_score: null,
+    };
+
+    try {
+      const fetchUrl = await resolveTrackPath(url);
+      let meta = null;
+
+      if (fetchUrl !== url && !fetchUrl.startsWith('http')) {
+        meta = await extractMetadata(fetchUrl).catch(() => null);
+      } else {
+        const MAX_BYTES = 2 * 1024 * 1024;
+        const headers = { Range: `bytes=0-${MAX_BYTES - 1}` };
+        const res = await fetch(fetchUrl, { method: 'GET', headers, redirect: 'follow', timeout: 10000 }).catch(() => null);
+        if (res && (res.status === 206 || res.status === 200)) {
+          const ab = await res.arrayBuffer();
+          const buf = Buffer.from(ab);
+          meta = await extractMetadataFromBuffer(buf, url).catch(() => null);
+        }
+      }
+
+      if (meta) {
+        track.title = providedTitle || meta.title || track.title;
+        track.artist = providedArtist || meta.artist || track.artist;
+        track.album = providedAlbum || meta.album || track.album;
+        track.album_artist = meta.albumArtist || null;
+        track.duration = providedDuration || meta.duration || track.duration;
+        track.format = meta.format || 'remote';
+        if (meta.coverPath) track.cover_path = meta.coverPath;
+        track.bitrate = meta.bitrate ?? track.bitrate;
+        track.sample_rate = meta.sampleRate ?? track.sample_rate;
+        track.bit_depth = meta.bitDepth ?? track.bit_depth;
+        track.channels = meta.channels ?? track.channels;
+        track.lossless = meta.lossless ?? track.lossless;
+        track.codec = meta.codec ?? track.codec;
+      }
+    } catch (inner) {
+      console.warn('[main] remote metadata fetch failed', inner);
+    }
+
+    track.quality_score = track.quality_score ?? computeQualityScore(track);
+    const stored = storeTrackWithDedup(track);
+    if (!stored) {
+      return { success: false, error: 'failed to store track' };
+    }
+
+    return { success: true, id: stored.id, track: stored };
+  } catch (err) {
+    console.error('[main] library:add-remote failed', err);
+    return { success: false, error: String(err) };
+  }
+}
+
 // Plugin loading system
 async function checkPluginDependencies(pluginDir, pluginId) {
   const packageJsonPath = path.join(pluginDir, 'package.json');
@@ -1896,6 +2030,13 @@ async function loadPlugins() {
           },
           registerRemoteHandler: (channel, handler) => {
             handlers[channel] = handler;
+          },
+          broadcast: (channel, ...args) => {
+            try {
+              broadcast(channel, ...args);
+            } catch (err) {
+              console.warn(`[plugins] broadcast failed for ${channel}`, err);
+            }
           }
         };
         

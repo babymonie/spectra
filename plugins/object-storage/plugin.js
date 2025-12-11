@@ -15,6 +15,7 @@ let settings = {};
 let syncInterval = null;
 let cachePath = null;
 let isInitialized = false;
+let remoteBroadcast = null;
 
 // Supported audio formats
 const AUDIO_FORMATS = ['.flac', '.wav', '.mp3', '.aac', '.ogg', '.m4a', '.alac', '.wma', '.dsf', '.dff', '.ape', '.aiff'];
@@ -60,6 +61,7 @@ function extractKeyFromUrl(url) {
 export function activate(context) {
   console.log('[object-storage] Activating...');
   settings = context.settings || {};
+  remoteBroadcast = typeof context.broadcast === 'function' ? context.broadcast : null;
   
   // Set up cache directory
   const userDataPath = app.getPath('userData');
@@ -108,7 +110,7 @@ export function activate(context) {
 
       // Generate a presigned URL for immediate use (short-lived)
       let url = null;
-      try { url = await getPresignedUrl(key, 3600); } catch (e) { url = null; }
+      try { url = await getPresignedUrl(key, 3600); } catch { url = null; }
 
       // Optionally notify renderers to refresh listing
       pushStatusToRenderers({ uploaded: true, key });
@@ -172,7 +174,7 @@ export function activate(context) {
             }
 
             enhanced.push({ Key: o.Key, Size: o.Size, LastModified: o.LastModified, url: presigned, cachedPath });
-          } catch (_err) {
+          } catch {
             enhanced.push({ Key: o.Key, Size: o.Size, LastModified: o.LastModified, url: null });
           }
         }
@@ -202,10 +204,23 @@ export function deactivate() {
   
   s3Client = null;
   isInitialized = false;
+  remoteBroadcast = null;
 
-  try { ipcMain.removeHandler && ipcMain.removeHandler('object-storage:upload'); } catch (e) {}
-  try { ipcMain.removeHandler && ipcMain.removeHandler('object-storage:get-url'); } catch (e) {}
-  try { ipcMain.removeHandler && ipcMain.removeHandler('object-storage:list'); } catch (e) {}
+  try {
+    if (typeof ipcMain.removeHandler === 'function') {
+      ipcMain.removeHandler('object-storage:upload');
+    }
+  } catch {}
+  try {
+    if (typeof ipcMain.removeHandler === 'function') {
+      ipcMain.removeHandler('object-storage:get-url');
+    }
+  } catch {}
+  try {
+    if (typeof ipcMain.removeHandler === 'function') {
+      ipcMain.removeHandler('object-storage:list');
+    }
+  } catch {}
   
   console.log('[object-storage] Plugin deactivated');
 }
@@ -472,11 +487,11 @@ function watchPluginConfig() {
             } else {
               pushStatusToRenderers({ connected: false, message: 'Not initialized (check credentials)' });
             }
-          } catch (e) {
-            pushStatusToRenderers({ connected: false, message: String(e && e.message ? e.message : e) });
+          } catch (error) {
+            pushStatusToRenderers({ connected: false, message: String(error && error.message ? error.message : error) });
           }
         }
-      } catch (e) {
+      } catch {
         // ignore transient errors
       }
     }, 1000);
@@ -518,7 +533,7 @@ function pushFilesToRenderers(objects) {
         }
 
         enhanced.push({ Key: o.Key, Size: o.Size, LastModified: o.LastModified, url: presigned, cachedPath });
-      } catch (_err) {
+      } catch {
         enhanced.push({ Key: o.Key, Size: o.Size, LastModified: o.LastModified, url: null });
       }
     }
@@ -526,7 +541,14 @@ function pushFilesToRenderers(objects) {
     for (const w of wins) {
       try {
         w.webContents.send('object-storage:files', enhanced);
-      } catch (e) {}
+      } catch {}
+    }
+    if (remoteBroadcast) {
+      try {
+        remoteBroadcast('object-storage:files', enhanced);
+      } catch (err) {
+        console.warn('[object-storage] remote broadcast for files failed', err);
+      }
     }
   })();
 }
@@ -536,7 +558,14 @@ function pushStatusToRenderers(status) {
   for (const w of wins) {
     try {
       w.webContents.send('object-storage:status', status);
-    } catch (e) {}
+    } catch {}
+  }
+  if (remoteBroadcast) {
+    try {
+      remoteBroadcast('object-storage:status', status);
+    } catch (err) {
+      console.warn('[object-storage] remote broadcast for status failed', err);
+    }
   }
 }
 
