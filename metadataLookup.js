@@ -187,10 +187,17 @@ export async function extractMetadata(filePath) {
 	let duration = null;
 	let format = path.extname(filePath || '').replace(/^\./, '').toLowerCase() || null;
 	let coverPath = null;
+	let bitrate = null;
+	let sampleRate = null;
+	let bitDepth = null;
+	let channels = null;
+	let lossless = null;
+	let codec = null;
 
 	try {
 		const metadata = await mm.parseFile(filePath, { duration: true });
 		const common = metadata.common || {};
+		const fmt = metadata.format || {};
 
 		title = common.title || path.basename(filePath);
 		artist = (common.artist || null) ?? null;
@@ -199,6 +206,12 @@ export async function extractMetadata(filePath) {
 		duration = typeof metadata.format.duration === 'number'
 			? metadata.format.duration
 			: null;
+		bitrate = typeof fmt.bitrate === 'number' ? Math.round(fmt.bitrate) : null;
+		sampleRate = typeof fmt.sampleRate === 'number' ? Math.round(fmt.sampleRate) : null;
+		bitDepth = typeof fmt.bitsPerSample === 'number' ? Math.round(fmt.bitsPerSample) : null;
+		channels = typeof fmt.numberOfChannels === 'number' ? Math.round(fmt.numberOfChannels) : null;
+		lossless = typeof fmt.lossless === 'boolean' ? (fmt.lossless ? 1 : 0) : null;
+		codec = fmt.codec || fmt.container || format || null;
 
 		// 1. Try embedded picture
 		if (Array.isArray(common.picture) && common.picture.length > 0) {
@@ -253,6 +266,12 @@ export async function extractMetadata(filePath) {
 		duration,
 		format,
 		coverPath,
+		bitrate,
+		sampleRate,
+		bitDepth,
+		channels,
+		lossless,
+		codec,
 	};
 }
 
@@ -264,17 +283,30 @@ export async function extractMetadataFromBuffer(buf, sourceName = 'remote') {
 	let duration = null;
 	let format = null;
 	let coverPath = null;
+	let bitrate = null;
+	let sampleRate = null;
+	let bitDepth = null;
+	let channels = null;
+	let lossless = null;
+	let codec = null;
 
 	try {
 		// music-metadata can parse from a Buffer. Content-type may be unknown for remote files.
 		const metadata = await mm.parseBuffer(buf, null, { duration: true });
 		const common = metadata.common || {};
+		const fmt = metadata.format || {};
 
 		title = common.title || sourceName;
 		artist = (common.artist || null) ?? null;
 		album = (common.album || null) ?? null;
 		albumArtist = (common.albumartist || common['album artist'] || artist || null) ?? null;
 		duration = typeof metadata.format.duration === 'number' ? metadata.format.duration : null;
+		bitrate = typeof fmt.bitrate === 'number' ? Math.round(fmt.bitrate) : null;
+		sampleRate = typeof fmt.sampleRate === 'number' ? Math.round(fmt.sampleRate) : null;
+		bitDepth = typeof fmt.bitsPerSample === 'number' ? Math.round(fmt.bitsPerSample) : null;
+		channels = typeof fmt.numberOfChannels === 'number' ? Math.round(fmt.numberOfChannels) : null;
+		lossless = typeof fmt.lossless === 'boolean' ? (fmt.lossless ? 1 : 0) : null;
+		codec = fmt.codec || fmt.container || format || null;
 
 		if (Array.isArray(common.picture) && common.picture.length > 0) {
 			coverPath = await saveCoverForAlbum(common.picture[0], album, albumArtist || artist);
@@ -306,13 +338,27 @@ export async function extractMetadataFromBuffer(buf, sourceName = 'remote') {
 		}
 
 		// format: try to read container from format.container or fallback
-		format = (metadata.format && metadata.format.container) || null;
+		format = (metadata.format && metadata.format.container) || format;
 	} catch (err) {
 		console.error('extractMetadataFromBuffer failed for', sourceName, err);
 		title = title || sourceName;
 	}
 
-	return { title, artist, album, albumArtist, duration, format, coverPath };
+	return {
+		title,
+		artist,
+		album,
+		albumArtist,
+		duration,
+		format,
+		coverPath,
+		bitrate,
+		sampleRate,
+		bitDepth,
+		channels,
+		lossless,
+		codec,
+	};
 }
 
 // Extract embedded lyrics from audio files (ID3 USLT, Vorbis COMMENTS, etc.)

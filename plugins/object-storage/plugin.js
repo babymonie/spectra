@@ -19,6 +19,44 @@ let isInitialized = false;
 // Supported audio formats
 const AUDIO_FORMATS = ['.flac', '.wav', '.mp3', '.aac', '.ogg', '.m4a', '.alac', '.wma', '.dsf', '.dff', '.ape', '.aiff'];
 
+function extractKeyFromUrl(url) {
+  if (!url || typeof url !== 'string' || !settings.endpoint) return null;
+  try {
+    const endpointUrl = new URL(settings.endpoint);
+    const incoming = new URL(url);
+
+    let bucketFromUrl = null;
+    let keyPart = '';
+
+    if (incoming.host === endpointUrl.host) {
+      // Path-style: endpoint host matches; bucket is first path segment
+      let pathPart = incoming.pathname || '';
+      if (pathPart.startsWith('/')) pathPart = pathPart.slice(1);
+      if (!pathPart) return null;
+      const segments = pathPart.split('/');
+      bucketFromUrl = segments.shift();
+      keyPart = segments.join('/');
+    } else if (incoming.host.endsWith(`.${endpointUrl.host}`)) {
+      // Virtual-host style: bucket in hostname, key in path
+      bucketFromUrl = incoming.host.substring(0, incoming.host.length - endpointUrl.host.length - 1);
+      keyPart = incoming.pathname.startsWith('/') ? incoming.pathname.slice(1) : incoming.pathname;
+    } else {
+      return null;
+    }
+
+    if (!keyPart) return null;
+
+    const decodedKey = decodeURIComponent(keyPart);
+    if (bucketFromUrl && settings.bucket && bucketFromUrl !== settings.bucket) {
+      console.warn(`[object-storage] URL bucket '${bucketFromUrl}' differs from configured bucket '${settings.bucket}'.`);
+    }
+    return decodedKey;
+  } catch (err) {
+    console.warn('[object-storage] Failed to parse object-storage URL:', err?.message ?? err);
+    return null;
+  }
+}
+
 export function activate(context) {
   console.log('[object-storage] Activating...');
   settings = context.settings || {};
@@ -110,6 +148,45 @@ export function activate(context) {
     if (context.registerRemoteHandler) {
       context.registerRemoteHandler('object-storage:get-url', handleGetUrl);
     }
+    // Provide an IPC handler to list objects (enhanced) on demand for renderer refresh
+    const handleList = async (event, prefix = '') => {
+      try {
+        const objects = await listObjects(prefix || '');
+        // Build enhanced list (presigned URLs or cached info) without forcing downloads
+        const enhanced = [];
+        for (const o of (objects || [])) {
+          try {
+            let presigned = null;
+            try { presigned = await getPresignedUrl(o.Key); } catch { presigned = null; }
+
+            let cachedPath = null;
+            if (settings.cacheFiles && cachePath) {
+              try {
+                const localName = basename(o.Key);
+                const localPath = join(cachePath, localName);
+                await access(localPath);
+                cachedPath = localPath;
+              } catch {
+                cachedPath = null;
+              }
+            }
+
+            enhanced.push({ Key: o.Key, Size: o.Size, LastModified: o.LastModified, url: presigned, cachedPath });
+          } catch (_err) {
+            enhanced.push({ Key: o.Key, Size: o.Size, LastModified: o.LastModified, url: null });
+          }
+        }
+
+        return { success: true, files: enhanced };
+      } catch (err) {
+        return { success: false, error: String(err && err.message ? err.message : err) };
+      }
+    };
+
+    ipcMain.handle('object-storage:list', (event, prefix) => handleList(event, prefix));
+    if (context.registerRemoteHandler) {
+      context.registerRemoteHandler('object-storage:list', handleList);
+    }
   } catch (e) {
     console.warn('[object-storage] failed to register ipc upload handler', e);
   }
@@ -128,6 +205,7 @@ export function deactivate() {
 
   try { ipcMain.removeHandler && ipcMain.removeHandler('object-storage:upload'); } catch (e) {}
   try { ipcMain.removeHandler && ipcMain.removeHandler('object-storage:get-url'); } catch (e) {}
+  try { ipcMain.removeHandler && ipcMain.removeHandler('object-storage:list'); } catch (e) {}
   
   console.log('[object-storage] Plugin deactivated');
 }
@@ -513,20 +591,39 @@ export const ObjectStorageAPI = {
   },
 
   async resolvePath(uri) {
-    if (!uri || !uri.startsWith('object-storage://')) return null;
-    const pathPart = uri.substring(17); // length of 'object-storage://'
-    const firstSlash = pathPart.indexOf('/');
-    if (firstSlash === -1) return null;
-    
-    const bucket = pathPart.substring(0, firstSlash);
-    const key = decodeURIComponent(pathPart.substring(firstSlash + 1));
-    
-    // We use the configured bucket for the actual request, but we could check if it matches
-    if (settings.bucket && bucket !== settings.bucket) {
-      console.warn(`[object-storage] URI bucket '${bucket}' does not match configured bucket '${settings.bucket}'. Attempting download anyway.`);
+    if (!uri || typeof uri !== 'string') return null;
+
+    if (uri.startsWith('object-storage://')) {
+      const pathPart = uri.substring(17); // length of 'object-storage://'
+      const firstSlash = pathPart.indexOf('/');
+      if (firstSlash === -1) return null;
+
+      const bucket = pathPart.substring(0, firstSlash);
+      const key = decodeURIComponent(pathPart.substring(firstSlash + 1));
+
+      if (settings.bucket && bucket !== settings.bucket) {
+        console.warn(`[object-storage] URI bucket '${bucket}' does not match configured bucket '${settings.bucket}'. Attempting download anyway.`);
+      }
+
+      if (settings.cacheFiles) {
+        return await downloadToCache(key);
+      }
+      return await getPresignedUrl(key);
     }
-    
-    return await downloadToCache(key);
+
+    if (uri.startsWith('http://') || uri.startsWith('https://')) {
+      const key = extractKeyFromUrl(uri);
+      if (key) {
+        if (settings.cacheFiles) {
+          return await downloadToCache(key);
+        }
+        return await getPresignedUrl(key);
+      }
+      // No matching key – fall back to streaming original URL
+      return uri;
+    }
+
+    return null;
   },
 };
 

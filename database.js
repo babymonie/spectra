@@ -8,7 +8,6 @@ console.log('User Data Path:', userDataPath);
 const dbPath = path.join(userDataPath, 'spectra.db');
 
 let db = null;
-let dbReady = false;
 
 // Initialize sql.js database
 const initDb = async () => {
@@ -17,10 +16,9 @@ const initDb = async () => {
     const buffer = fs.readFileSync(dbPath);
     db = new SQL.Database(buffer);
   } catch (err) {
-    // Database doesn't exist yet, create new one
+    console.debug?.('[database] creating new sqlite database', err?.message);
     db = new SQL.Database();
   }
-  dbReady = true;
 };
 
 // Save database to disk
@@ -60,6 +58,41 @@ const all = (sql, params = []) => {
   return results;
 };
 
+const TRACK_UPDATEABLE_COLUMNS = new Set([
+  'path',
+  'title',
+  'artist',
+  'album',
+  'album_artist',
+  'duration',
+  'format',
+  'cover_path',
+  'lyrics',
+  'bitrate',
+  'sample_rate',
+  'bit_depth',
+  'channels',
+  'lossless',
+  'quality_score',
+  'codec',
+]);
+
+const normalizeValue = (value) => (typeof value === 'string' ? value.trim() : value);
+
+export const updateTrackFields = (id, updates = {}) => {
+  if (!db) return { changes: 0 };
+  if (!id) return { changes: 0 };
+  const entries = Object.entries(updates).filter(([key, value]) => TRACK_UPDATEABLE_COLUMNS.has(key) && value !== undefined);
+  if (entries.length === 0) return { changes: 0 };
+
+  const assignments = entries.map(([key]) => `${key} = ?`).join(', ');
+  const params = entries.map(([, value]) => normalizeValue(value));
+  params.push(id);
+
+  run(`UPDATE tracks SET ${assignments} WHERE id = ?`, params);
+  return { changes: 1 };
+};
+
 // Initialize schema
 const initSchema = () => {
   if (!db) return;
@@ -76,6 +109,13 @@ const initSchema = () => {
       format TEXT,
       cover_path TEXT,
       lyrics TEXT,
+      bitrate INTEGER,
+      sample_rate INTEGER,
+      bit_depth INTEGER,
+      channels INTEGER,
+      lossless INTEGER,
+      quality_score REAL,
+      codec TEXT,
       created_at DATETIME DEFAULT CURRENT_TIMESTAMP
     )
   `);
@@ -83,25 +123,82 @@ const initSchema = () => {
   // Migration: Add columns if they don't exist (for existing DBs)
   try {
     db.run('ALTER TABLE tracks ADD COLUMN cover_path TEXT');
-  } catch (e) {
-    // Column likely already exists
+  } catch (err) {
+    if (err) {
+      // Column likely already exists
+    }
   }
   try {
     db.run('ALTER TABLE tracks ADD COLUMN album_artist TEXT');
-  } catch (e) {
-    // Column likely already exists
+  } catch (err) {
+    if (err) {
+      // Column likely already exists
+    }
   }
   try {
     db.run('ALTER TABLE tracks ADD COLUMN lyrics TEXT');
-  } catch (e) {
-    // Column likely already exists
+  } catch (err) {
+    if (err) {
+      // Column likely already exists
+    }
+  }
+  try {
+    db.run('ALTER TABLE tracks ADD COLUMN bitrate INTEGER');
+  } catch (err) {
+    if (err) {
+      // Column likely already exists
+    }
+  }
+  try {
+    db.run('ALTER TABLE tracks ADD COLUMN sample_rate INTEGER');
+  } catch (err) {
+    if (err) {
+      // Column likely already exists
+    }
+  }
+  try {
+    db.run('ALTER TABLE tracks ADD COLUMN bit_depth INTEGER');
+  } catch (err) {
+    if (err) {
+      // Column likely already exists
+    }
+  }
+  try {
+    db.run('ALTER TABLE tracks ADD COLUMN channels INTEGER');
+  } catch (err) {
+    if (err) {
+      // Column likely already exists
+    }
+  }
+  try {
+    db.run('ALTER TABLE tracks ADD COLUMN lossless INTEGER');
+  } catch (err) {
+    if (err) {
+      // Column likely already exists
+    }
+  }
+  try {
+    db.run('ALTER TABLE tracks ADD COLUMN quality_score REAL');
+  } catch (err) {
+    if (err) {
+      // Column likely already exists
+    }
+  }
+  try {
+    db.run('ALTER TABLE tracks ADD COLUMN codec TEXT');
+  } catch (err) {
+    if (err) {
+      // Column likely already exists
+    }
   }
 
   // Ensure playlists.updated_at exists for older DBs
   try {
     db.run('ALTER TABLE playlists ADD COLUMN updated_at DATETIME');
-  } catch (e) {
-    // ignore if already exists
+  } catch (err) {
+    if (err) {
+      // Column likely already exists
+    }
   }
 
   db.run(`
@@ -133,26 +230,49 @@ initSchema();
 
 export const addTrack = (track) => {
   if (!db) return null;
-  const stmt = db.prepare(`
-    INSERT INTO tracks (path, title, artist, album, album_artist, duration, format, cover_path)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-  `);
-  stmt.run([track.path, track.title, track.artist, track.album, track.album_artist, track.duration, track.format, track.cover_path]);
-  stmt.free();
-  
-  // Handle conflict manually - if exists, update
-  const existing = get('SELECT id FROM tracks WHERE path = ?', [track.path]);
-  if (existing) {
-    const updateStmt = db.prepare(`
-      UPDATE tracks 
-      SET title = ?, artist = ?, album = ?, album_artist = ?, duration = ?, format = ?, cover_path = ?
-      WHERE path = ?
-    `);
-    updateStmt.run([track.title, track.artist, track.album, track.album_artist, track.duration, track.format, track.cover_path, track.path]);
-    updateStmt.free();
+  const sql = `
+    INSERT INTO tracks (
+      path, title, artist, album, album_artist, duration, format, cover_path,
+      bitrate, sample_rate, bit_depth, channels, lossless, quality_score, codec
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+  `;
+
+  const params = [
+    track.path,
+    track.title,
+    track.artist,
+    track.album,
+    track.album_artist,
+    track.duration,
+    track.format,
+    track.cover_path,
+    track.bitrate ?? null,
+    track.sample_rate ?? null,
+    track.bit_depth ?? null,
+    track.channels ?? null,
+    track.lossless ?? null,
+    track.quality_score ?? null,
+    track.codec ?? null,
+  ];
+
+  try {
+    const stmt = db.prepare(sql);
+    stmt.run(params);
+    stmt.free();
+    saveDb();
+    return get('SELECT * FROM tracks WHERE path = ? LIMIT 1', [track.path]);
+  } catch (err) {
+    const message = String(err?.message || err);
+    if (message.includes('UNIQUE constraint failed: tracks.path')) {
+      const existing = get('SELECT * FROM tracks WHERE path = ? LIMIT 1', [track.path]);
+      if (existing?.id) {
+        updateTrackFields(existing.id, track);
+        return get('SELECT * FROM tracks WHERE id = ? LIMIT 1', [existing.id]);
+      }
+      return existing;
+    }
+    throw err;
   }
-  saveDb();
-  return existing || { lastInsertRowid: db.exec('SELECT last_insert_rowid() as id')[0].values[0][0] };
 };
 
 export const getAllTracks = () => {
@@ -165,6 +285,17 @@ export const getTrackByPath = (filePath) => {
 
 export const getTrackById = (id) => {
   return get('SELECT * FROM tracks WHERE id = ?', [id]);
+};
+
+const toLower = (value) => (typeof value === 'string' ? value.trim().toLowerCase() : '');
+
+export const findTracksByTitleArtist = (title, artist) => {
+  if (!db) return [];
+  if (!title || !artist) return [];
+  return all(
+    `SELECT * FROM tracks WHERE LOWER(title) = ? AND LOWER(artist) = ?`,
+    [toLower(title), toLower(artist)]
+  );
 };
 
 export const updateTrackLyrics = (id, lyrics) => {
@@ -189,8 +320,10 @@ export const addTrackToPlaylist = (playlistId, trackId) => {
   try {
     run('INSERT OR IGNORE INTO playlist_tracks (playlist_id, track_id, track_order) VALUES (?, ?, ?)', [playlistId, trackId, maxOrder + 1]);
     run('UPDATE playlists SET updated_at = CURRENT_TIMESTAMP WHERE id = ?', [playlistId]);
-  } catch (_) {
-    // ignore
+  } catch (err) {
+    if (err) {
+      // ignore
+    }
   }
   return { changes: 1 };
 };
@@ -209,8 +342,10 @@ export const removeTrackFromPlaylist = (playlistId, trackId) => {
   run('DELETE FROM playlist_tracks WHERE playlist_id = ? AND track_id = ?', [playlistId, trackId]);
   try {
     run('UPDATE playlists SET updated_at = CURRENT_TIMESTAMP WHERE id = ?', [playlistId]);
-  } catch (_) {
-    // ignore
+  } catch (err) {
+    if (err) {
+      // ignore
+    }
   }
   return { changes: 1 };
 };
@@ -351,6 +486,7 @@ const api = {
   addTrack,
   getAllTracks,
   getTrackByPath,
+  findTracksByTitleArtist,
   createPlaylist,
   getAllPlaylists,
   addTrackToPlaylist,
@@ -368,7 +504,8 @@ const api = {
   getAlbums,
   getArtists,
   getTrackById,
-  updateTrackLyrics
+  updateTrackLyrics,
+  updateTrackFields,
 };
 
 export default api;

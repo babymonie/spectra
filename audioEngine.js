@@ -261,6 +261,10 @@ async function playFile(filePath, onEnd, onError, options = {}) {
   const args = [
     '-hide_banner',
     '-loglevel', 'error',
+    // Robust streaming options: auto-reconnect when HTTP stream drops
+    '-reconnect', '1',
+    '-reconnect_streamed', '1',
+    '-reconnect_delay_max', '5',
   ];
 
   if (options.startTime) {

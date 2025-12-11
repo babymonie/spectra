@@ -274,15 +274,14 @@ function createWindow() {
 
 // Helper to resolve special URI schemes like object-storage://
 async function resolveTrackPath(filePath) {
-  if (typeof filePath === 'string' && filePath.startsWith('object-storage://')) {
-    const plugin = loadedPlugins.get('object-storage');
-    if (plugin && plugin.module && plugin.module.ObjectStorageAPI && plugin.module.ObjectStorageAPI.resolvePath) {
-      try {
-        const resolved = await plugin.module.ObjectStorageAPI.resolvePath(filePath);
-        if (resolved) return resolved;
-      } catch (e) {
-        console.warn('[main] Failed to resolve URI:', filePath, e);
-      }
+  if (typeof filePath !== 'string') return filePath;
+  const plugin = loadedPlugins.get('object-storage');
+  if (plugin?.module?.ObjectStorageAPI?.resolvePath) {
+    try {
+      const resolved = await plugin.module.ObjectStorageAPI.resolvePath(filePath);
+      if (resolved) return resolved;
+    } catch (e) {
+      console.warn('[main] Failed to resolve object-storage path:', filePath, e);
     }
   }
   return filePath;
@@ -547,10 +546,30 @@ const handlers = {
       // For each track, insert/update into main DB and add to playlist in order
       for (const r of rows) {
         try {
-          // Use db.addTrack which does insert/update on path
-          db.addTrack({ path: r.path, title: r.title, artist: r.artist, album: r.album, album_artist: r.album_artist, duration: r.duration, format: r.format, cover_path: r.cover_path });
-          const existing = db.getTrackByPath(r.path);
-          if (existing && newPlaylistId) db.addTrackToPlaylist(newPlaylistId, existing.id);
+          const candidateTrack = {
+            path: r.path,
+            title: r.title,
+            artist: r.artist,
+            album: r.album,
+            album_artist: r.album_artist,
+            duration: r.duration,
+            format: r.format,
+            cover_path: r.cover_path || null,
+            bitrate: r.bitrate ?? null,
+            sample_rate: r.sample_rate ?? null,
+            bit_depth: r.bit_depth ?? null,
+            channels: r.channels ?? null,
+            lossless: r.lossless ?? null,
+            codec: r.codec ?? null,
+            quality_score: r.quality_score ?? null,
+          };
+          if (candidateTrack.quality_score == null) {
+            candidateTrack.quality_score = computeQualityScore(candidateTrack);
+          }
+          const storedTrack = storeTrackWithDedup(candidateTrack);
+          if (storedTrack && newPlaylistId) {
+            db.addTrackToPlaylist(newPlaylistId, storedTrack.id);
+          }
         } catch (e) {
           console.warn('Failed to import track', r.path, e);
         }
@@ -883,8 +902,8 @@ const handlers = {
         };
         try { ipcMain.once('plugins:ready-for-reload', handler); } catch (e) { console.warn('ipc once failed', e); resolve(); }
       });
-    } catch (_) {
-      console.warn('[plugins] Error while waiting for renderer ack; continuing');
+    } catch (err) {
+      console.warn('[plugins] Error while waiting for renderer ack; continuing', err);
     }
 
     // Deactivate all plugins
@@ -1006,6 +1025,7 @@ const handlers = {
             read.pipe(write);
           } catch (err) {
             // If stat fails, fallback to simple copy
+            console.warn('[main] download stat fallback', err);
             try {
               await fs.promises.copyFile(filePath, savePath);
               broadcast('download:complete', { id, savedPath: savePath });
@@ -1034,7 +1054,9 @@ function createTray() {
       trayImage = nativeImage.createFromPath(iconPath);
     }
   } catch (e) {
-    // ignore
+    if (e) {
+      console.warn('[tray] Failed to load tray icon from disk', e);
+    }
   }
 
   if (!trayImage) {
@@ -1113,6 +1135,7 @@ app.whenReady().then(async () => {
 
   // Load app settings so we can respect minimize-to-tray preference
   loadAppSettings();
+  dedupeLibrary();
 
   createWindow();
   // Create tray only if enabled in app settings
@@ -1397,6 +1420,13 @@ ipcMain.handle('library:add-remote', async (event, remoteInfo = {}) => {
       duration: providedDuration || 0,
       format: 'remote',
       cover_path: null,
+      bitrate: null,
+      sample_rate: null,
+      bit_depth: null,
+      channels: null,
+      lossless: null,
+      codec: null,
+      quality_score: null,
     };
 
     // Try to fetch initial bytes of the remote file and extract metadata from buffer
@@ -1426,13 +1456,21 @@ ipcMain.handle('library:add-remote', async (event, remoteInfo = {}) => {
         track.duration = providedDuration || meta.duration || track.duration;
         track.format = meta.format || 'remote';
         if (meta.coverPath) track.cover_path = meta.coverPath;
+        track.bitrate = meta.bitrate ?? track.bitrate;
+        track.sample_rate = meta.sampleRate ?? track.sample_rate;
+        track.bit_depth = meta.bitDepth ?? track.bit_depth;
+        track.channels = meta.channels ?? track.channels;
+        track.lossless = meta.lossless ?? track.lossless;
+        track.codec = meta.codec ?? track.codec;
       }
     } catch (inner) {
       console.warn('[main] remote metadata fetch failed', inner);
     }
 
-    const id = db.addTrack(track);
-    return { success: true, id, track: { id, ...track } };
+    track.quality_score = track.quality_score ?? computeQualityScore(track);
+    const stored = storeTrackWithDedup(track);
+    if (!stored) return { success: false, error: 'failed to store track' };
+    return { success: true, id: stored.id, track: stored };
   } catch (e) {
     console.error('[main] library:add-remote failed', e);
     return { success: false, error: String(e) };
@@ -1471,6 +1509,189 @@ async function getAudioFiles(dir) {
   return results;
 }
 
+const QUALITY_SCORE_EPSILON = 5000;
+const DURATION_FUZZ_SECONDS = 3;
+
+function normalizeForKey(value) {
+  if (!value) return '';
+  return String(value).trim().toLowerCase();
+}
+
+function normalizeAlbumValue(value) {
+  const normalized = normalizeForKey(value);
+  if (!normalized || normalized === 'unknown album') return '';
+  return normalized;
+}
+
+function durationsRoughlyEqual(a, b) {
+  const aNum = typeof a === 'number' ? a : Number(a);
+  const bNum = typeof b === 'number' ? b : Number(b);
+  if (!Number.isFinite(aNum) || aNum <= 0) return false;
+  if (!Number.isFinite(bNum) || bNum <= 0) return false;
+  return Math.abs(aNum - bNum) <= DURATION_FUZZ_SECONDS;
+}
+
+function computeQualityScore(meta = {}) {
+  const bitrate = Number(meta.bitrate ?? 0);
+  const sampleRate = Number(meta.sampleRate ?? meta.sample_rate ?? 0);
+  const bitDepth = Number(meta.bitDepth ?? meta.bit_depth ?? 0);
+  const channels = Number(meta.channels ?? 0);
+  const isLossless = meta.lossless === true || meta.lossless === 1 || meta.lossless === '1';
+  let score = 0;
+  if (isLossless) score += 1_000_000_000;
+  if (bitrate > 0) score += bitrate;
+  if (sampleRate > 0 && bitDepth > 0 && channels > 0) {
+    score += sampleRate * bitDepth * channels;
+  } else if (sampleRate > 0 && channels > 0) {
+    score += sampleRate * channels * 100;
+  }
+  return Math.round(score);
+}
+
+function computeStoredTrackQuality(track) {
+  if (!track) return 0;
+  if (track.quality_score) return Number(track.quality_score);
+  return computeQualityScore(track);
+}
+
+function tracksLikelySameSong(incomingTrack, existingTrack) {
+  if (!incomingTrack || !existingTrack) return false;
+  const albumsMatch = normalizeAlbumValue(incomingTrack.album) === normalizeAlbumValue(existingTrack.album)
+    || !normalizeAlbumValue(incomingTrack.album)
+    || !normalizeAlbumValue(existingTrack.album);
+  return albumsMatch && durationsRoughlyEqual(incomingTrack.duration, existingTrack.duration);
+}
+
+function recordsLikelySameSong(a, b) {
+  if (!a || !b) return false;
+  const sameTitle = normalizeForKey(a.title) === normalizeForKey(b.title);
+  const sameArtist = normalizeForKey(a.artist) === normalizeForKey(b.artist);
+  if (!sameTitle || !sameArtist) return false;
+  const albumsMatch = normalizeAlbumValue(a.album) === normalizeAlbumValue(b.album)
+    || !normalizeAlbumValue(a.album)
+    || !normalizeAlbumValue(b.album);
+  return albumsMatch && durationsRoughlyEqual(a.duration, b.duration);
+}
+
+function collectMetadataImprovements(existing, incoming) {
+  const updates = {};
+  if (incoming.cover_path && !existing.cover_path) updates.cover_path = incoming.cover_path;
+  if (incoming.album && incoming.album !== 'Unknown Album' && (!existing.album || existing.album === 'Unknown Album')) updates.album = incoming.album;
+  if (incoming.album_artist && (!existing.album_artist || existing.album_artist === 'Unknown Artist')) updates.album_artist = incoming.album_artist;
+  if (incoming.duration && (!existing.duration || existing.duration <= 0)) updates.duration = incoming.duration;
+  if (incoming.format && (!existing.format || existing.format === 'remote')) updates.format = incoming.format;
+  if (incoming.bitrate && !existing.bitrate) updates.bitrate = incoming.bitrate;
+  if (incoming.sample_rate && !existing.sample_rate) updates.sample_rate = incoming.sample_rate;
+  if (incoming.bit_depth && !existing.bit_depth) updates.bit_depth = incoming.bit_depth;
+  if (incoming.channels && !existing.channels) updates.channels = incoming.channels;
+  if (incoming.lossless !== null && incoming.lossless !== undefined && (existing.lossless === null || existing.lossless === undefined)) {
+    updates.lossless = incoming.lossless;
+  }
+  if (incoming.codec && !existing.codec) updates.codec = incoming.codec;
+  const incomingQuality = incoming.quality_score ?? computeQualityScore(incoming);
+  const existingQuality = existing.quality_score ?? computeQualityScore(existing);
+  if (incomingQuality && (!existingQuality || incomingQuality > existingQuality)) {
+    updates.quality_score = incomingQuality;
+  }
+  return updates;
+}
+
+let libraryDeduped = false;
+function dedupeLibrary() {
+  if (libraryDeduped) return;
+  libraryDeduped = true;
+  try {
+    const tracks = db.getAllTracks();
+    const groups = new Map();
+    for (const track of tracks) {
+      const titleKey = normalizeForKey(track.title);
+      const artistKey = normalizeForKey(track.artist);
+      if (!titleKey || !artistKey) continue;
+      const albumKey = normalizeAlbumValue(track.album);
+      const key = `${artistKey}::${albumKey}::${titleKey}`;
+      if (!groups.has(key)) groups.set(key, []);
+      groups.get(key).push(track);
+    }
+    let removed = 0;
+    for (const group of groups.values()) {
+      if (!group || group.length < 2) continue;
+      group.sort((a, b) => computeStoredTrackQuality(b) - computeStoredTrackQuality(a));
+      const keeper = group[0];
+      let aggregatedUpdates = {};
+      for (let i = 1; i < group.length; i++) {
+        const candidate = group[i];
+        if (!recordsLikelySameSong(keeper, candidate)) continue;
+        const upgrades = collectMetadataImprovements(keeper, candidate);
+        if (Object.keys(upgrades).length > 0) {
+          aggregatedUpdates = { ...aggregatedUpdates, ...upgrades };
+          Object.assign(keeper, upgrades);
+        }
+        db.removeTrack(candidate.id);
+        removed++;
+      }
+      if (Object.keys(aggregatedUpdates).length > 0) {
+        db.updateTrackFields(keeper.id, aggregatedUpdates);
+      }
+    }
+    if (removed > 0) {
+      console.log(`[main] Deduped ${removed} duplicate track(s) on startup.`);
+    }
+  } catch (err) {
+    console.warn('[main] Unable to dedupe library', err);
+  }
+}
+
+function storeTrackWithDedup(track) {
+  if (!track) return null;
+  const normalizedTitle = normalizeForKey(track.title);
+  const normalizedArtist = normalizeForKey(track.artist);
+  const newScore = track.quality_score ?? computeQualityScore(track);
+  track.quality_score = newScore;
+
+  const duplicates = normalizedTitle && normalizedArtist
+    ? (db.findTracksByTitleArtist(track.title, track.artist) || [])
+    : [];
+
+  const comparable = duplicates.filter(existing => tracksLikelySameSong(track, existing));
+
+  if (comparable.length > 0) {
+    const scoredExisting = comparable
+      .map(candidate => ({ record: candidate, score: computeStoredTrackQuality(candidate) }))
+      .sort((a, b) => b.score - a.score);
+
+    const keeper = scoredExisting[0];
+    const keeperId = keeper.record.id;
+    const keeperScore = keeper.score;
+
+    if (newScore > keeperScore + QUALITY_SCORE_EPSILON) {
+      db.updateTrackFields(keeperId, track);
+      for (const { record } of scoredExisting.slice(1)) {
+        if (record.id !== keeperId) db.removeTrack(record.id);
+      }
+      console.log(`[main] Upgraded duplicate track with higher quality: ${track.title}`);
+      return db.getTrackById(keeperId);
+    }
+
+    const metadataUpdates = collectMetadataImprovements(keeper.record, track);
+    if (Object.keys(metadataUpdates).length > 0) {
+      db.updateTrackFields(keeperId, metadataUpdates);
+      Object.assign(keeper.record, metadataUpdates);
+    }
+
+    for (const { record } of scoredExisting.slice(1)) {
+      if (record.id !== keeperId) db.removeTrack(record.id);
+    }
+
+    return db.getTrackById(keeperId);
+  }
+
+  const inserted = db.addTrack(track);
+  if (inserted?.id) {
+    console.log(`[main] Added track: ${track.title}, cover: ${track.cover_path}`);
+  }
+  return inserted;
+}
+
 // Helper to process a list of files with progress
 async function processFileList(files) {
   const total = files.length;
@@ -1507,6 +1728,13 @@ async function processAndAddTrack(filePath) {
       duration: meta.duration || 0,
       format: meta.format || path.extname(filePath).slice(1),
       cover_path: meta.coverPath || null,
+      bitrate: meta.bitrate ?? null,
+      sample_rate: meta.sampleRate ?? null,
+      bit_depth: meta.bitDepth ?? null,
+      channels: meta.channels ?? null,
+      lossless: meta.lossless ?? null,
+      codec: meta.codec ?? null,
+      quality_score: computeQualityScore(meta),
     };
 
     // Normalize album artist from DB if available
@@ -1526,9 +1754,8 @@ async function processAndAddTrack(filePath) {
       }
     }
 
-    const id = db.addTrack(track);
-    console.log(`[main] Added track: ${track.title}, cover: ${track.cover_path}`);
-    return { id, ...track };
+    const stored = storeTrackWithDedup(track);
+    return stored;
   } catch (e) {
     console.error('Failed to process track', filePath, e);
     throw e;
