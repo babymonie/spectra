@@ -180,6 +180,7 @@ function savePluginConfig(cfg) {
 let mainWindow;
 let tray = null;
 let remoteServer;
+let libraryDeduped = false;
 let currentTrackMetadata = null;
 // Pending files opened before app is ready
 const pendingOpenFiles = [];
@@ -266,7 +267,7 @@ function parseArgvFiles(argv) {
         files.push(u.pathname);
         continue;
       }
-    } catch (e) {}
+    } catch {}
     if (isAudioPath(a) && fs.existsSync(a)) files.push(a);
   }
   return files;
@@ -298,7 +299,7 @@ async function handleOpenFile(filePath) {
       }
     } else {
       // remote URL: call existing add-remote handler then play
-      const r = await handlers['library:add-remote'](null, { url: filePath }).catch(() => null);
+      await handlers['library:add-remote'](null, { url: filePath }).catch(() => null);
       await handlers['audio:play'](filePath, {});
     }
   } catch (e) {
@@ -324,7 +325,7 @@ function createWindow() {
   try {
     const winIconPath = path.join(__dirname, 'images', 'icon.png');
     if (fs.existsSync(winIconPath)) winIcon = winIconPath;
-  } catch (e) {}
+  } catch {}
 
   mainWindow = new BrowserWindow({
     width: 1200,
@@ -1506,10 +1507,6 @@ ipcMain.handle('library:import-folder', async () => {
   await processFileList(files);
 });
 
-ipcMain.handle('library:add-files', async (event, filePaths) => handleAddFiles(filePaths));
-
-ipcMain.handle('library:add-remote', async (event, remoteInfo = {}) => handleAddRemote(remoteInfo));
-
 ipcMain.handle('window:set-fullscreen', (event, flag) => {
   if (mainWindow) {
     mainWindow.setFullScreen(flag);
@@ -1629,7 +1626,6 @@ function collectMetadataImprovements(existing, incoming) {
   return updates;
 }
 
-let libraryDeduped = false;
 function dedupeLibrary() {
   if (libraryDeduped) return;
   libraryDeduped = true;
