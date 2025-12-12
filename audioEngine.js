@@ -162,6 +162,10 @@ function createExclusiveStream({ sampleRate, channels, bitDepth, deviceId, mode,
 
   const tryMode = (m) => {
     console.log(`[audioEngine] opening ${m} WASAPI/CoreAudio stream`);
+    try {
+      const st = new Error().stack;
+      console.log('[audioEngine] createExclusiveStream callstack:\n', st);
+    } catch {}
     return exclusiveAudio.createExclusiveStream({ ...baseOpts, mode: m });
   };
 
@@ -208,6 +212,11 @@ function createExclusiveStream({ sampleRate, channels, bitDepth, deviceId, mode,
 async function playFile(filePath, onEnd, onError, options = {}) {
   // Clean up any previous playback
   stop();
+  try {
+    console.log('[audioEngine] playFile called for', filePath, 'options=', { ...(options || {}) });
+    const st = new Error('playFile-stack').stack;
+    console.log('[audioEngine] playFile callstack:\n', st);
+  } catch {}
   currentStartTime = options.startTime || 0;
 
   currentFile = filePath;

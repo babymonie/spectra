@@ -1726,7 +1726,14 @@ async function processFileList(files) {
   const total = files.length;
   if (total === 0) return;
 
+  console.log('[main] processFileList: starting import of', total, 'files');
   broadcast('import:start', { total });
+
+  // Mark bulk import in progress so other subsystems can avoid noisy actions
+  // (e.g. avoid triggering playback restarts while we're scanning files).
+  try {
+    global.__spectra_bulk_import = true;
+  } catch {}
 
   for (let i = 0; i < total; i++) {
     await processAndAddTrack(files[i]);
@@ -1738,6 +1745,11 @@ async function processFileList(files) {
   }
 
   broadcast('import:complete');
+  console.log('[main] processFileList: import complete');
+
+  try {
+    global.__spectra_bulk_import = false;
+  } catch {}
 }
 
 async function processAndAddTrack(filePath) {
