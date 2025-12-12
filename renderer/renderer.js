@@ -58,11 +58,25 @@ let notificationBar;
 let notificationMessage;
 let notificationProgress;
 let notificationCount;
+let notificationDetail;
+let notificationClose;
+let notificationTrack;
 
 let isSeeking = false;
 // When set, searches and library view are scoped to this album (lowercase name and optional artist)
 let currentAlbumFilter = null;
 let currentArtistFilter = null;
+let currentPlaylistFilter = null;
+let currentPlaylistTracks = [];
+let currentView = 'library';
+let libraryContext = { type: 'library', name: null, artist: null };
+let albumsCache = [];
+let artistsCache = [];
+let playlistsCache = [];
+let libraryTitleEl;
+let searchInputEl;
+let lastAutoAdvancedTrackId = null;
+const AUTO_ADVANCE_EPS = 0.9; // seconds before end to trigger advance
 
 // Helper function to update repeat button visual state
 
@@ -84,6 +98,241 @@ function updateRepeatButton(btn) {
   } else if (repeatMode === 'one') {
     btn.classList.add('active', 'repeat-one');
   }
+}
+
+const tokenizeQuery = (query) => {
+  if (!query) return [];
+  return String(query)
+    .split(/\s+/)
+    .filter(Boolean)
+    .map((tok) => {
+      let type = 'include';
+      let text = tok;
+      if (tok.startsWith('-')) { type = 'exclude'; text = tok.slice(1); }
+      else if (tok.startsWith('+')) { type = 'include'; text = tok.slice(1); }
+      const fieldMatch = text.match(/^(title|artist|album):(.+)$/);
+      if (fieldMatch) {
+        return { type, field: fieldMatch[1], text: fieldMatch[2] };
+      }
+      return { type, field: null, text };
+    });
+};
+
+const matchesTrackToken = (track, token) => {
+  const needle = (token.text || '').toLowerCase();
+  if (!needle) return true;
+  if (token.field) {
+    const val = ((track?.[token.field] || '') + '').toLowerCase();
+    return val.includes(needle);
+  }
+  const title = (track?.title || '').toLowerCase();
+  const artist = (track?.artist || '').toLowerCase();
+  const album = (track?.album || '').toLowerCase();
+  return title.includes(needle) || artist.includes(needle) || album.includes(needle);
+};
+
+const filterTracksByQuery = (base, query) => {
+  if (!Array.isArray(base)) return [];
+  const tokens = tokenizeQuery(query);
+  if (tokens.length === 0) return base;
+  return base.filter((track) => {
+    for (const tok of tokens) {
+      if (tok.type === 'exclude') {
+        if (matchesTrackToken(track, tok)) return false;
+      } else if (!matchesTrackToken(track, tok)) {
+        return false;
+      }
+    }
+    return true;
+  });
+};
+
+const computeLibraryBase = () => {
+  if (libraryContext.type === 'playlist' && currentPlaylistFilter) {
+    return Array.isArray(currentPlaylistTracks) ? [...currentPlaylistTracks] : [];
+  }
+
+  let base = Array.isArray(libraryCache) ? libraryCache : [];
+
+  if (currentAlbumFilter && currentAlbumFilter.album) {
+    base = base.filter((t) => {
+      const trackAlbum = normalizeForCompare(t.album || '');
+      const trackArtist = normalizeForCompare(t.artist || '');
+      if (currentAlbumFilter.artist) {
+        return trackAlbum === currentAlbumFilter.album && trackArtist === currentAlbumFilter.artist;
+      }
+      return trackAlbum === currentAlbumFilter.album;
+    });
+  } else if (currentArtistFilter) {
+    base = base.filter((t) => {
+      const trackArtist = normalizeForCompare(t.artist || '');
+      return trackArtist === currentArtistFilter;
+    });
+  }
+
+  return base;
+};
+
+const applyLibrarySearch = (query) => {
+  const base = computeLibraryBase();
+  tracks = filterTracksByQuery(base, query);
+  renderLibrary();
+};
+
+function setLibraryContext(type, details = {}) {
+  const normalized = type || 'library';
+  libraryContext = {
+    type: normalized,
+    name: details?.name ?? null,
+    artist: details?.artist ?? null,
+    id: details?.id ?? null,
+  };
+
+  if (normalized === 'library') {
+    currentAlbumFilter = null;
+    currentArtistFilter = null;
+    currentPlaylistFilter = null;
+    currentPlaylistTracks = [];
+  } else if (normalized === 'playlist') {
+    currentAlbumFilter = null;
+    currentArtistFilter = null;
+    currentPlaylistFilter = { id: details?.id ?? null, name: details?.name ?? null };
+  }
+
+  updateLibraryHeader();
+  updateSearchPlaceholder();
+}
+
+function updateLibraryHeader() {
+  if (!libraryTitleEl) libraryTitleEl = document.querySelector('#view-library h2');
+  if (!libraryTitleEl) return;
+
+  if (libraryContext.type === 'album') {
+    const segments = ['Album'];
+    if (libraryContext.name) segments.push(`· ${libraryContext.name}`);
+    if (libraryContext.artist) segments.push(`(${libraryContext.artist})`);
+    libraryTitleEl.textContent = segments.join(' ');
+  } else if (libraryContext.type === 'artist') {
+    const label = libraryContext.name ? `Artist · ${libraryContext.name}` : 'Artist';
+    libraryTitleEl.textContent = label;
+  } else if (libraryContext.type === 'playlist') {
+    const label = libraryContext.name ? `Playlist · ${libraryContext.name}` : 'Playlist';
+    libraryTitleEl.textContent = label;
+  } else {
+    libraryTitleEl.textContent = 'Library';
+  }
+}
+
+function updateSearchPlaceholder() {
+  if (!searchInputEl) searchInputEl = document.getElementById('search-input');
+  if (!searchInputEl) return;
+
+  if (currentView === 'albums') {
+    searchInputEl.placeholder = 'Search albums...';
+  } else if (currentView === 'artists') {
+    searchInputEl.placeholder = 'Search artists...';
+  } else if (currentView === 'playlists') {
+    searchInputEl.placeholder = 'Search playlists...';
+  } else if (libraryContext.type === 'album') {
+    searchInputEl.placeholder = 'Search this album...';
+  } else if (libraryContext.type === 'artist') {
+    searchInputEl.placeholder = 'Search this artist...';
+  } else if (libraryContext.type === 'playlist') {
+    searchInputEl.placeholder = 'Search this playlist...';
+  } else {
+    searchInputEl.placeholder = 'Search library...';
+  }
+}
+
+const albumMatchesQuery = (album, query) => {
+  const needle = (query || '').toLowerCase();
+  if (!needle) return true;
+  const name = (album?.name || album?.album || '').toLowerCase();
+  const artist = (album?.artist || '').toLowerCase();
+  return name.includes(needle) || artist.includes(needle);
+};
+
+const artistMatchesQuery = (artist, query) => {
+  const needle = (query || '').toLowerCase();
+  if (!needle) return true;
+  const name = (artist?.name || '').toLowerCase();
+  return name.includes(needle);
+};
+
+const playlistMatchesQuery = (playlist, query) => {
+  const needle = (query || '').toLowerCase();
+  if (!needle) return true;
+  const name = (playlist?.name || '').toLowerCase();
+  return name.includes(needle);
+};
+
+async function ensureAlbumsCache(force = false) {
+  if (!force && Array.isArray(albumsCache) && albumsCache.length) {
+    return albumsCache;
+  }
+  try {
+    const albums = await electron.getAlbums();
+    albumsCache = Array.isArray(albums) ? albums : [];
+  } catch (err) {
+    console.error('Failed to load albums:', err);
+    albumsCache = [];
+  }
+  return albumsCache;
+}
+
+async function ensureArtistsCache(force = false) {
+  if (!force && Array.isArray(artistsCache) && artistsCache.length) {
+    return artistsCache;
+  }
+  try {
+    const artists = await electron.getArtists();
+    artistsCache = Array.isArray(artists) ? artists : [];
+  } catch (err) {
+    console.error('Failed to load artists:', err);
+    artistsCache = [];
+  }
+  return artistsCache;
+}
+
+async function ensurePlaylistsCache(force = false) {
+  if (!force && Array.isArray(playlistsCache) && playlistsCache.length) {
+    return playlistsCache;
+  }
+  try {
+    const playlists = await electron.getPlaylists();
+    playlistsCache = Array.isArray(playlists) ? playlists : [];
+  } catch (err) {
+    console.error('Failed to load playlists:', err);
+    playlistsCache = [];
+  }
+  return playlistsCache;
+}
+
+async function handleSearchInput(rawValue = '') {
+  const query = (rawValue || '').toLowerCase().trim();
+
+  if (currentView === 'albums') {
+    const source = await ensureAlbumsCache();
+    const filtered = query ? source.filter((album) => albumMatchesQuery(album, query)) : source;
+    await renderAlbums({ data: filtered });
+    return;
+  }
+
+  if (currentView === 'artists') {
+    const source = await ensureArtistsCache();
+    const filtered = query ? source.filter((artist) => artistMatchesQuery(artist, query)) : source;
+    await renderArtists({ data: filtered });
+    return;
+  }
+
+  if (currentView === 'playlists') {
+    const source = await ensurePlaylistsCache();
+    const filtered = query ? source.filter((playlist) => playlistMatchesQuery(playlist, query)) : source;
+    await renderPlaylists({ data: filtered });
+    return;
+  }
+
+  applyLibrarySearch(query);
 }
 
 // Helper function to render queue
@@ -402,55 +651,73 @@ const saveSettings = () => {
 // Settings Event Listeners
 // Navigation Logic
 const switchView = (viewId, preserveLibrary = false) => {
-  // Hide all views (including plugin-provided views that use class `view`)
-  document.querySelectorAll('.view').forEach(el => el.style.display = 'none');
-  // Remove active state from all sidebar items
-  document.querySelectorAll('.sidebar nav li').forEach(el => el.classList.remove('active'));
+  currentView = viewId || 'library';
 
-  // Prefer a view element named `view-<viewId>` so plugins can register their own views
+  document.querySelectorAll('.view').forEach((el) => { el.style.display = 'none'; });
+  document.querySelectorAll('.sidebar nav li').forEach((el) => el.classList.remove('active'));
+
   const targetId = `view-${viewId}`;
   const targetView = document.getElementById(targetId);
+  const navEl = document.getElementById(`nav-${viewId}`);
   if (targetView) {
     targetView.style.display = 'block';
-    const navEl = document.getElementById(`nav-${viewId}`);
     if (navEl) navEl.classList.add('active');
 
-    // Keep legacy behavior for known views
     if (viewId === 'library') {
       if (!preserveLibrary) {
-        // Clear any album-scoped filter when doing a full library load
-        currentAlbumFilter = null;
-        currentArtistFilter = null;
+        setLibraryContext('library');
         loadLibrary();
+      } else {
+        updateLibraryHeader();
+        const currentQuery = searchInputEl ? searchInputEl.value : '';
+        void handleSearchInput(currentQuery);
       }
     } else if (viewId === 'albums') {
-      renderAlbums();
+      void renderAlbums({ forceReload: !albumsCache.length });
     } else if (viewId === 'artists') {
-      renderArtists();
+      void renderArtists({ forceReload: !artistsCache.length });
     } else if (viewId === 'settings') {
       loadSettingsUI();
+    }
+
+    updateSearchPlaceholder();
+    if (viewId !== 'library') {
+      const currentQuery = searchInputEl ? searchInputEl.value : '';
+      void handleSearchInput(currentQuery);
     }
     return;
   }
 
-  // Fallback: handle built-in views by id if explicit `view-<id>` element wasn't found
   if (viewId === 'library') {
     if (viewLibrary) viewLibrary.style.display = 'block';
     if (navLibrary) navLibrary.classList.add('active');
-    if (!preserveLibrary) loadLibrary();
+    if (!preserveLibrary) {
+      setLibraryContext('library');
+      loadLibrary();
+    } else {
+      updateLibraryHeader();
+      const currentQuery = searchInputEl ? searchInputEl.value : '';
+      void handleSearchInput(currentQuery);
+    }
   } else if (viewId === 'playlists') {
     if (viewPlaylists) viewPlaylists.style.display = 'block';
     if (navPlaylists) navPlaylists.classList.add('active');
-    renderPlaylists();
+    void renderPlaylists({ forceReload: !playlistsCache.length });
+    const currentQuery = searchInputEl ? searchInputEl.value : '';
+    void handleSearchInput(currentQuery);
   } else if (viewId === 'albums') {
     if (viewAlbums) viewAlbums.style.display = 'block';
     if (navAlbums) navAlbums.classList.add('active');
-    renderAlbums();
+    void renderAlbums({ forceReload: !albumsCache.length });
+    const currentQuery = searchInputEl ? searchInputEl.value : '';
+    void handleSearchInput(currentQuery);
   } else if (viewId === 'settings') {
     if (viewSettings) viewSettings.style.display = 'block';
     if (navSettings) navSettings.classList.add('active');
     loadSettingsUI();
   }
+
+  updateSearchPlaceholder();
 };
 
 
@@ -472,19 +739,41 @@ function showNowPlaying() {
 
 // Sidebar playlists removed: playlists are rendered on the Playlists page only.
 
-async function renderPlaylists() {
+async function renderPlaylists({ data, forceReload = false } = {}) {
   try {
     const container = document.getElementById('playlists-container');
     if (!container) return;
-    container.innerHTML = '';
+    const source = Array.isArray(data) ? data : await ensurePlaylistsCache(forceReload);
 
-    const pls = await electron.getPlaylists();
-    if (!Array.isArray(pls) || pls.length === 0) {
+    if (!Array.isArray(source) || source.length === 0) {
       container.innerHTML = '<div class="empty">No playlists</div>';
       return;
     }
 
-    for (const p of pls) {
+    container.innerHTML = '';
+
+    const openPlaylist = async (playlist, { autoplay = false } = {}) => {
+      try {
+        const tracksIn = await electron.getPlaylistTracks(playlist.id);
+        currentPlaylistTracks = Array.isArray(tracksIn) ? tracksIn : [];
+        setLibraryContext('playlist', { id: playlist.id, name: playlist.name });
+        currentAlbumFilter = null;
+        currentArtistFilter = null;
+        const currentQuery = searchInputEl ? searchInputEl.value : '';
+        switchView('library', true);
+        await handleSearchInput(currentQuery);
+        if (autoplay) {
+          const target = tracks.length > 0 ? tracks[0] : null;
+          if (target) await playTrack(target);
+          else notify('Playlist is empty', 'warning', { autoClose: 2200 });
+        }
+      } catch (err) {
+        console.error('Failed to open playlist', err);
+        notify('Failed to load playlist', 'error', { autoClose: 3600 });
+      }
+    };
+
+    for (const p of source) {
       const card = document.createElement('div');
       card.className = 'album-card';
 
@@ -494,7 +783,7 @@ async function renderPlaylists() {
 
       const meta = document.createElement('div');
       meta.className = 'album-artist';
-      meta.textContent = new Date(p.created_at).toLocaleString();
+      meta.textContent = p.created_at ? new Date(p.created_at).toLocaleString() : '';
 
       const actions = document.createElement('div');
       actions.style.display = 'flex';
@@ -504,27 +793,12 @@ async function renderPlaylists() {
       const btnView = document.createElement('button');
       btnView.className = 'btn-secondary';
       btnView.textContent = 'View';
-      btnView.onclick = async () => {
-        const tracksIn = await electron.getPlaylistTracks(p.id);
-        if (Array.isArray(tracksIn)) {
-          tracks = tracksIn;
-          renderLibrary();
-          switchView('library', true);
-        }
-      };
+      btnView.onclick = () => openPlaylist(p, { autoplay: false });
 
       const btnPlay = document.createElement('button');
       btnPlay.className = 'btn-secondary';
       btnPlay.textContent = 'Play';
-      btnPlay.onclick = async () => {
-        const tracksIn = await electron.getPlaylistTracks(p.id);
-        if (Array.isArray(tracksIn) && tracksIn.length > 0) {
-          tracks = tracksIn;
-          await playTrack(tracks[0]);
-        } else {
-          alert('Playlist is empty');
-        }
-      };
+      btnPlay.onclick = () => openPlaylist(p, { autoplay: true });
 
       const btnEdit = document.createElement('button');
       btnEdit.className = 'btn-text';
@@ -540,20 +814,28 @@ async function renderPlaylists() {
         e.stopPropagation();
         try {
           const res = await electron.exportPlaylist(p.id);
-          if (res && res.success) alert('Playlist exported to: ' + res.path);
-          else if (res && res.canceled) {/* user canceled */}
-          else alert('Export failed: ' + (res && res.error ? res.error : 'unknown'));
-        } catch (err) { console.error('Export playlist failed', err); alert('Export failed'); }
+          if (res && res.success) notify(`Playlist exported to ${res.path}`, 'success', { autoClose: 2600 });
+          else if (res && res.canceled) { /* user canceled */ }
+          else notify(`Export failed: ${res && res.error ? res.error : 'unknown'}`, 'error');
+        } catch (err) {
+          console.error('Export playlist failed', err);
+          notify('Export failed', 'error');
+        }
       };
 
-      // count: load tracks length
       const count = document.createElement('div');
       count.className = 'album-count';
-      try {
-        const tlist = await electron.getPlaylistTracks(p.id);
-        count.textContent = `${Array.isArray(tlist) ? tlist.length : 0} tracks`;
-      } catch {
-        count.textContent = '';
+      if (typeof p._trackCount === 'number') {
+        count.textContent = `${p._trackCount} tracks`;
+      } else {
+        try {
+          const tlist = await electron.getPlaylistTracks(p.id);
+          const trackCount = Array.isArray(tlist) ? tlist.length : 0;
+          p._trackCount = trackCount;
+          count.textContent = `${trackCount} tracks`;
+        } catch {
+          count.textContent = '';
+        }
       }
 
       actions.appendChild(btnView);
@@ -567,16 +849,10 @@ async function renderPlaylists() {
       card.appendChild(actions);
 
       container.appendChild(card);
-      // Make the whole card clickable to view the playlist (except when clicking buttons)
       card.style.cursor = 'pointer';
-      card.addEventListener('click', async (e) => {
-        if (e.target.closest('button')) return; // ignore clicks on controls
-        const tracksIn = await electron.getPlaylistTracks(p.id);
-        if (Array.isArray(tracksIn)) {
-          tracks = tracksIn;
-          renderLibrary();
-          switchView('library', true);
-        }
+      card.addEventListener('click', (event) => {
+        if (event.target.closest('button')) return;
+        void openPlaylist(p, { autoplay: false });
       });
     }
   } catch (e) {
@@ -655,6 +931,206 @@ function customPrompt(message, defaultValue = '') {
   });
 }
 
+function customConfirm(message, options = {}) {
+  return new Promise((resolve) => {
+    const modal = document.createElement('div');
+    modal.className = 'modal';
+    modal.style.display = 'flex';
+
+    const content = document.createElement('div');
+    content.className = 'modal-content';
+
+    const title = document.createElement('h3');
+    title.textContent = options.title || 'Confirm';
+    content.appendChild(title);
+
+    const body = document.createElement('p');
+    body.textContent = message || '';
+    body.style.marginBottom = '16px';
+    content.appendChild(body);
+
+    const actions = document.createElement('div');
+    actions.className = 'modal-actions';
+
+    const cancelBtn = document.createElement('button');
+    cancelBtn.id = 'custom-confirm-cancel';
+    cancelBtn.className = 'btn-text';
+    cancelBtn.textContent = options.cancelLabel || 'Cancel';
+
+    const okBtn = document.createElement('button');
+    okBtn.id = 'custom-confirm-ok';
+    okBtn.className = options.confirmClass || 'btn-secondary';
+    okBtn.textContent = options.confirmLabel || 'OK';
+
+    actions.appendChild(cancelBtn);
+    actions.appendChild(okBtn);
+    content.appendChild(actions);
+    modal.appendChild(content);
+    document.body.appendChild(modal);
+
+    const cleanup = (accepted) => {
+      try { document.body.removeChild(modal); } catch {}
+      resolve(Boolean(accepted));
+    };
+
+    cancelBtn.onclick = () => cleanup(false);
+    okBtn.onclick = () => cleanup(true);
+
+    const keyHandler = (event) => {
+      if (event.key === 'Escape') {
+        cleanup(false);
+        document.removeEventListener('keydown', keyHandler);
+      } else if (event.key === 'Enter') {
+        cleanup(true);
+        document.removeEventListener('keydown', keyHandler);
+      }
+    };
+
+    document.addEventListener('keydown', keyHandler);
+    modal.onclick = (event) => {
+      if (event.target === modal) {
+        cleanup(false);
+        document.removeEventListener('keydown', keyHandler);
+      }
+    };
+  });
+}
+
+const NotificationCenter = (() => {
+  let current = null;
+  let hideTimer = null;
+
+  const ensureDom = () => {
+    notificationBar = notificationBar || document.getElementById('notification-bar');
+    notificationMessage = notificationMessage || document.getElementById('notification-message');
+    notificationDetail = notificationDetail || document.getElementById('notification-detail');
+    notificationProgress = notificationProgress || document.getElementById('notification-progress');
+    notificationCount = notificationCount || document.getElementById('notification-count');
+    notificationClose = notificationClose || document.getElementById('notification-close');
+    notificationTrack = notificationTrack || document.querySelector('#notification-bar .progress-track');
+
+    return {
+      bar: notificationBar,
+      messageEl: notificationMessage,
+      detailEl: notificationDetail,
+      progressTrack: notificationTrack,
+      progressEl: notificationProgress,
+      countEl: notificationCount,
+      closeBtn: notificationClose
+    };
+  };
+
+  const setType = (bar, type) => {
+    if (!bar) return;
+    const classes = ['type-info', 'type-success', 'type-error', 'type-warning', 'type-progress'];
+    for (const cls of classes) bar.classList.remove(cls);
+    const normalized = type ? String(type).toLowerCase() : 'info';
+    const cls = classes.find(c => c.endsWith(normalized));
+    if (cls) bar.classList.add(cls);
+  };
+
+  const applyState = (state) => {
+    const dom = ensureDom();
+    if (!dom.bar || !dom.messageEl) return;
+
+    dom.bar.classList.add('show');
+    setType(dom.bar, state.type);
+
+    dom.messageEl.textContent = state.message || '';
+
+    if (dom.detailEl) {
+      dom.detailEl.textContent = state.detail || '';
+      dom.detailEl.style.display = state.detail ? 'block' : 'none';
+    }
+
+    if (dom.progressTrack) {
+      const showProgress = state.mode === 'progress';
+      dom.progressTrack.classList.toggle('hidden', !showProgress);
+      if (dom.progressEl && typeof state.progress === 'number') {
+        const pct = Math.max(0, Math.min(100, state.progress));
+        dom.progressEl.style.width = `${pct}%`;
+      }
+    }
+
+    if (dom.countEl) {
+      if (state.mode === 'progress' && state.count) {
+        dom.countEl.textContent = state.count;
+        dom.countEl.classList.remove('hidden');
+      } else {
+        dom.countEl.classList.add('hidden');
+      }
+    }
+
+    if (dom.closeBtn) {
+      dom.closeBtn.style.display = state.dismissible === false ? 'none' : 'flex';
+      dom.closeBtn.onclick = () => hide();
+    }
+  };
+
+  const scheduleHide = (state) => {
+    if (hideTimer) {
+      clearTimeout(hideTimer);
+      hideTimer = null;
+    }
+    if (!state.sticky && state.autoClose) {
+      hideTimer = setTimeout(() => hide(), state.autoClose);
+    }
+  };
+
+  const show = (config = {}) => {
+    const mode = config.mode || (typeof config.progress === 'number' ? 'progress' : 'message');
+    const type = config.type || (mode === 'progress' ? 'progress' : 'info');
+    const next = {
+      message: config.message || '',
+      detail: config.detail || '',
+      type,
+      mode,
+      progress: typeof config.progress === 'number' ? config.progress : 0,
+      count: config.count || '',
+      autoClose: config.autoClose === undefined ? (mode === 'progress' ? null : 4000) : config.autoClose,
+      sticky: config.sticky === undefined ? mode === 'progress' : config.sticky,
+      dismissible: config.dismissible === undefined ? true : config.dismissible,
+      onClose: typeof config.onClose === 'function' ? config.onClose : null
+    };
+    current = next;
+    applyState(current);
+    scheduleHide(current);
+  };
+
+  const update = (partial = {}) => {
+    if (!current) {
+      show(partial);
+      return;
+    }
+    current = {
+      ...current,
+      ...partial
+    };
+    if (!current.mode) current.mode = typeof current.progress === 'number' ? 'progress' : 'message';
+    if (!current.type) current.type = current.mode === 'progress' ? 'progress' : 'info';
+    applyState(current);
+    scheduleHide(current);
+  };
+
+  const hide = () => {
+    const dom = ensureDom();
+    if (hideTimer) {
+      clearTimeout(hideTimer);
+      hideTimer = null;
+    }
+    if (dom.bar) dom.bar.classList.remove('show');
+    const closeCb = current && current.onClose;
+    current = null;
+    if (typeof closeCb === 'function') {
+      try { closeCb(); } catch (err) {
+        console.warn('Notification onClose failed', err);
+      }
+    }
+  };
+
+  return { show, update, hide, ensureDom };
+})();
+
 // Render Library
 const renderLibrary = () => {
   trackList.innerHTML = '';
@@ -691,7 +1167,11 @@ const renderLibrary = () => {
       selectedTrackIds.add(track.id);
       // re-render library to update classes
       renderLibrary();
-      playTrack(track);
+      const sameTrack = currentTrack && (
+        (track.id && currentTrack.id && track.id === currentTrack.id) ||
+        (!track.id && currentTrack.path && track.path && currentTrack.path === track.path)
+      );
+      playTrack(track, { forceRestart: Boolean(sameTrack) });
     });
     
     // Context Menu
@@ -715,251 +1195,170 @@ const renderLibrary = () => {
 // Load Library
 const loadLibrary = async () => {
   libraryCache = await electron.getLibrary();
-  
-  const searchInput = document.getElementById('search-input');
-  const query = searchInput ? searchInput.value.toLowerCase().trim() : '';
-  
-  // If an album filter is active, scope the base set to that album first
-  let base = libraryCache;
-  if (currentAlbumFilter && currentAlbumFilter.album) {
-    base = libraryCache.filter(t => {
-      const trackAlbum = (t.album || '').toString().trim().toLowerCase();
-      const trackArtist = (t.artist || '').toString().trim().toLowerCase();
-      if (currentAlbumFilter.artist) {
-        return trackAlbum === currentAlbumFilter.album && trackArtist === currentAlbumFilter.artist;
-      }
-      return trackAlbum === currentAlbumFilter.album;
-    });
-  } else if (currentArtistFilter) {
-    base = libraryCache.filter(t => {
-      const trackArtist = (t.artist || '').toString().trim().toLowerCase();
-      return trackArtist === currentArtistFilter;
-    });
+
+  const querySource = searchInputEl || document.getElementById('search-input');
+  const query = querySource ? querySource.value.toLowerCase().trim() : '';
+
+  if (libraryContext.type === 'playlist' && currentPlaylistFilter?.id) {
+    try {
+      const refreshed = await electron.getPlaylistTracks(currentPlaylistFilter.id);
+      currentPlaylistTracks = Array.isArray(refreshed) ? refreshed : [];
+    } catch (err) {
+      console.warn('Failed to refresh playlist tracks', err);
+      currentPlaylistTracks = [];
+    }
   }
 
-  if (query) {
-    // Support prefixes: +term (required), -term (exclude), and field:value (title:, artist:, album:)
-    const tokens = query.split(/\s+/).filter(Boolean);
-    const parsed = tokens.map(tok => {
-      let type = 'include';
-      let text = tok;
-      if (tok.startsWith('-')) { type = 'exclude'; text = tok.slice(1); }
-      else if (tok.startsWith('+')) { type = 'include'; text = tok.slice(1); }
-      // fielded search
-      const m = text.match(/^(title|artist|album):(.+)$/);
-      if (m) return { type, field: m[1], text: m[2] };
-      return { type, field: null, text };
-    });
-
-    const matchesToken = (t, token) => {
-      const text = (token.text || '').toLowerCase();
-      if (!text) return true;
-      if (token.field) {
-        const v = ((t[token.field] || '') + '').toLowerCase();
-        return v.includes(text);
-      }
-      // default: search title, artist, album
-      const title = (t.title || '').toLowerCase();
-      const artist = (t.artist || '').toLowerCase();
-      const album = (t.album || '').toLowerCase();
-      return title.includes(text) || artist.includes(text) || album.includes(text);
-    };
-
-    tracks = base.filter(t => {
-      // All include tokens must match; no exclude tokens must match
-      for (const tok of parsed) {
-        if (tok.type === 'exclude') {
-          if (matchesToken(t, tok)) return false;
-        } else {
-          // include
-          if (!matchesToken(t, tok)) return false;
-        }
-      }
-      return true;
-    });
-  } else {
-    tracks = base;
-  }
-  
-  renderLibrary();
+  applyLibrarySearch(query);
 };
 
 // Render Albums view
-function renderAlbums() {
-  // Clear view
-  viewAlbums.innerHTML = '<h2>Albums</h2>';
+async function renderAlbums({ data, forceReload = false } = {}) {
+  if (!viewAlbums) return;
+  const container = document.getElementById('albums-container');
+  if (!container) return;
 
-  electron.getAlbums().then((albums) => {
-    if (!Array.isArray(albums) || albums.length === 0) {
-      viewAlbums.innerHTML = '<div class="empty">No albums found</div>';
-      return;
-    }
+  const source = Array.isArray(data) ? data : await ensureAlbumsCache(forceReload);
 
-    const grid = document.createElement('div');
-    grid.className = 'album-grid';
+  if (!Array.isArray(source) || source.length === 0) {
+    container.innerHTML = '<div class="empty">No albums found</div>';
+    return;
+  }
 
-    for (const album of albums) {
-      const card = document.createElement('div');
-      card.className = 'album-card';
+  container.innerHTML = '';
 
-      const img = document.createElement('img');
-      img.className = 'album-art';
-      if (album.cover_path) {
-        if (album.cover_path.startsWith('http') || album.cover_path.startsWith('data:')) {
-          img.src = album.cover_path;
-        } else {
-          // Load via IPC to avoid file:// protocol security issues
-          electron.getCoverImage(album.cover_path).then(dataUrl => {
-            if (dataUrl) {
-              img.src = dataUrl;
-            } else {
-              img.classList.add('placeholder');
-            }
-          }).catch(() => {
-            img.classList.add('placeholder');
-          });
-        }
-        img.alt = album.album || 'Album art';
+  for (const album of source) {
+    const card = document.createElement('div');
+    card.className = 'album-card';
+
+    const img = document.createElement('img');
+    img.className = 'album-art';
+    const coverPath = album.cover_path || album.coverPath || '';
+    if (coverPath) {
+      if (coverPath.startsWith('http') || coverPath.startsWith('data:')) {
+        img.src = coverPath;
       } else {
-        img.classList.add('placeholder');
-        img.alt = '';
+        electron.getCoverImage(coverPath).then((dataUrl) => {
+          if (dataUrl) img.src = dataUrl;
+          else img.classList.add('placeholder');
+        }).catch(() => img.classList.add('placeholder'));
       }
-
-      const title = document.createElement('div');
-      title.className = 'album-title';
-      // DB returns album name as either `album` or `name` depending on source; normalize here
-      const albumName = (album.album || album.name || '').toString();
-      title.textContent = albumName || 'Unknown Album';
-
-      const artist = document.createElement('div');
-      artist.className = 'album-artist';
-      artist.textContent = (album.artist || album.artist_name || 'Unknown Artist');
-
-      const count = document.createElement('div');
-      count.className = 'album-count';
-      count.textContent = `${album.track_count || album.trackCount || 0} tracks`;
-
-      card.appendChild(img);
-      card.appendChild(title);
-      card.appendChild(artist);
-      card.appendChild(count);
-
-      // Clicking an album filters the library view to that album
-      // Use closure to capture current album value
-      // Clicking an album filters the library view to that album. Preserve the filtered
-      // view when switching programmatically to the library so the filter isn't immediately
-      // overwritten by a full reload.
-      card.onclick = ((albumToFilter) => {
-        return async () => {
-          const allTracks = await electron.getLibrary();
-          // Get album name, handling both 'album' and 'name' properties
-          const albumNameRaw = albumToFilter.album || albumToFilter.name || '';
-          const nameToMatch = normalizeForCompare(albumNameRaw);
-          
-          const artistNameRaw = albumToFilter.artist || albumToFilter.artist_name || '';
-          const artistToMatch = normalizeForCompare(artistNameRaw) || null;
-
-          // Don't filter if album name is empty
-          if (!nameToMatch) {
-            console.warn('Album click: empty album name, skipping filter');
-            return;
-          }
-
-          // Set the global album filter so searches are scoped to this album
-          currentAlbumFilter = { album: nameToMatch, artist: artistToMatch };
-
-          tracks = allTracks.filter(t => {
-            const trackAlbum = normalizeForCompare(t.album || '');
-            const trackArtist = normalizeForCompare(t.artist || '');
-            if (artistToMatch) {
-              return trackAlbum === nameToMatch && trackArtist === artistToMatch;
-            }
-            return trackAlbum === nameToMatch;
-          });
-          if (!tracks || tracks.length === 0) {
-            console.warn('[renderAlbums] album click produced 0 matches for', { album: albumNameRaw, nameToMatch, artistToMatch });
-          }
-          renderLibrary();
-          switchView('library', true); // preserve current filtered library (do not auto-reload)
-        };
-      })(album);
-
-      grid.appendChild(card);
+      img.alt = (album.name || album.album || 'Album art');
+    } else {
+      img.classList.add('placeholder');
+      img.alt = '';
     }
 
-    viewAlbums.appendChild(grid);
-  }).catch((err) => {
-    console.error('renderAlbums error', err);
-    viewAlbums.innerHTML = '<div class="empty">Failed to load albums</div>';
-  });
+    const title = document.createElement('div');
+    title.className = 'album-title';
+    const albumName = (album.name || album.album || '').toString();
+    title.textContent = albumName || 'Unknown Album';
+
+    const artist = document.createElement('div');
+    artist.className = 'album-artist';
+    artist.textContent = (album.artist || album.artist_name || 'Unknown Artist');
+
+    const count = document.createElement('div');
+    count.className = 'album-count';
+    count.textContent = `${album.track_count || album.trackCount || 0} tracks`;
+
+    card.appendChild(img);
+    card.appendChild(title);
+    card.appendChild(artist);
+    card.appendChild(count);
+
+    card.onclick = (() => {
+      const albumNameRaw = album.name || album.album || '';
+      const nameToMatch = normalizeForCompare(albumNameRaw);
+      const artistNameRaw = album.artist || album.artist_name || '';
+      const artistToMatch = normalizeForCompare(artistNameRaw) || null;
+
+      return async () => {
+        if (!nameToMatch) {
+          console.warn('Album click: empty album name, skipping filter');
+          return;
+        }
+
+        currentAlbumFilter = { album: nameToMatch, artist: artistToMatch };
+        currentArtistFilter = null;
+        currentPlaylistFilter = null;
+        currentPlaylistTracks = [];
+        setLibraryContext('album', { name: albumNameRaw, artist: artistNameRaw });
+
+        const currentQuery = searchInputEl ? searchInputEl.value : '';
+        switchView('library', true);
+        await handleSearchInput(currentQuery);
+      };
+    })();
+
+    container.appendChild(card);
+  }
 }
 
-function renderArtists() {
-  viewArtists.innerHTML = '<h2>Artists</h2>';
+async function renderArtists({ data, forceReload = false } = {}) {
+  if (!viewArtists) return;
+  const container = document.getElementById('artists-container');
+  if (!container) return;
 
-  electron.getArtists().then((artists) => {
-    if (!Array.isArray(artists) || artists.length === 0) {
-      viewArtists.innerHTML = '<div class="empty">No artists found</div>';
-      return;
-    }
+  const source = Array.isArray(data) ? data : await ensureArtistsCache(forceReload);
 
-    const grid = document.createElement('div');
-    grid.className = 'album-grid'; // Reuse album grid styles
+  if (!Array.isArray(source) || source.length === 0) {
+    container.innerHTML = '<div class="empty">No artists found</div>';
+    return;
+  }
 
-    for (const artist of artists) {
-      const card = document.createElement('div');
-      card.className = 'album-card';
+  container.innerHTML = '';
 
-      const img = document.createElement('img');
-      img.className = 'album-art';
-      // Use artist image if available (from DB query)
-      if (artist.cover_path) {
-         if (artist.cover_path.startsWith('http') || artist.cover_path.startsWith('data:')) {
-          img.src = artist.cover_path;
-        } else {
-          electron.getCoverImage(artist.cover_path).then(dataUrl => {
-            if (dataUrl) img.src = dataUrl;
-            else img.classList.add('placeholder');
-          }).catch(() => img.classList.add('placeholder'));
-        }
+  for (const artist of source) {
+    const card = document.createElement('div');
+    card.className = 'album-card';
+
+    const img = document.createElement('img');
+    img.className = 'album-art';
+    const coverPath = artist.cover_path || '';
+    if (coverPath) {
+      if (coverPath.startsWith('http') || coverPath.startsWith('data:')) {
+        img.src = coverPath;
       } else {
-        img.classList.add('placeholder');
+        electron.getCoverImage(coverPath).then((dataUrl) => {
+          if (dataUrl) img.src = dataUrl;
+          else img.classList.add('placeholder');
+        }).catch(() => img.classList.add('placeholder'));
       }
-      
-      const title = document.createElement('div');
-      title.className = 'album-title';
-      title.textContent = artist.name || 'Unknown Artist';
+    } else {
+      img.classList.add('placeholder');
+    }
+    
+    const title = document.createElement('div');
+    title.className = 'album-title';
+    const artistName = (artist.name || '').toString();
+    title.textContent = artistName || 'Unknown Artist';
 
-      const count = document.createElement('div');
-      count.className = 'album-artist';
-      count.textContent = `${artist.album_count} albums, ${artist.track_count} tracks`;
+    const count = document.createElement('div');
+    count.className = 'album-artist';
+    count.textContent = `${artist.album_count || 0} albums, ${artist.track_count || 0} tracks`;
 
-      card.appendChild(img);
-      card.appendChild(title);
-      card.appendChild(count);
+    card.appendChild(img);
+    card.appendChild(title);
+    card.appendChild(count);
 
-      card.onclick = async () => {
-        const allTracks = await electron.getLibrary();
-        const artistToMatch = (artist.name || '').toString().trim().toLowerCase();
-        
+    card.onclick = (() => {
+      const artistToMatch = normalizeForCompare(artistName);
+      return async () => {
         currentArtistFilter = artistToMatch;
         currentAlbumFilter = null;
+        currentPlaylistFilter = null;
+        currentPlaylistTracks = [];
+        setLibraryContext('artist', { name: artistName });
 
-        tracks = allTracks.filter(t => {
-          const trackArtist = (t.artist || '').toString().trim().toLowerCase();
-          return trackArtist === artistToMatch;
-        });
-        renderLibrary();
+        const currentQuery = searchInputEl ? searchInputEl.value : '';
         switchView('library', true);
+        await handleSearchInput(currentQuery);
       };
+    })();
 
-      grid.appendChild(card);
-    }
-    viewArtists.appendChild(grid);
-  }).catch((err) => {
-    console.error('renderArtists error', err);
-    viewArtists.innerHTML = '<div class="empty">Failed to load artists</div>';
-  });
+    container.appendChild(card);
+  }
 }
 
 // Play Track
@@ -1516,61 +1915,16 @@ const initSearch = () => {
 
   searchInput.addEventListener('input', (e) => {
     const query = e.target.value.toLowerCase().trim();
-    
-    // If searching, ensure we are on the library view
-    if (query) {
-      switchView('library', true);
-    }
-    // Determine base set: either whole library or scoped to selected album
-    let base = libraryCache;
-    if (currentAlbumFilter && currentAlbumFilter.album) {
-      base = libraryCache.filter(t => {
-        const trackAlbum = (t.album || '').toString().toLowerCase();
-        const trackArtist = (t.artist || '').toString().toLowerCase();
-        if (currentAlbumFilter.artist) return trackAlbum === currentAlbumFilter.album && trackArtist === currentAlbumFilter.artist;
-        return trackAlbum === currentAlbumFilter.album;
-      });
-    }
+    // Delegate to the scoped search handler which respects currentView and libraryContext
+    void handleSearchInput(query);
+  });
 
-    if (!query) {
-      tracks = base;
-    } else {
-      const tokens = query.split(/\s+/).filter(Boolean);
-      const parsed = tokens.map(tok => {
-        let type = 'include';
-        let text = tok;
-        if (tok.startsWith('-')) { type = 'exclude'; text = tok.slice(1); }
-        else if (tok.startsWith('+')) { type = 'include'; text = tok.slice(1); }
-        const m = text.match(/^(title|artist|album):(.+)$/);
-        if (m) return { type, field: m[1], text: m[2] };
-        return { type, field: null, text };
-      });
-
-      const matchesToken = (t, token) => {
-        const text = (token.text || '').toLowerCase();
-        if (!text) return true;
-        if (token.field) {
-          const v = ((t[token.field] || '') + '').toLowerCase();
-          return v.includes(text);
-        }
-        const title = (t.title || '').toLowerCase();
-        const artist = (t.artist || '').toLowerCase();
-        const album = (t.album || '').toLowerCase();
-        return title.includes(text) || artist.includes(text) || album.includes(text);
-      };
-
-      tracks = base.filter(t => {
-        for (const tok of parsed) {
-          if (tok.type === 'exclude') {
-            if (matchesToken(t, tok)) return false;
-          } else {
-            if (!matchesToken(t, tok)) return false;
-          }
-        }
-        return true;
-      });
+  // Enter key should also run the scoped search immediately
+  searchInput.addEventListener('keydown', (e) => {
+    if (e.key === 'Enter') {
+      const q = e.target.value.toLowerCase().trim();
+      void handleSearchInput(q);
     }
-    renderLibrary();
   });
 };
 
@@ -1585,6 +1939,8 @@ const syncState = (state) => {
   // Update currentTrack if changed
   if (state.track && (!currentTrack || currentTrack.id !== state.track.id)) {
       currentTrack = state.track;
+      // reset auto-advance marker when track changes
+      lastAutoAdvancedTrackId = null;
       updateNowPlaying();
       renderLibrary();
   }
@@ -1596,6 +1952,56 @@ const syncState = (state) => {
       }
   }
 };
+
+// Advance playback to the next track based on current context (playlist vs library)
+async function advanceToNext() {
+  if (!currentTrack) return;
+  // If repeat one, restart same track
+  if (repeatMode === 'one') {
+    try { await playTrack(currentTrack); } catch (e) { console.warn('advanceToNext replay failed', e); }
+    return;
+  }
+
+  // Determine source list
+  let sourceList = [];
+  if (libraryContext.type === 'playlist' && Array.isArray(currentPlaylistTracks) && currentPlaylistTracks.length) {
+    sourceList = currentPlaylistTracks;
+  } else if (Array.isArray(tracks) && tracks.length) {
+    sourceList = tracks;
+  } else if (Array.isArray(libraryCache) && libraryCache.length) {
+    sourceList = libraryCache;
+  }
+
+  if (!sourceList || sourceList.length === 0) return;
+
+  // Find current index in sourceList
+  let idx = sourceList.findIndex(t => (t.id && currentTrack.id && t.id === currentTrack.id) || (t.path && currentTrack.path && t.path === currentTrack.path));
+
+  // Shuffle handling
+  if (shuffleEnabled) {
+    const randIdx = Math.floor(Math.random() * sourceList.length);
+    const next = sourceList[randIdx];
+    if (next) await playTrack(next);
+    return;
+  }
+
+  // Next index
+  if (idx === -1) idx = 0;
+  const nextIdx = idx + 1;
+  if (nextIdx < sourceList.length) {
+    await playTrack(sourceList[nextIdx]);
+  } else {
+    // End of list
+    if (repeatMode === 'all') {
+      await playTrack(sourceList[0]);
+    } else {
+      // stop playback
+      try { await electron.pause(); } catch {}
+      isPlaying = false;
+      updatePlayButton();
+    }
+  }
+}
 
 // Plugin System API (sandboxed via factory)
 const SPECTRA_PLUGIN_API_VERSION = 1;
@@ -1794,6 +2200,20 @@ const Spectra = {
       btn.onclick = onClick;
       container.appendChild(btn);
     },
+    notify: (options) => {
+      if (!options) return;
+      if (typeof options === 'string') NotificationCenter.show({ message: options });
+      else NotificationCenter.show(options);
+    },
+    notifyUpdate: (options) => {
+      if (!options) return;
+      NotificationCenter.update(options);
+    },
+    dismissNotification: () => {
+      NotificationCenter.hide();
+    },
+    prompt: (message, defaultValue) => customPrompt(message, defaultValue),
+    confirm: (message, opts) => customConfirm(message, opts),
     registerFullscreenView: ({ id, render }) => {
       const container = document.getElementById('plugin-overlays');
       if (!container) return;
@@ -2346,6 +2766,9 @@ async function init() {
   notificationMessage = document.getElementById('notification-message');
   notificationProgress = document.getElementById('notification-progress');
   notificationCount = document.getElementById('notification-count');
+  notificationDetail = document.getElementById('notification-detail');
+  notificationClose = document.getElementById('notification-close');
+  notificationTrack = document.querySelector('#notification-bar .progress-track');
 
   // Settings event listeners
   if (deviceSelect) deviceSelect.onchange = saveSettings;
@@ -2686,24 +3109,33 @@ async function init() {
 
   // Import progress notifications
   electron.on('import:start', ({ total }) => {
-    if (!notificationBar) return;
-    notificationBar.classList.add('show');
-    notificationMessage.textContent = 'Adding tracks...';
-    notificationProgress.style.width = '0%';
-    notificationCount.textContent = `0/${total}`;
+    NotificationCenter.show({
+      message: 'Adding tracks...',
+      mode: 'progress',
+      progress: 0,
+      count: `0/${total}`,
+      sticky: true,
+      dismissible: false
+    });
   });
   electron.on('import:progress', ({ current, total, filename }) => {
-    if (!notificationBar) return;
-    const percent = (current / total) * 100;
-    notificationProgress.style.width = `${percent}%`;
-    notificationCount.textContent = `${current}/${total}`;
-    notificationMessage.textContent = `Adding: ${filename}`;
+    NotificationCenter.update({
+      message: filename ? `Adding: ${filename}` : 'Adding tracks...',
+      mode: 'progress',
+      progress: total ? (current / total) * 100 : 0,
+      count: `${current}/${total}`
+    });
   });
   electron.on('import:complete', () => {
-    if (!notificationBar) return;
-    notificationMessage.textContent = 'Import complete!';
-    notificationProgress.style.width = '100%';
-    setTimeout(() => { notificationBar.classList.remove('show'); loadLibrary(); }, 2000);
+    NotificationCenter.show({
+      message: 'Import complete!',
+      type: 'success',
+      autoClose: 2600,
+      sticky: false,
+      onClose: async () => {
+        try { await loadLibrary(); } catch (err) { console.warn('Library refresh after import failed', err); }
+      }
+    });
   });
 
   electron.on('player:state', syncState);
@@ -2750,14 +3182,35 @@ async function init() {
   // Periodic UI updates
   setInterval(async () => {
       if (currentTrack) {
-        // Always query current time for UI and persistence (even if paused)
-        const time = await electron.getTime();
+        // Prefer full audio status when available
+        let status = null;
+        try { status = await electron.getAudioStatus(); } catch {}
+        let time = 0;
+        if (status && typeof status.currentTime === 'number') time = status.currentTime;
+        else {
+          try { time = await electron.getTime(); } catch {}
+        }
         if (currentTimeEl) currentTimeEl.textContent = formatTime(time);
         if (!isSeeking && currentTrack.duration > 0 && seekSlider) seekSlider.value = (time / currentTrack.duration) * 100;
         // Persist last played position
         saveLastPlayed(currentTrack, time);
         // Ensure Now Playing bar visible when we have a current track
         showNowPlaying();
+
+        // Auto-advance detection: if player reports not playing/paused and time is at/after end
+        try {
+          const playingFlag = status ? Boolean(status.playing) : isPlaying;
+          const pausedFlag = status ? Boolean(status.paused) : !isPlaying;
+          const nearEnd = currentTrack.duration > 0 && time >= Math.max(0, currentTrack.duration - AUTO_ADVANCE_EPS);
+          if (nearEnd && (!playingFlag || pausedFlag)) {
+            if (lastAutoAdvancedTrackId !== (currentTrack && currentTrack.id)) {
+              lastAutoAdvancedTrackId = currentTrack && currentTrack.id;
+              void advanceToNext();
+            }
+          }
+        } catch (err) {
+          // ignore
+        }
       }
   }, 500);
 

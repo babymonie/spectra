@@ -8,10 +8,73 @@
   let currentPrefix = '';
   let isConnected = false;
   let storageSettings = null;
+  const selectedKeys = new Set();
+  let currentPlayingKey = null;
+  let currentPlayingTrack = null;
+
+  function notify(messageOrOptions, type = 'info', options = {}) {
+    const payload = typeof messageOrOptions === 'string'
+      ? { message: messageOrOptions, type, ...options }
+      : (messageOrOptions ? { ...messageOrOptions } : null);
+    if (!payload || !payload.message) return;
+    if (!payload.type && type) payload.type = type;
+    if (Spectra?.ui?.notify) {
+      Spectra.ui.notify(payload);
+    } else if (payload.type === 'error') {
+      console.error('[object-storage]', payload.message);
+    } else {
+      console.log('[object-storage]', payload.message);
+    }
+  }
+
+  function notifySuccess(message, options = {}) {
+    notify(message, 'success', { autoClose: 2600, ...options, type: 'success' });
+  }
+
+  function notifyError(message, options = {}) {
+    notify(message, 'error', { autoClose: 4200, ...options, type: 'error' });
+  }
+
+  async function confirmDialog(message, options = {}) {
+    if (Spectra?.ui?.confirm) {
+      return Spectra.ui.confirm(message, options);
+    }
+    if (typeof globalThis.confirm === 'function') {
+      return globalThis.confirm(message);
+    }
+    return false;
+  }
+
+  async function promptDialog(message, defaultValue = '') {
+    if (Spectra?.ui?.prompt) {
+      return Spectra.ui.prompt(message, defaultValue);
+    }
+    if (typeof globalThis.prompt === 'function') {
+      return globalThis.prompt(message, defaultValue);
+    }
+    return null;
+  }
+
+  function extractStorageKeyFromTrack(track) {
+    if (!track) return null;
+    if (track.sourceKey) return track.sourceKey;
+    const potential = track.path || track.url;
+    if (typeof potential === 'string' && potential.startsWith('object-storage://')) {
+      const withoutScheme = potential.slice('object-storage://'.length);
+      const slashIndex = withoutScheme.indexOf('/');
+      if (slashIndex >= 0) {
+        const keyPart = withoutScheme.slice(slashIndex + 1);
+        try { return decodeURIComponent(keyPart); } catch { return keyPart; }
+      }
+    }
+    if (track.extra && track.extra.sourceKey) return track.extra.sourceKey;
+    return null;
+  }
 
   function getBridge() {
     if (typeof globalThis !== 'undefined' && globalThis.electron) return globalThis.electron;
-    if (typeof window !== 'undefined' && window.electron) return window.electron;
+    const win = typeof globalThis !== 'undefined' ? globalThis.window : undefined;
+    if (win && win.electron) return win.electron;
     return null;
   }
 
@@ -78,6 +141,9 @@
           <button id="btn-storage-refresh" class="btn-secondary" disabled title="Refresh List">
             <span class="material-icons">refresh</span>
           </button>
+          <button id="btn-storage-import-selected" class="btn-secondary" disabled title="Import Selected">
+            <span class="material-icons">library_add</span> Import Selected
+          </button>
           <button id="btn-storage-import-all" class="btn-secondary" disabled title="Import All">
             <span class="material-icons">playlist_add</span> Import All
           </button>
@@ -92,6 +158,20 @@
         <span id="storage-file-count" class="file-count"></span>
       </div>
 
+      <div class="storage-now-playing" id="storage-now-playing" hidden>
+        <div class="np-indicator">
+          <span class="material-icons">equalizer</span>
+        </div>
+        <div class="np-meta">
+          <div class="np-label">Now Playing</div>
+          <div id="storage-now-playing-title" class="np-title"></div>
+          <div id="storage-now-playing-context" class="np-context"></div>
+        </div>
+        <button id="btn-storage-locate-playing" class="btn-secondary" hidden>
+          <span class="material-icons">my_location</span> Locate
+        </button>
+      </div>
+
       <div class="storage-controls">
         <div class="search-input-wrapper">
           <span class="material-icons">folder_open</span>
@@ -102,6 +182,9 @@
 
       <div class="storage-files-container">
         <div class="track-list-header">
+          <div class="col-select">
+            <input type="checkbox" id="storage-select-all" aria-label="Select all files" />
+          </div>
           <div class="col-icon"></div>
           <div class="col-title">File Name</div>
           <div class="col-size">Size</div>
@@ -132,10 +215,16 @@
     
     // Set up event listeners
     setupEventListeners();
+    setupPlaybackListeners();
     // Listen for plugin-pushed updates
-    if (window.electron && window.electron.on) {
-      window.electron.on('object-storage:files', (files) => {
-        storageFiles = files || [];
+    const bridge = getBridge();
+    if (bridge && typeof bridge.on === 'function') {
+      bridge.on('object-storage:files', (files) => {
+        storageFiles = Array.isArray(files) ? files : [];
+        for (const key of Array.from(selectedKeys)) {
+          if (!storageFiles.some((f) => f.Key === key)) selectedKeys.delete(key);
+        }
+
         const listEl = document.getElementById('storage-files-list');
         const countEl = document.getElementById('storage-file-count');
         if (!storageFiles || storageFiles.length === 0) {
@@ -144,16 +233,20 @@
           renderFilesList(storageFiles);
         }
         if (countEl) countEl.textContent = `${storageFiles.length} files`;
-        // enable import/refresh controls when files returned
+
         const btnRefresh = document.getElementById('btn-storage-refresh');
         const btnImportAll = document.getElementById('btn-storage-import-all');
         const btnBrowse = document.getElementById('btn-storage-browse');
         if (btnRefresh) btnRefresh.disabled = false;
         if (btnImportAll) btnImportAll.disabled = storageFiles.length === 0;
         if (btnBrowse) btnBrowse.disabled = false;
+
+        updateSelectionUI();
+        updatePlayingIndicator();
+        updateNowPlayingPanel();
       });
 
-      window.electron.on('object-storage:status', (status) => {
+      bridge.on('object-storage:status', (status) => {
         const statusText = document.getElementById('storage-status-text');
         const statusIcon = document.getElementById('storage-status-icon');
         
@@ -197,8 +290,10 @@
     const btnConnect = document.getElementById('btn-storage-connect');
     const btnRefresh = document.getElementById('btn-storage-refresh');
     const btnImportAll = document.getElementById('btn-storage-import-all');
+    const btnImportSelected = document.getElementById('btn-storage-import-selected');
     const btnBrowse = document.getElementById('btn-storage-browse');
     const prefixInput = document.getElementById('storage-prefix');
+    const selectAllCheckbox = document.getElementById('storage-select-all');
     
     if (btnConnect) {
       btnConnect.onclick = async () => {
@@ -249,6 +344,23 @@
           await importAllFiles();
       };
     }
+
+    if (btnImportSelected) {
+      btnImportSelected.onclick = async () => {
+        await importSelectedFiles();
+      };
+    }
+
+    if (selectAllCheckbox) {
+      selectAllCheckbox.addEventListener('change', (event) => {
+        if (event.target.checked) {
+          for (const file of storageFiles) selectedKeys.add(file.Key);
+        } else {
+          selectedKeys.clear();
+        }
+        updateSelectionUI();
+      });
+    }
     
     if (btnBrowse) {
       btnBrowse.onclick = async () => {
@@ -286,6 +398,30 @@
     }
   }
   
+  function setupPlaybackListeners() {
+    const playback = Spectra?.playback;
+    if (!playback) return;
+
+    try {
+      const initial = typeof playback.getCurrentTrack === 'function' ? playback.getCurrentTrack() : null;
+      currentPlayingTrack = initial || null;
+      currentPlayingKey = extractStorageKeyFromTrack(initial);
+      updatePlayingIndicator();
+      updateNowPlayingPanel();
+    } catch (err) {
+      console.warn('[object-storage] failed to read current playback state', err);
+    }
+
+    if (typeof playback.onTrackChanged === 'function') {
+      playback.onTrackChanged((track) => {
+        currentPlayingTrack = track || null;
+        currentPlayingKey = extractStorageKeyFromTrack(track) || null;
+        updatePlayingIndicator();
+        updateNowPlayingPanel();
+      });
+    }
+  }
+
   async function testConnection() {
     const statusText = document.getElementById('storage-status-text');
     const btnConnect = document.getElementById('btn-storage-connect');
@@ -297,141 +433,383 @@
       // Retrieve current plugin settings and save them via the existing IPC handler.
       // The plugin watches the config file and will test the connection and push
       // results back via events `object-storage:status` and `object-storage:files`.
-      const plugins = await window.electron.getPlugins();
+      const bridge = getBridge();
+      const plugins = await bridge?.getPlugins?.();
       const p = plugins.find(x => x.id === 'object-storage');
       if (!p) throw new Error('Object Storage plugin not found');
 
       if (statusText) statusText.textContent = 'Testing connection...';
       if (btnConnect) btnConnect.disabled = true;
 
-      await window.electron.updatePluginSettings('object-storage', p.settings || {});
+      await bridge?.updatePluginSettings?.('object-storage', p.settings || {});
       // The plugin will emit status/files events which we listen for below.
     } catch (err) {
       isConnected = false;
-      if (statusText) statusText.textContent = `Connection failed: ${err && err.message ? err.message : err}`;
+      if (statusText) statusText.textContent = `Connection failed: ${err?.message || err}`;
     } finally {
       if (btnConnect) btnConnect.disabled = false;
     }
   }
   
   // Import all files with progress feedback using the global notification bar
-  async function importAllFiles() {
-    if (storageFiles.length === 0) {
-      alert('No files to import');
+  async function importSingleFile(file, settings, bridge) {
+    if (!file) throw new Error('Missing file metadata');
+    const name = (file.Key || '').split('/').pop() || file.Key || 'unknown';
+
+    if (file.cachedPath && typeof bridge.addFiles === 'function') {
+      await bridge.addFiles([file.cachedPath]);
+      return true;
+    }
+
+    if (file.url && typeof bridge.addRemote === 'function') {
+      const canonical = buildObjectStorageUri(file.Key, settings);
+      const remoteUrl = canonical || file.url;
+      const res = await bridge.addRemote({ url: remoteUrl, title: name });
+      if (res && res.success) return true;
+      throw new Error(res && res.error ? res.error : 'Failed to add remote track');
+    }
+
+    if (file.Key) {
+      try {
+        const plugins = typeof bridge.getPlugins === 'function' ? await bridge.getPlugins() : [];
+        const p = plugins.find((x) => x.id === 'object-storage');
+        if (p && typeof bridge.updatePluginSettings === 'function') {
+          await bridge.updatePluginSettings('object-storage', p.settings || {});
+        }
+      } catch (err) {
+        console.warn('[object-storage] cache nudge failed', err);
+      }
+      return true;
+    }
+
+    throw new Error('No URL or cached file available. Try Refresh/Connect.');
+  }
+
+  async function importFilesBatch(files, options = {}) {
+    const list = Array.isArray(files) ? files.filter(Boolean) : [];
+    if (!list.length) {
+      notify('No files to import.', 'info');
       return;
     }
-    if (!confirm(`Import ${storageFiles.length} files from object storage?`)) return;
 
     const bridge = getBridge();
     if (!bridge) {
-      alert('Electron bridge unavailable. Restart the app and try again.');
+      notifyError('Electron bridge unavailable. Restart the app and try again.');
       return;
     }
 
-    const notif = document.getElementById('notification-bar');
-    const msg = document.getElementById('notification-message');
-    const prog = document.getElementById('notification-progress');
-    const cnt = document.getElementById('notification-count');
-    const settings = await getObjectStorageSettings();
-
-    if (notif) notif.classList.add('show');
-    if (msg) msg.textContent = 'Importing from Object Storage...';
-    if (prog) prog.style.width = '0%';
-    if (cnt) cnt.textContent = `0/${storageFiles.length}`;
-
-    let success = 0;
-    for (let i = 0; i < storageFiles.length; i++) {
-      const f = storageFiles[i];
-      const name = (f.Key || '').split('/').pop() || f.Key || 'unknown';
-      try {
-        if (msg) msg.textContent = `Importing: ${name}`;
-        // Prefer cachedPath (local file) so we can add as local file and get full metadata
-        if (f.cachedPath) {
-          if (typeof bridge.addFiles === 'function') {
-            await bridge.addFiles([f.cachedPath]);
-          }
-        } else if (f.url) {
-          const canonical = buildObjectStorageUri(f.Key, settings);
-          const remoteUrl = canonical || f.url;
-          if (typeof bridge.addRemote === 'function') {
-            await bridge.addRemote({ url: remoteUrl, title: name });
-          }
-        } else if (f.Key) {
-          // Try requesting plugin to download to cache via existing API: call plugins:update-settings to nudge plugin
-          try {
-            const plugins = (typeof bridge.getPlugins === 'function') ? await bridge.getPlugins() : [];
-            const p = plugins.find(x => x.id === 'object-storage');
-            if (p && typeof bridge.updatePluginSettings === 'function') {
-              await bridge.updatePluginSettings('object-storage', p.settings || {});
-            }
-          } catch (err) {
-            console.warn('[object-storage] cache nudge failed', err);
-          }
-        }
-        success++;
-      } catch (err) {
-        console.warn('[object-storage] import item failed', f.Key, err);
-      }
-
-      // update progress
-      const percent = Math.round(((i + 1) / storageFiles.length) * 100);
-      if (prog) prog.style.width = `${percent}%`;
-      if (cnt) cnt.textContent = `${i + 1}/${storageFiles.length}`;
-      // brief pause to keep UI responsive for large batches
-      await new Promise(r => setTimeout(r, 50));
+    const confirmMessage = options.confirmMessage || `Import ${list.length} file${list.length === 1 ? '' : 's'} from object storage?`;
+    if (!options.skipConfirm) {
+      const confirmed = await confirmDialog(confirmMessage, { confirmLabel: 'Import' });
+      if (!confirmed) return;
     }
 
-    if (msg) msg.textContent = `Import complete (${success}/${storageFiles.length})`;
-    if (prog) prog.style.width = '100%';
-    // allow UI to show completion then hide and refresh library
-    setTimeout(async () => {
-      if (notif) notif.classList.remove('show');
-      try { if (typeof bridge.getLibrary === 'function') await bridge.getLibrary(); } catch (err) { console.warn('Refresh library failed', err); }
-      // nudge plugin to refresh listing after import
-      try {
-        const plugins = typeof bridge.getPlugins === 'function' ? await bridge.getPlugins() : [];
-        const p = plugins.find(x => x.id === 'object-storage');
-        if (p && typeof bridge.updatePluginSettings === 'function') {
-          await bridge.updatePluginSettings('object-storage', p.settings || {});
-          storageSettings = { ...(p.settings || {}) };
-        }
-      } catch (err) {
-        console.warn('[object-storage] post-import refresh failed', err);
+    const settings = await getObjectStorageSettings();
+    const notifyFn = Spectra?.ui?.notify;
+    const notifyUpdateFn = Spectra?.ui?.notifyUpdate;
+
+    if (typeof notifyFn === 'function') {
+      notifyFn({
+        message: options.progressMessage || 'Importing from Object Storage...',
+        mode: 'progress',
+        progress: 0,
+        count: `0/${list.length}`,
+        sticky: true,
+        dismissible: false
+      });
+    }
+
+    let success = 0;
+
+    for (let i = 0; i < list.length; i++) {
+      const file = list[i];
+      const name = (file.Key || '').split('/').pop() || file.Key || 'unknown';
+
+      if (typeof notifyUpdateFn === 'function') {
+        notifyUpdateFn({
+          message: `${options.progressLabel || 'Importing'}: ${name}`,
+          mode: 'progress',
+          progress: ((i + 1) / list.length) * 100,
+          count: `${i + 1}/${list.length}`
+        });
       }
-    }, 1200);
+
+      try {
+        await importSingleFile(file, settings, bridge);
+        success++;
+      } catch (err) {
+        console.warn('[object-storage] import item failed', file?.Key, err);
+      }
+
+      await new Promise((resolve) => setTimeout(resolve, 40));
+    }
+
+    if (typeof notifyFn === 'function') {
+      notifyFn({
+        message: `Import complete (${success}/${list.length})`,
+        type: success === list.length ? 'success' : 'warning',
+        autoClose: 2800
+      });
+    }
+
+    try {
+      if (typeof bridge.getLibrary === 'function') await bridge.getLibrary();
+    } catch (err) {
+      console.warn('Refresh library failed', err);
+    }
+
+    try {
+      const plugins = typeof bridge.getPlugins === 'function' ? await bridge.getPlugins() : [];
+      const p = plugins.find((x) => x.id === 'object-storage');
+      if (p && typeof bridge.updatePluginSettings === 'function') {
+        await bridge.updatePluginSettings('object-storage', p.settings || {});
+        storageSettings = { ...(p.settings || {}) };
+      }
+    } catch (err) {
+      console.warn('[object-storage] post-import refresh failed', err);
+    }
+
+    if (!options.preserveSelection) {
+      selectedKeys.clear();
+      updateSelectionUI();
+    }
+  }
+
+  async function importAllFiles() {
+    await importFilesBatch(storageFiles, {
+      confirmMessage: `Import ${storageFiles.length} file${storageFiles.length === 1 ? '' : 's'} from object storage?`,
+      progressMessage: 'Importing from Object Storage...',
+      progressLabel: 'Importing'
+    });
+  }
+
+  async function importSelectedFiles() {
+    const files = storageFiles.filter((f) => selectedKeys.has(f.Key));
+    if (!files.length) {
+      notify('Select at least one file to import.', 'info');
+      return;
+    }
+    await importFilesBatch(files, {
+      confirmMessage: `Import ${files.length} selected file${files.length === 1 ? '' : 's'}?`,
+      progressMessage: 'Importing selected files',
+      progressLabel: 'Importing'
+    });
   }
   
   function renderFilesList(files) {
     const listEl = document.getElementById('storage-files-list');
     if (!listEl) return;
-    
+
     listEl.innerHTML = '';
-    
-    files.forEach(file => {
+
+    if (!files || files.length === 0) {
+      listEl.innerHTML = '<div class="empty-state">No audio files found. Configure your bucket settings and ensure files exist.</div>';
+      updateSelectionUI();
+      updatePlayingIndicator();
+      updateNowPlayingPanel();
+      return;
+    }
+
+    for (const file of files) {
       const row = document.createElement('div');
       row.className = 'storage-file-row';
-      
-      const fileName = file.Key.split('/').pop();
+      row.dataset.key = file.Key;
+
+      const fileName = (file.Key || '').split('/').pop() || file.Key || 'unknown';
       const size = formatBytes(file.Size);
-      const modified = new Date(file.LastModified).toLocaleDateString();
-      
-      row.innerHTML = `
-        <div class="col-icon"><span class="material-icons">audio_file</span></div>
-        <div class="col-title" title="${file.Key}">${fileName}</div>
-        <div class="col-size">${size}</div>
-        <div class="col-date">${modified}</div>
-        <div class="col-actions">
-          <button class="btn-icon" onclick="playStorageFile('${file.Key}')" title="Play Stream">
-            <span class="material-icons">play_arrow</span>
-          </button>
-          <button class="btn-icon" onclick="importStorageFile('${file.Key}')" title="Add to Library">
-            <span class="material-icons">playlist_add</span>
-          </button>
-        </div>
-      `;
-      
+      const modified = file.LastModified ? new Date(file.LastModified).toLocaleString() : '';
+      const isSelected = selectedKeys.has(file.Key);
+      const isPlaying = currentPlayingKey === file.Key;
+
+      if (isSelected) row.classList.add('selected');
+      if (isPlaying) row.classList.add('playing');
+
+      const selectCol = document.createElement('div');
+      selectCol.className = 'col-select';
+      const checkbox = document.createElement('input');
+      checkbox.type = 'checkbox';
+      checkbox.className = 'storage-select';
+      checkbox.dataset.key = file.Key;
+      checkbox.checked = isSelected;
+      checkbox.setAttribute('aria-label', `Select ${fileName}`);
+      selectCol.appendChild(checkbox);
+
+      const iconCol = document.createElement('div');
+      iconCol.className = 'col-icon';
+      const icon = document.createElement('span');
+      icon.className = 'material-icons';
+      icon.textContent = isPlaying ? 'equalizer' : 'audio_file';
+      iconCol.appendChild(icon);
+
+      const titleCol = document.createElement('div');
+      titleCol.className = 'col-title';
+      titleCol.title = file.Key;
+      titleCol.textContent = fileName;
+
+      const sizeCol = document.createElement('div');
+      sizeCol.className = 'col-size';
+      sizeCol.textContent = size;
+
+      const dateCol = document.createElement('div');
+      dateCol.className = 'col-date';
+      dateCol.textContent = modified;
+
+      const actionsCol = document.createElement('div');
+      actionsCol.className = 'col-actions';
+
+      const playBtn = document.createElement('button');
+      playBtn.className = 'btn-icon';
+      playBtn.title = 'Play Stream';
+      const playIcon = document.createElement('span');
+      playIcon.className = 'material-icons';
+      playIcon.textContent = 'play_arrow';
+      playBtn.appendChild(playIcon);
+      playBtn.addEventListener('click', (event) => {
+        event.stopPropagation();
+        if (typeof globalThis.playStorageFile === 'function') {
+          globalThis.playStorageFile(file.Key);
+        }
+      });
+
+      const importBtn = document.createElement('button');
+      importBtn.className = 'btn-icon';
+      importBtn.title = 'Add to Library';
+      const importIcon = document.createElement('span');
+      importIcon.className = 'material-icons';
+      importIcon.textContent = 'playlist_add';
+      importBtn.appendChild(importIcon);
+      importBtn.addEventListener('click', async (event) => {
+        event.stopPropagation();
+        if (typeof globalThis.importStorageFile === 'function') {
+          await globalThis.importStorageFile(file.Key);
+        }
+      });
+
+      actionsCol.appendChild(playBtn);
+      actionsCol.appendChild(importBtn);
+
+      row.appendChild(selectCol);
+      row.appendChild(iconCol);
+      row.appendChild(titleCol);
+      row.appendChild(sizeCol);
+      row.appendChild(dateCol);
+      row.appendChild(actionsCol);
+
+      checkbox.addEventListener('change', (event) => {
+        event.stopPropagation();
+        if (event.target.checked) selectedKeys.add(file.Key);
+        else selectedKeys.delete(file.Key);
+        updateSelectionUI();
+      });
+
+      row.addEventListener('click', (event) => {
+        if (event.target instanceof HTMLElement && (event.target.closest('.col-actions') || event.target.closest('.col-select'))) {
+          return;
+        }
+        if (selectedKeys.has(file.Key)) selectedKeys.delete(file.Key);
+        else selectedKeys.add(file.Key);
+        updateSelectionUI();
+      });
+
       listEl.appendChild(row);
+    }
+
+    updateSelectionUI();
+    updatePlayingIndicator();
+    updateNowPlayingPanel();
+  }
+
+  function updateSelectionUI() {
+    const importSelectedBtn = document.getElementById('btn-storage-import-selected');
+    if (importSelectedBtn) importSelectedBtn.disabled = selectedKeys.size === 0;
+
+    const selectAll = document.getElementById('storage-select-all');
+    if (selectAll) {
+      const total = storageFiles.length;
+      const selected = selectedKeys.size;
+      selectAll.checked = total > 0 && selected === total;
+      selectAll.indeterminate = selected > 0 && selected < total;
+    }
+
+    const listEl = document.getElementById('storage-files-list');
+    if (!listEl) return;
+    listEl.querySelectorAll('.storage-file-row').forEach((row) => {
+      const key = row.dataset.key;
+      const isSelected = key ? selectedKeys.has(key) : false;
+      row.classList.toggle('selected', isSelected);
+      const checkbox = row.querySelector('input.storage-select');
+      if (checkbox) checkbox.checked = isSelected;
     });
+  }
+
+  function updatePlayingIndicator() {
+    const listEl = document.getElementById('storage-files-list');
+    if (!listEl) return;
+    listEl.querySelectorAll('.storage-file-row').forEach((row) => {
+      const key = row.dataset.key;
+      const isPlaying = key && key === currentPlayingKey;
+      row.classList.toggle('playing', isPlaying);
+      const icon = row.querySelector('.col-icon .material-icons');
+      if (icon) icon.textContent = isPlaying ? 'equalizer' : 'audio_file';
+    });
+  }
+
+  function updateNowPlayingPanel() {
+    const panel = document.getElementById('storage-now-playing');
+    if (!panel) return;
+    if (!currentPlayingKey) {
+      panel.hidden = true;
+      return;
+    }
+
+    const titleEl = document.getElementById('storage-now-playing-title');
+    const contextEl = document.getElementById('storage-now-playing-context');
+    const locateBtn = document.getElementById('btn-storage-locate-playing');
+    const match = storageFiles.find((f) => f.Key === currentPlayingKey);
+    const displayName = currentPlayingTrack?.title || (match ? match.Key.split('/').pop() : currentPlayingKey.split('/').pop() || currentPlayingKey);
+
+    if (titleEl) titleEl.textContent = displayName || currentPlayingKey;
+    if (contextEl) {
+      contextEl.textContent = match
+        ? `In current list • ${match.Key}`
+        : 'Playing from object storage (outside current prefix)';
+    }
+    if (locateBtn) {
+      if (match) {
+        locateBtn.hidden = false;
+        locateBtn.onclick = () => scrollToStorageKey(currentPlayingKey);
+      } else {
+        locateBtn.hidden = true;
+        locateBtn.onclick = null;
+      }
+    }
+
+    panel.hidden = false;
+  }
+
+  function scrollToStorageKey(key) {
+    if (!key) return;
+    const listEl = document.getElementById('storage-files-list');
+    if (!listEl) return;
+    const selector = `.storage-file-row[data-key="${escapeSelector(key)}"]`;
+    const row = listEl.querySelector(selector);
+    if (row) {
+      row.scrollIntoView({ block: 'center', behavior: 'smooth' });
+      row.classList.add('selected');
+    }
+  }
+
+  function escapeSelector(value) {
+    const str = String(value);
+    if (typeof CSS !== 'undefined' && typeof CSS.escape === 'function') {
+      return CSS.escape(str);
+    }
+    let escaped = '';
+    for (const ch of str) {
+      if (ch === '"' || ch === "'" || ch === '\\') escaped += `\\${ch}`;
+      else escaped += ch;
+    }
+    return escaped;
   }
   
   function formatBytes(bytes) {
@@ -445,14 +823,14 @@
   
   
   // Make functions available globally for inline onclick handlers
-  window.playStorageFile = async function(key) {
+  globalThis.playStorageFile = async function(key) {
     const bridge = getBridge();
     if (!bridge || typeof bridge.playTrack !== 'function') {
-      alert('Playback bridge not available. Try restarting the app.');
+      notifyError('Playback bridge not available. Try restarting the app.');
       return;
     }
     try {
-      const file = storageFiles.find(f => f.Key === key) || {};
+      const file = storageFiles.find((f) => f.Key === key) || {};
       const settings = await getObjectStorageSettings();
       let playbackPath = buildObjectStorageUri(file.Key, settings);
 
@@ -471,75 +849,83 @@
       if (!playbackPath && file.url) playbackPath = file.url;
 
       if (!playbackPath) {
-        alert('No playable URL available for this file. Try Refresh/Connect.');
+        notifyError('No playable URL available for this file. Try Refresh/Connect.');
         return;
       }
 
-      const title = (key.split('/').pop() || key);
+      const title = key.split('/').pop() || key;
       const trackInfo = { title, path: playbackPath, sourceKey: file.Key };
       await bridge.playTrack(playbackPath, { track: trackInfo });
+      currentPlayingTrack = trackInfo;
+      currentPlayingKey = file.Key || currentPlayingKey;
+      updatePlayingIndicator();
+      updateNowPlayingPanel();
     } catch (err) {
-      alert(`Failed to play: ${err?.message || err}`);
+      notifyError(`Failed to play: ${err?.message || err}`);
     }
   };
 
   // Add right-click helper to offer "Add to Object Storage" for local library items
   // We attach a capture listener so plugin can offer upload without modifying core files.
   function installRightClickUploader() {
-    // Listen for upload request from main process (triggered by context menu)
-    window.electron.on && window.electron.on('object-storage:request-upload', async (event, tracks) => {
-      if (!tracks || tracks.length === 0) return;
-      
-      // For now, just handle the first track to keep UI simple, or loop through them
-      // The prompt-based flow is best for single files. For multiple, we might want a different UI.
-      // Let's handle one by one or just the first one for now as per previous behavior.
-      
+    const bridge = getBridge();
+    if (!bridge || typeof bridge.on !== 'function') return;
+
+    bridge.on('object-storage:request-upload', async (_event, tracks) => {
+      if (!Array.isArray(tracks) || tracks.length === 0) return;
+
       const track = tracks[0];
-      const localPath = track.path;
+      const localPath = track?.path;
       if (!localPath) return;
 
+      const defaultKey = localPath.split(/[/\\]/).pop();
+      const destKey = await promptDialog(`Upload "${defaultKey}" to Object Storage?\n\nEnter destination key (path inside bucket):`, defaultKey);
+      if (!destKey) return;
+
       try {
-        // Default destination key: basename
-        const defaultKey = localPath.split(/[/\\]/).pop();
-        const destKey = prompt(`Upload "${defaultKey}" to Object Storage?\n\nEnter destination key (path inside bucket):`, defaultKey);
-        if (!destKey) return; // User cancelled
+        const uploadResult = await bridge.objectStorageUpload?.(localPath, destKey);
+        if (!uploadResult?.success) {
+          notifyError(`Upload failed: ${uploadResult?.error || 'unknown error'}`);
+          return;
+        }
 
-        // Call preload-exposed IPC to upload
-        const res = await window.electron.objectStorageUpload(localPath, destKey);
-        if (res && res.success) {
-          alert('Upload succeeded: ' + res.key);
-          // Optionally add uploaded file to library as remote (use canonical URI)
-          const addNow = confirm('Add uploaded file to library as a remote track?');
-          if (addNow) {
+        notifySuccess(`Upload succeeded: ${uploadResult.key}`);
+
+        const addNow = await confirmDialog('Add uploaded file to library as a remote track?', { confirmLabel: 'Add' });
+        if (addNow) {
+          try {
+            let bucket = 'unknown';
             try {
-              // Get bucket from settings to construct canonical URI
-              let bucket = 'unknown';
-              try {
-                const plugins = await window.electron.getPlugins();
-                const p = plugins.find(x => x.id === 'object-storage');
-                if (p && p.settings && p.settings.bucket) {
-                  bucket = p.settings.bucket;
-                }
-              } catch (e) { console.warn('Failed to get bucket settings', e); }
+              const plugins = await bridge.getPlugins?.();
+              const plugin = Array.isArray(plugins) ? plugins.find((x) => x.id === 'object-storage') : null;
+              bucket = plugin?.settings?.bucket || bucket;
+            } catch (settingsErr) {
+              console.warn('[object-storage] failed to read bucket settings', settingsErr);
+            }
 
-              const title = defaultKey;
-              // Use canonical URI: object-storage://bucket/key
-              const uri = `object-storage://${bucket}/${res.key}`;
-              
-              const r = await window.electron.addRemote({ url: uri, title });
-              if (r && r.success) alert('Added uploaded file to library');
-              else alert('Failed to add uploaded file to library');
-            } catch (err) { console.warn('addRemote failed', err); alert('Failed to add uploaded file to library'); }
+            const title = defaultKey;
+            const uri = `object-storage://${bucket}/${uploadResult.key}`;
+            const addResponse = await bridge.addRemote?.({ url: uri, title });
+            if (addResponse?.success) notifySuccess('Uploaded file added to library.');
+            else notifyError(`Failed to add uploaded file to library: ${addResponse?.error || 'unknown error'}`);
+          } catch (libraryErr) {
+            console.warn('[object-storage] addRemote failed', libraryErr);
+            notifyError('Failed to add uploaded file to library.');
           }
-          
-          // signal plugin to refresh listing
-          try { const plugins = await window.electron.getPlugins(); const p = plugins.find(x => x.id === 'object-storage'); if (p) await window.electron.updatePluginSettings('object-storage', p.settings || {}); } catch (e) {}
-        } else {
-          alert('Upload failed: ' + (res && res.error ? res.error : 'unknown'));
+        }
+
+        try {
+          const plugins = await bridge.getPlugins?.();
+          const plugin = Array.isArray(plugins) ? plugins.find((x) => x.id === 'object-storage') : null;
+          if (plugin && typeof bridge.updatePluginSettings === 'function') {
+            await bridge.updatePluginSettings('object-storage', plugin.settings || {});
+          }
+        } catch (refreshErr) {
+          console.warn('[object-storage] refresh after upload failed', refreshErr);
         }
       } catch (err) {
-        console.error('Upload failed', err);
-        alert('Upload failed: ' + (err && err.message ? err.message : err));
+        console.error('[object-storage] upload failed', err);
+        notifyError(`Upload failed: ${err?.message || err}`);
       }
     });
   }
@@ -547,11 +933,11 @@
   // Install uploader overlay after DOM ready
   if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', installRightClickUploader); else installRightClickUploader();
   
-  window.importStorageFile = async function(key) {
+  globalThis.importStorageFile = async function(key) {
     try {
       const bridge = getBridge();
       if (!bridge) {
-        alert('Electron bridge unavailable. Restart the app and try again.');
+        notifyError('Electron bridge unavailable. Restart the app and try again.');
         return;
       }
       const settings = await getObjectStorageSettings();
@@ -562,7 +948,7 @@
         if (typeof bridge.addFiles === 'function') {
           await bridge.addFiles([file.cachedPath]);
         }
-        alert('Imported cached file to library.');
+        notifySuccess('Imported cached file to library.');
       } else if (file.url) {
         // Add remote reference to library without downloading
         try {
@@ -571,19 +957,19 @@
           const res = typeof bridge.addRemote === 'function'
             ? await bridge.addRemote({ url: remoteUrl, title: key.split('/').pop() })
             : null;
-          if (res && res.success) {
-            alert('Added remote track to library.');
+          if (res?.success) {
+            notifySuccess('Added remote track to library.');
           } else {
-            alert('Failed to add remote track: ' + (res && res.error ? res.error : 'unknown'));
+            notifyError(`Failed to add remote track: ${res?.error || 'unknown'}`);
           }
         } catch (error_) {
-          alert('Failed to add remote track: ' + (error_?.message || error_));
+          notifyError(`Failed to add remote track: ${error_?.message || error_}`);
         }
       } else {
-        alert('No URL or cached file available. Try Refresh/Connect.');
+        notifyError('No URL or cached file available. Try Refresh/Connect.');
       }
     } catch (err) {
-      alert(`Failed to import: ${err.message}`);
+      notifyError(`Failed to import: ${err?.message || err}`);
     }
   };
   
@@ -593,7 +979,7 @@
   // clean them up when the plugin is disabled/unloaded.
   try {
     if (Spectra && Spectra.ui && typeof Spectra.ui.registerTarget === 'function') {
-      Spectra.ui.registerTarget('object-storage', '.main-content', (mainContent, pid) => {
+      Spectra.ui.registerTarget('object-storage', '.main-content', () => {
         // If view already exists, return it so we don't duplicate
         if (document.getElementById('view-object-storage')) return { nodes: [document.getElementById('view-object-storage')] };
         // create view inside provided container
@@ -605,13 +991,13 @@
         try {
           if (!Spectra.plugins) Spectra.plugins = {};
           if (!Spectra.plugins['object-storage']) Spectra.plugins['object-storage'] = {};
-          Spectra.plugins['object-storage'].playStorageFile = window.playStorageFile;
-          Spectra.plugins['object-storage'].importStorageFile = window.importStorageFile;
-        } catch (e) {}
+          Spectra.plugins['object-storage'].playStorageFile = globalThis.playStorageFile;
+          Spectra.plugins['object-storage'].importStorageFile = globalThis.importStorageFile;
+        } catch {}
 
         const globals = [];
-        if (window.playStorageFile) globals.push('playStorageFile');
-        if (window.importStorageFile) globals.push('importStorageFile');
+        if (globalThis.playStorageFile) globals.push('playStorageFile');
+        if (globalThis.importStorageFile) globals.push('importStorageFile');
 
         const nodes = [];
         if (view) nodes.push(view);
@@ -627,7 +1013,7 @@
         createStorageView();
       }
     }
-  } catch (e) {
+  } catch {
     // No Spectra UI available — fallback to immediate attach
     if (document.readyState === 'loading') {
       document.addEventListener('DOMContentLoaded', createStorageView);

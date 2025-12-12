@@ -91,7 +91,7 @@
 
 .track-list-header {
   display: grid;
-  grid-template-columns: 48px 3fr 1fr 1.5fr 100px;
+  grid-template-columns: 44px 48px 3fr 1fr 1.5fr 110px;
   padding: 12px 16px;
   background-color: #202020;
   border-bottom: 1px solid #333;
@@ -109,7 +109,7 @@
 
 .storage-file-row {
   display: grid;
-  grid-template-columns: 48px 3fr 1fr 1.5fr 100px;
+  grid-template-columns: 44px 48px 3fr 1fr 1.5fr 110px;
   padding: 10px 16px;
   border-bottom: 1px solid #282828;
   align-items: center;
@@ -167,6 +167,78 @@
 
 .btn-icon .material-icons {
   font-size: 20px;
+}
+
+.col-select {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.col-select input[type="checkbox"] {
+  width: 16px;
+  height: 16px;
+  cursor: pointer;
+}
+
+.storage-file-row.selected {
+  background-color: #242424;
+}
+
+.storage-file-row.playing {
+  background: linear-gradient(90deg, rgba(29, 185, 84, 0.1) 0%, rgba(24,24,24,0) 65%);
+}
+
+.storage-file-row.playing .col-icon .material-icons {
+  color: #4caf50;
+}
+
+.storage-now-playing {
+  display: flex;
+  align-items: center;
+  gap: 16px;
+  padding: 12px 16px;
+  background-color: #1b1b1b;
+  border: 1px solid #2a2a2a;
+  border-radius: 8px;
+  margin-bottom: 18px;
+}
+
+.storage-now-playing[hidden] {
+  display: none;
+}
+
+.np-indicator .material-icons {
+  font-size: 28px;
+  color: #4caf50;
+}
+
+.np-meta {
+  flex: 1;
+  min-width: 0;
+}
+
+.np-label {
+  text-transform: uppercase;
+  font-size: 11px;
+  letter-spacing: 0.6px;
+  color: var(--text-secondary);
+}
+
+.np-title {
+  font-weight: 600;
+  color: var(--text-primary);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.np-context {
+  font-size: 12px;
+  color: var(--text-secondary);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .empty-state {

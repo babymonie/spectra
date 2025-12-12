@@ -13,11 +13,17 @@
   <!-- Notification Bar -->
   <div id="notification-bar" class="notification-bar">
     <div class="notification-content">
-      <span id="notification-message">Adding tracks...</span>
+      <div class="notification-text">
+        <span id="notification-message">Adding tracks...</span>
+        <span id="notification-detail" class="notification-detail"></span>
+      </div>
       <div class="progress-track">
         <div id="notification-progress" class="progress-fill"></div>
       </div>
       <span id="notification-count">0/0</span>
+      <button id="notification-close" class="notification-close" aria-label="Dismiss notification">
+        <span class="material-icons">close</span>
+      </button>
     </div>
   </div>
 
