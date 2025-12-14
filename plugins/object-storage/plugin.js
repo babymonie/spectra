@@ -282,10 +282,13 @@ async function listObjects(prefix = '') {
     const response = await s3Client.send(command);
     const objects = response.Contents || [];
     
-    // Filter only audio files
+    // Filter only audio files and skip tiny placeholder objects (<1KB)
     return objects.filter(obj => {
       const ext = extname(obj.Key).toLowerCase();
-      return AUDIO_FORMATS.includes(ext);
+      if (!AUDIO_FORMATS.includes(ext)) return false;
+      // Some object storage entries may be zero-byte or tiny placeholder files — ignore them
+      if (typeof obj.Size === 'number' && obj.Size < 1024) return false;
+      return true;
     });
   } catch (err) {
     console.error('[object-storage] Failed to list objects:', err);

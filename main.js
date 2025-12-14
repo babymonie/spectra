@@ -1,5 +1,5 @@
 
-import { app, BrowserWindow, ipcMain, dialog, Menu, protocol, globalShortcut, Tray, nativeImage } from 'electron';
+import { app, BrowserWindow, ipcMain, dialog, Menu, protocol, globalShortcut, Tray, nativeImage, shell } from 'electron';
 import path from 'path';
 import { fileURLToPath } from 'url';
 import fs from 'fs';
@@ -319,6 +319,212 @@ function broadcastState() {
   broadcast('player:state', getPlayerState());
 }
 
+// Read version from package.json
+function getAppVersion() {
+  try {
+    const packagePath = path.join(__dirname, 'package.json');
+    const packageJson = JSON.parse(fs.readFileSync(packagePath, 'utf8'));
+    return packageJson.version || '1.0.0';
+  } catch {
+    return '1.0.0';
+  }
+}
+
+function setupApplicationMenu() {
+  const version = getAppVersion();
+  const isMac = process.platform === 'darwin';
+
+  const template = [
+    // App menu (macOS only)
+    ...(isMac ? [{
+      label: app.name,
+      submenu: [
+        { role: 'about' },
+        { type: 'separator' },
+        { role: 'services' },
+        { type: 'separator' },
+        { role: 'hide' },
+        { role: 'hideOthers' },
+        { role: 'unhide' },
+        { type: 'separator' },
+        { role: 'quit' }
+      ]
+    }] : []),
+    // File menu
+    {
+      label: 'File',
+      submenu: [
+        {
+          label: 'Add Files to Library...',
+          accelerator: 'CmdOrCtrl+O',
+          click: async () => {
+            const result = await dialog.showOpenDialog(mainWindow, {
+              properties: ['openFile', 'multiSelections'],
+              filters: [
+                { name: 'Audio Files', extensions: ['mp3', 'flac', 'wav', 'ogg', 'm4a', 'aac', 'wma'] }
+              ]
+            });
+            if (!result.canceled && result.filePaths.length > 0) {
+              for (const filePath of result.filePaths) {
+                await handleOpenFile(filePath);
+              }
+            }
+          }
+        },
+        {
+          label: 'Add Folder to Library...',
+          accelerator: 'CmdOrCtrl+Shift+O',
+          click: async () => {
+            const result = await dialog.showOpenDialog(mainWindow, {
+              properties: ['openDirectory']
+            });
+            if (!result.canceled && result.filePaths.length > 0) {
+              mainWindow?.webContents.send('library:import-folder', result.filePaths[0]);
+            }
+          }
+        },
+        { type: 'separator' },
+        isMac ? { role: 'close' } : { role: 'quit' }
+      ]
+    },
+    // Edit menu
+    {
+      label: 'Edit',
+      submenu: [
+        { role: 'undo' },
+        { role: 'redo' },
+        { type: 'separator' },
+        { role: 'cut' },
+        { role: 'copy' },
+        { role: 'paste' },
+        { role: 'selectAll' }
+      ]
+    },
+    // View menu
+    {
+      label: 'View',
+      submenu: [
+        { role: 'reload' },
+        { role: 'forceReload' },
+        { role: 'toggleDevTools' },
+        { type: 'separator' },
+        { role: 'resetZoom' },
+        { role: 'zoomIn' },
+        { role: 'zoomOut' },
+        { type: 'separator' },
+        { role: 'togglefullscreen' }
+      ]
+    },
+    // Playback menu
+    {
+      label: 'Playback',
+      submenu: [
+        {
+          label: 'Play/Pause',
+          accelerator: 'Space',
+          click: () => {
+            const status = audioEngine.getStatus();
+            if (status.playing && !status.paused) {
+              handlers['audio:pause']();
+            } else {
+              handlers['audio:resume']();
+            }
+          }
+        },
+        {
+          label: 'Next Track',
+          accelerator: 'CmdOrCtrl+Right',
+          click: () => handlers['queue:next']()
+        },
+        {
+          label: 'Previous Track',
+          accelerator: 'CmdOrCtrl+Left',
+          click: () => handlers['queue:previous']()
+        },
+        { type: 'separator' },
+        {
+          label: 'Volume Up',
+          accelerator: 'CmdOrCtrl+Up',
+          click: () => {
+            const status = audioEngine.getStatus();
+            const newVolume = Math.min(1, (status.volume || 0.5) + 0.1);
+            handlers['audio:set-volume'](newVolume);
+          }
+        },
+        {
+          label: 'Volume Down',
+          accelerator: 'CmdOrCtrl+Down',
+          click: () => {
+            const status = audioEngine.getStatus();
+            const newVolume = Math.max(0, (status.volume || 0.5) - 0.1);
+            handlers['audio:set-volume'](newVolume);
+          }
+        }
+      ]
+    },
+    // Window menu
+    {
+      label: 'Window',
+      submenu: [
+        { role: 'minimize' },
+        { role: 'zoom' },
+        ...(isMac ? [
+          { type: 'separator' },
+          { role: 'front' }
+        ] : [
+          { role: 'close' }
+        ])
+      ]
+    },
+    // Help menu
+    {
+      label: 'Help',
+      submenu: [
+        {
+          label: 'About Spectra',
+          click: () => {
+            dialog.showMessageBox(mainWindow, {
+              type: 'info',
+              title: 'About Spectra',
+              message: 'Spectra',
+              detail: `Version: ${version}\n\nA modern, high-fidelity music player with exclusive audio support.\n\nBuilt with Electron and ❤️\n\nGitHub: github.com/babymonie/spectra`,
+              buttons: ['OK', 'View on GitHub'],
+              defaultId: 0,
+              cancelId: 0
+            }).then(result => {
+              if (result.response === 1) {
+                shell.openExternal('https://github.com/babymonie/spectra');
+              }
+            });
+          }
+        },
+        {
+          label: 'Changelog',
+          click: () => {
+            shell.openExternal('https://github.com/babymonie/spectra/releases');
+          }
+        },
+        {
+          label: 'Report Issue',
+          click: () => {
+            shell.openExternal('https://github.com/babymonie/spectra/issues/new');
+          }
+        },
+        { type: 'separator' },
+        {
+          label: 'View on GitHub',
+          click: () => {
+            shell.openExternal('https://github.com/babymonie/spectra');
+          }
+        }
+      ]
+    }
+  ];
+
+  const menu = Menu.buildFromTemplate(template);
+  Menu.setApplicationMenu(menu);
+}
+
 function createWindow() {
   // Prefer bunded app icon when available
   let winIcon = undefined;
@@ -381,6 +587,7 @@ async function resolveTrackPath(filePath) {
 const handlers = {
   'library:get': () => db.getAllTracks(),
   'library:remove-track': (id) => db.removeTrack(id),
+  'library:delete-album': (albumName, artistName) => db.deleteAlbum(albumName, artistName),
   'library:update-track': (id, data) => db.updateTrack(id, data),
   'library:get-albums': () => db.getAlbums(),
   'library:get-artists': () => db.getArtists(),
@@ -462,7 +669,30 @@ const handlers = {
     },
   'audio:play': async (filePath, options = {}) => {
     try {
+      // If a bulk import is running and we are already playing, avoid reopening the exclusive stream (prevents hiss/static during imports)
+      try {
+        if (global.__spectra_bulk_import) {
+          const status = audioEngine.getStatus();
+          if (status && status.playing) {
+            console.log('[main] audio:play suppressed during bulk import while already playing');
+            return;
+          }
+        }
+      } catch {}
+
       const playPath = await resolveTrackPath(filePath);
+
+      // Guard against missing media (e.g., USB drive unplugged) to avoid “background” silent playback attempts
+      // Skip file existence check for remote URLs (presigned URLs from object storage)
+      const isRemoteUrl = playPath.startsWith('http://') || playPath.startsWith('https://');
+      try {
+        if (!isRemoteUrl && !fs.existsSync(playPath)) {
+          const err = `File not found: ${playPath}`;
+          console.warn('[main] audio:play aborted:', err);
+          broadcast('audio:error', { message: err, filePath: playPath, track: currentTrackMetadata });
+          return;
+        }
+      } catch {}
 
       if (options.volume !== undefined) {
         options.volume = Number(options.volume);
@@ -1246,6 +1476,7 @@ app.whenReady().then(async () => {
 
   if (!isServerMode) {
     createWindow();
+    setupApplicationMenu();
     if (appSettings.minimizeToTray) createTray();
   } else {
     console.log('[main] Server mode: skipping desktop window and tray.');
@@ -1395,6 +1626,28 @@ ipcMain.handle('app:set-minimize-to-tray', (event, enabled) => {
 });
 
 // Specific IPC handlers that need event.sender or are local-only
+ipcMain.handle('context-menu:show-album', async (event, albumInfo) => {
+  const { albumName, artistName, trackCount } = albumInfo || {};
+  const template = [
+    {
+      label: `Delete Album "${albumName || 'Unknown'}"`,
+      click: () => {
+        event.sender.send('album:delete-confirm', { albumName, artistName, trackCount });
+      }
+    },
+    { type: 'separator' },
+    {
+      label: 'View Album',
+      click: () => {
+        event.sender.send('album:view', { albumName, artistName });
+      }
+    }
+  ];
+
+  const menu = Menu.buildFromTemplate(template);
+  menu.popup(BrowserWindow.fromWebContents(event.sender));
+});
+
 ipcMain.handle('context-menu:show-track', async (event, tracks) => {
   // `tracks` may be a single object or an array of track objects
   const items = Array.isArray(tracks) ? tracks : (tracks ? [tracks] : []);
@@ -1527,6 +1780,15 @@ async function getAudioFiles(dir) {
         } else {
           const ext = path.extname(res).toLowerCase();
           if (['.flac', '.wav', '.mp3', '.aac', '.ogg', '.m4a'].includes(ext)) {
+            try {
+              const st = await fs.promises.stat(res).catch(() => null);
+              // Skip tiny files (< 1KB) which are likely bogus/placeholder files
+              if (st && typeof st.size === 'number' && st.size < 1024) {
+                continue;
+              }
+            } catch (e) {
+              // ignore stat errors and include file
+            }
             results.push(res);
           }
         }
@@ -1818,6 +2080,15 @@ async function handleAddFiles(filePaths = []) {
       const dirFiles = await getAudioFiles(filePath);
       allFiles = allFiles.concat(dirFiles);
     } else if (isAudioPath(filePath)) {
+      // Ignore tiny files (<1KB) which are likely fake/placeholder
+      try {
+        const s = stat && stat.size ? stat.size : (await fs.promises.stat(filePath).catch(() => ({ size: 0 }))).size;
+        if (typeof s === 'number' && s < 1024) {
+          continue;
+        }
+      } catch (e) {
+        // if stat fails, fall back to including the file
+      }
       allFiles.push(filePath);
     }
   }

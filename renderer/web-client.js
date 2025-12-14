@@ -254,6 +254,14 @@ globalThis.electron = {
     document.body.appendChild(overlay);
     document.body.appendChild(menu);
   },
+
+  showAlbumContextMenu: async (albumInfo) => {
+    // For web client, we don't have native menus, so renderer.js uses showWebAlbumContextMenu fallback
+    // This function exists for API compatibility but does nothing - the renderer handles it
+    return null;
+  },
+
+  deleteAlbum: (albumName, artistName) => invoke('library:delete-album', albumName, artistName),
   
   // Audio playback is handled by the server (main process), not the browser.
   // The browser sends a command to the server to play the audio on the host machine.

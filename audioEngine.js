@@ -162,10 +162,6 @@ function createExclusiveStream({ sampleRate, channels, bitDepth, deviceId, mode,
 
   const tryMode = (m) => {
     console.log(`[audioEngine] opening ${m} WASAPI/CoreAudio stream`);
-    try {
-      const st = new Error().stack;
-      console.log('[audioEngine] createExclusiveStream callstack:\n', st);
-    } catch {}
     return exclusiveAudio.createExclusiveStream({ ...baseOpts, mode: m });
   };
 
@@ -210,12 +206,25 @@ function createExclusiveStream({ sampleRate, channels, bitDepth, deviceId, mode,
  * If anything fails, we throw so main.js can fall back to renderer.
  */
 async function playFile(filePath, onEnd, onError, options = {}) {
+  // If the same file is already playing and we are asked to start at ~0 without restart, skip to avoid stream churn
+  try {
+    const startAt = Number(options?.startTime ?? 0);
+    // For object storage, compare by track path (object-storage:// URI) not presigned URL
+    const trackPath = options?.track?.path;
+    const currentTrackPath = lastOptions?.track?.path;
+    const sameByTrack = trackPath && currentTrackPath && trackPath === currentTrackPath;
+    const sameByFile = currentFile && filePath && currentFile === filePath;
+    const sameFile = ffmpegProc && (sameByTrack || sameByFile);
+    if (sameFile && startAt < 0.05) {
+      console.log('[audioEngine] playFile dedup: already playing this file, ignoring duplicate request');
+      return;
+    }
+  } catch {}
+
   // Clean up any previous playback
   stop();
   try {
-    console.log('[audioEngine] playFile called for', filePath, 'options=', { ...(options || {}) });
-    const st = new Error('playFile-stack').stack;
-    console.log('[audioEngine] playFile callstack:\n', st);
+    console.log('[audioEngine] playFile called for', filePath);
   } catch {}
   currentStartTime = options.startTime || 0;
 

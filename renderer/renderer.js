@@ -77,6 +77,7 @@ let libraryTitleEl;
 let searchInputEl;
 let lastAutoAdvancedTrackId = null;
 const AUTO_ADVANCE_EPS = 0.9; // seconds before end to trigger advance
+let lastKnownPosition = 0; // seconds, updated from player state/time polls
 
 // Helper function to update repeat button visual state
 
@@ -1192,9 +1193,134 @@ const renderLibrary = () => {
   }
 };
 
+// Show album context menu (right-click menu for albums)
+const showAlbumContextMenu = async (event, albumInfo) => {
+  // Use native context menu via IPC (works for both desktop and web)
+  if (electron.showAlbumContextMenu) {
+    electron.showAlbumContextMenu(albumInfo);
+  } else {
+    // Fallback for web UI - show a simple custom menu
+    showWebAlbumContextMenu(event, albumInfo);
+  }
+};
+
+// Fallback context menu for web UI
+const showWebAlbumContextMenu = (event, albumInfo) => {
+  const { albumName, artistName, trackCount } = albumInfo;
+  
+  // Remove any existing context menu
+  const existing = document.querySelector('.album-context-menu');
+  if (existing) existing.remove();
+  
+  const menu = document.createElement('div');
+  menu.className = 'album-context-menu';
+  menu.style.cssText = `
+    position: fixed;
+    left: ${event.clientX}px;
+    top: ${event.clientY}px;
+    background: #282828;
+    border: 1px solid #383838;
+    border-radius: 4px;
+    padding: 4px 0;
+    min-width: 180px;
+    z-index: 10000;
+    box-shadow: 0 4px 12px rgba(0,0,0,0.5);
+  `;
+  
+  const deleteItem = document.createElement('div');
+  deleteItem.textContent = `Delete Album "${albumName}"`;
+  deleteItem.style.cssText = `
+    padding: 8px 16px;
+    cursor: pointer;
+    color: #fff;
+    font-size: 14px;
+  `;
+  deleteItem.onmouseenter = () => deleteItem.style.background = '#383838';
+  deleteItem.onmouseleave = () => deleteItem.style.background = 'transparent';
+  deleteItem.onclick = () => {
+    menu.remove();
+    handleAlbumDeleteConfirm({ albumName, artistName, trackCount });
+  };
+  
+  const viewItem = document.createElement('div');
+  viewItem.textContent = 'View Album';
+  viewItem.style.cssText = `
+    padding: 8px 16px;
+    cursor: pointer;
+    color: #fff;
+    font-size: 14px;
+  `;
+  viewItem.onmouseenter = () => viewItem.style.background = '#383838';
+  viewItem.onmouseleave = () => viewItem.style.background = 'transparent';
+  viewItem.onclick = () => {
+    menu.remove();
+    handleAlbumView({ albumName, artistName });
+  };
+  
+  menu.appendChild(deleteItem);
+  menu.appendChild(viewItem);
+  document.body.appendChild(menu);
+  
+  // Close on click outside
+  const closeMenu = (e) => {
+    if (!menu.contains(e.target)) {
+      menu.remove();
+      document.removeEventListener('click', closeMenu);
+    }
+  };
+  setTimeout(() => document.addEventListener('click', closeMenu), 0);
+};
+
+// Handle album delete confirmation
+const handleAlbumDeleteConfirm = async (albumInfo) => {
+  const { albumName, artistName, trackCount } = albumInfo;
+  
+  const confirmed = window.confirm(
+    `Delete album "${albumName}" by ${artistName || 'Unknown Artist'}?\n\nThis will remove all ${trackCount} track(s) from your library.\n\nThis cannot be undone.`
+  );
+  
+  if (confirmed) {
+    try {
+      const result = await electron.deleteAlbum(albumName, artistName);
+      if (result && result.deleted > 0) {
+        // Refresh library and albums view
+        await loadLibrary();
+        albumsCache = [];
+        await renderAlbums({ forceReload: true });
+      }
+    } catch (err) {
+      console.error('Failed to delete album:', err);
+      alert('Failed to delete album: ' + (err.message || err));
+    }
+  }
+};
+
+// Handle album view from context menu
+const handleAlbumView = async (albumInfo) => {
+  const { albumName, artistName } = albumInfo;
+  const nameToMatch = normalizeForCompare(albumName);
+  const artistToMatch = normalizeForCompare(artistName) || null;
+  
+  if (!nameToMatch) return;
+  
+  currentAlbumFilter = { album: nameToMatch, artist: artistToMatch };
+  currentArtistFilter = null;
+  currentPlaylistFilter = null;
+  currentPlaylistTracks = [];
+  setLibraryContext('album', { name: albumName, artist: artistName });
+  
+  const currentQuery = searchInputEl ? searchInputEl.value : '';
+  switchView('library', true);
+  await handleSearchInput(currentQuery);
+};
+
 // Load Library
 const loadLibrary = async () => {
   libraryCache = await electron.getLibrary();
+
+  // Invalidate derived caches (albums/artists) so views reflect current library state
+  albumsCache = [];
+  artistsCache = [];
 
   const querySource = searchInputEl || document.getElementById('search-input');
   const query = querySource ? querySource.value.toLowerCase().trim() : '';
@@ -1291,6 +1417,21 @@ async function renderAlbums({ data, forceReload = false } = {}) {
       };
     })();
 
+    // Right-click context menu for album deletion
+    card.oncontextmenu = (e) => {
+      e.preventDefault();
+      const albumNameRaw = album.name || album.album || '';
+      const artistNameRaw = album.artist || album.artist_name || '';
+      const trackCount = album.track_count || album.trackCount || 0;
+      
+      // Show a custom context menu
+      showAlbumContextMenu(e, {
+        albumName: albumNameRaw,
+        artistName: artistNameRaw,
+        trackCount: trackCount
+      });
+    };
+
     container.appendChild(card);
   }
 }
@@ -1362,12 +1503,18 @@ async function renderArtists({ data, forceReload = false } = {}) {
 }
 
 // Play Track
-const playTrack = async (track) => {
+const playTrack = async (track, opts = {}) => {
+  const { startTime, forceRestart = true } = opts || {};
+  
+  // Check if same track BEFORE updating currentTrack
+  const isSameTrack = currentTrack && track && currentTrack.id === track.id;
+  
   currentTrack = track;
   // Show UI animation for now playing
   showNowPlaying();
   // record start as lastPlayed with zero elapsed until periodic saver updates it
-  saveLastPlayed(currentTrack, 0);
+  const startPos = typeof startTime === 'number' && startTime >= 0 ? startTime : 0;
+  saveLastPlayed(currentTrack, startPos);
   // Normalize sample rate: parse to integer and validate reasonable range
   let sr;
   if (settings.sampleRate) {
@@ -1376,7 +1523,7 @@ const playTrack = async (track) => {
     else sr = undefined;
   } else sr = undefined;
 
-  await electron.playTrack(track.path, {
+  const playbackOptions = {
     deviceId: settings.deviceId,
     mode: settings.mode,
     bitPerfect: settings.bitPerfect,
@@ -1384,8 +1531,17 @@ const playTrack = async (track) => {
     sampleRate: sr,
     volume: Number(volumeSlider.value), // Pass current volume as number
     track: track
-  });
+  };
+  if (typeof startTime === 'number' && startTime >= 0) playbackOptions.startTime = startTime;
+  // If we are already on this track and not forcing restart, just resume
+  if (!forceRestart && isPlaying && isSameTrack) {
+    await electron.resume();
+  } else {
+    await electron.playTrack(track.path, playbackOptions);
+  }
+
   isPlaying = true;
+  lastKnownPosition = startPos;
   updateNowPlaying();
   renderLibrary(); // Update active state
   updatePlayButton();
@@ -1506,11 +1662,9 @@ function showFullscreen() {
   const fsTitle = document.getElementById('fs-title');
   const fsArtist = document.getElementById('fs-artist');
   const fsLyrics = document.getElementById('fs-lyrics');
-  
+
   // Progress elements
-  const fsCurrentTime = document.getElementById('fs-current-time');
   const fsTotalTime = document.getElementById('fs-total-time');
-  const fsProgressFill = document.getElementById('fs-progress-fill');
 
   // Controls
   const btnFsPlay = document.getElementById('fs-btn-play');
@@ -1534,24 +1688,31 @@ function showFullscreen() {
   // Wire up controls
   if (btnFsPlay) {
     btnFsPlay.onclick = async () => {
-      if (isPlaying) {
-        await electron.pause();
-        isPlaying = false;
-      } else {
-        // Resume logic similar to main play button
-        try {
-          const status = await electron.getAudioStatus();
+      try {
+        // Capture latest position before toggling state
+        const status = await electron.getAudioStatus().catch(() => null);
+        if (status && typeof status.currentTime === 'number') {
+          lastKnownPosition = status.currentTime;
+        }
+
+        if (isPlaying) {
+          await electron.pause();
+          isPlaying = false;
+        } else {
           if (status && status.playing && status.paused) {
-             await electron.resume();
+            await electron.resume();
+          } else if (currentTrack) {
+            // If engine lost state, restart from the last known position instead of 0
+            await playTrack(currentTrack, { startTime: lastKnownPosition, forceRestart: true });
           } else {
-             // If for some reason we are not playing/paused, play current
-             if (currentTrack) await playTrack(currentTrack);
-             else await electron.resume();
+            await electron.resume();
           }
-        } catch(e) { await electron.resume(); }
-        isPlaying = true;
+          isPlaying = true;
+        }
+        updatePlayButton();
+      } catch (err) {
+        console.warn('Fullscreen play toggle failed', err);
       }
-      updatePlayButton();
     };
   }
   
@@ -1942,7 +2103,11 @@ const syncState = (state) => {
       // reset auto-advance marker when track changes
       lastAutoAdvancedTrackId = null;
       updateNowPlaying();
+      showNowPlaying();
       renderLibrary();
+  } else if (state.track && currentTrack) {
+      // Even if same track, ensure the now playing bar is visible
+      showNowPlaying();
   }
 
   // Update Volume
@@ -2845,6 +3010,11 @@ async function init() {
   if (navAlbums) navAlbums.onclick = () => switchView('albums');
   if (navArtists) navArtists.onclick = () => switchView('artists');
 
+  // Listen for library refresh requests (e.g., from plugins)
+  window.addEventListener('spectra:refresh-library', async () => {
+    await loadLibrary();
+  });
+
   // Import buttons
   if (btnImportFile) btnImportFile.onclick = async () => { await electron.importFile(); loadLibrary(); };
   if (btnImportFolder) btnImportFolder.onclick = async () => { await electron.importFolder(); loadLibrary(); };
@@ -2854,7 +3024,8 @@ async function init() {
     try {
       await electron.createPlaylist(name.trim());
       // Refresh playlists view if currently visible
-      if (viewPlaylists && viewPlaylists.style.display !== 'none') renderPlaylists();
+      playlistsCache = [];
+      if (viewPlaylists && viewPlaylists.style.display !== 'none') renderPlaylists({ forceReload: true });
     } catch (e) {
       console.error('Failed to create playlist', e);
       alert('Failed to create playlist');
@@ -2864,7 +3035,8 @@ async function init() {
     try {
       const res = await electron.importPlaylist();
       if (res && res.success) {
-        await renderPlaylists();
+        playlistsCache = [];
+        await renderPlaylists({ forceReload: true });
         alert('Playlist imported');
       } else if (res && res.canceled) {
         // user canceled
@@ -3105,6 +3277,15 @@ async function init() {
     }
   });
 
+  // Album context menu actions
+  electron.on('album:delete-confirm', (albumInfo) => {
+    handleAlbumDeleteConfirm(albumInfo);
+  });
+
+  electron.on('album:view', (albumInfo) => {
+    handleAlbumView(albumInfo);
+  });
+
   window.onclick = (event) => { if (event.target === editModal) closeEditModal(); };
 
   // Import progress notifications
@@ -3148,6 +3329,7 @@ async function init() {
       await electron.createPlaylist(name.trim());
       // Refresh playlists and locate the created playlist (best-effort)
       const pls = await electron.getPlaylists();
+      playlistsCache = [];
       let created = null;
       if (Array.isArray(pls) && pls.length) {
         // Pick most recently-created playlist with this name
@@ -3158,7 +3340,7 @@ async function init() {
       }
       if (!created) {
         // fallback: just refresh UI
-        await renderPlaylists();
+        await renderPlaylists({ forceReload: true });
         return;
       }
       const pid = created.id;
@@ -3176,7 +3358,7 @@ async function init() {
 
   // Refresh playlists view when main notifies tracks were added
   electron.on('playlist:added', async () => {
-    try { await renderPlaylists(); } catch {}
+    try { playlistsCache = []; await renderPlaylists({ forceReload: true }); } catch {}
   });
 
   // Periodic UI updates
@@ -3190,6 +3372,7 @@ async function init() {
         else {
           try { time = await electron.getTime(); } catch {}
         }
+        if (time > 0) lastKnownPosition = time;
         if (currentTimeEl) currentTimeEl.textContent = formatTime(time);
         if (!isSeeking && currentTrack.duration > 0 && seekSlider) seekSlider.value = (time / currentTrack.duration) * 100;
         // Persist last played position

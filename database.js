@@ -374,6 +374,28 @@ export const removeTrack = (id) => {
   return { changes: 1 };
 };
 
+export const deleteAlbum = (albumName, artistName) => {
+  // Delete all tracks matching the album (and optionally album_artist)
+  // Use case-insensitive comparison
+  let sql = 'DELETE FROM tracks WHERE LOWER(TRIM(album)) = LOWER(TRIM(?))';
+  const params = [albumName || ''];
+  
+  if (artistName) {
+    sql += ' AND (LOWER(TRIM(album_artist)) = LOWER(TRIM(?)) OR LOWER(TRIM(artist)) = LOWER(TRIM(?)))';
+    params.push(artistName, artistName);
+  }
+  
+  // First count how many will be deleted
+  let countSql = sql.replace('DELETE FROM', 'SELECT COUNT(*) as count FROM');
+  const countResult = get(countSql, params);
+  const count = countResult?.count || 0;
+  
+  // Now delete
+  run(sql, params);
+  
+  return { deleted: count };
+};
+
 export const updateTrack = (id, { title, artist, album }) => {
   run('UPDATE tracks SET title = ?, artist = ?, album = ? WHERE id = ?', [title, artist, album, id]);
   return { changes: 1 };
@@ -496,6 +518,7 @@ const api = {
   removeTrackFromPlaylist,
   reorderPlaylist,
   removeTrack,
+  deleteAlbum,
   updateTrack,
   updateTrackPath,
   updateTrackWithAlbumArtist,

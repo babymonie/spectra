@@ -11,6 +11,10 @@
   const selectedKeys = new Set();
   let currentPlayingKey = null;
   let currentPlayingTrack = null;
+  let storageAlbums = [];
+  let storageArtists = [];
+  let currentStorageView = 'files'; // 'files', 'albums', 'artists'
+  let currentStorageFilter = null; // { type: 'album', name: '', artist: '' } or { type: 'artist', name: '' }
 
   function notify(messageOrOptions, type = 'info', options = {}) {
     const payload = typeof messageOrOptions === 'string'
@@ -133,7 +137,7 @@
     storageView.style.display = 'none';
     storageView.innerHTML = `
       <div class="storage-header">
-        <h2>Object Storage</h2>
+        <h2 id="storage-view-title">Object Storage</h2>
         <div class="storage-actions">
           <button id="btn-storage-connect" class="btn-primary">
             <span class="material-icons">link</span> Connect
@@ -158,6 +162,21 @@
         <span id="storage-file-count" class="file-count"></span>
       </div>
 
+      <div class="storage-tabs">
+        <button class="storage-tab active" data-tab="files">
+          <span class="material-icons">description</span>
+          Files
+        </button>
+        <button class="storage-tab" data-tab="albums">
+          <span class="material-icons">album</span>
+          Albums
+        </button>
+        <button class="storage-tab" data-tab="artists">
+          <span class="material-icons">person</span>
+          Artists
+        </button>
+      </div>
+
       <div class="storage-now-playing" id="storage-now-playing" hidden>
         <div class="np-indicator">
           <span class="material-icons">equalizer</span>
@@ -172,7 +191,7 @@
         </button>
       </div>
 
-      <div class="storage-controls">
+      <div class="storage-controls" id="storage-controls-files">
         <div class="search-input-wrapper">
           <span class="material-icons">folder_open</span>
           <input type="text" id="storage-prefix" placeholder="Path prefix (e.g., albums/rock/)" />
@@ -180,22 +199,46 @@
         <button id="btn-storage-browse" class="btn-secondary" disabled>Browse</button>
       </div>
 
-      <div class="storage-files-container">
-        <div class="track-list-header">
-          <div class="col-select">
-            <input type="checkbox" id="storage-select-all" aria-label="Select all files" />
+      <div class="storage-search-wrapper" id="storage-search-wrapper" hidden>
+        <span class="material-icons">search</span>
+        <input type="text" id="storage-search-input" placeholder="Search..." />
+      </div>
+
+      <div class="storage-content-view" id="storage-view-files">
+        <div class="storage-files-container">
+          <div class="track-list-header">
+            <div class="col-select">
+              <input type="checkbox" id="storage-select-all" aria-label="Select all files" />
+            </div>
+            <div class="col-icon"></div>
+            <div class="col-title">File Name</div>
+            <div class="col-size">Size</div>
+            <div class="col-date">Last Modified</div>
+            <div class="col-actions">Actions</div>
           </div>
-          <div class="col-icon"></div>
-          <div class="col-title">File Name</div>
-          <div class="col-size">Size</div>
-          <div class="col-date">Last Modified</div>
-          <div class="col-actions">Actions</div>
+          <div class="storage-files-list" id="storage-files-list">
+            <div class="empty-state">
+              <span class="material-icons">cloud_queue</span>
+              <p>Connect to view files</p>
+            </div>
+          </div>
         </div>
-        <div class="storage-files-list" id="storage-files-list">
-          <!-- Files will be listed here -->
+      </div>
+
+      <div class="storage-content-view" id="storage-view-albums" style="display: none;">
+        <div id="storage-albums-container" class="storage-grid-container">
           <div class="empty-state">
-            <span class="material-icons">cloud_queue</span>
-            <p>Connect to view files</p>
+            <span class="material-icons">album</span>
+            <p>No albums found</p>
+          </div>
+        </div>
+      </div>
+
+      <div class="storage-content-view" id="storage-view-artists" style="display: none;">
+        <div id="storage-artists-container" class="storage-grid-container">
+          <div class="empty-state">
+            <span class="material-icons">person</span>
+            <p>No artists found</p>
           </div>
         </div>
       </div>
@@ -219,20 +262,72 @@
     // Listen for plugin-pushed updates
     const bridge = getBridge();
     if (bridge && typeof bridge.on === 'function') {
+      // Clean up old presigned URL tracks on connect
+      bridge.on('object-storage:status', async (status) => {
+        if (status?.connected && typeof bridge.getLibrary === 'function') {
+          try {
+            const library = await bridge.getLibrary();
+            const oldTracks = library.filter(t => 
+              t.path && 
+              t.path.startsWith('http') && 
+              t.path.includes('X-Amz-Algorithm') &&
+              t.path.includes(settings?.endpoint || 'unknown')
+            );
+            
+            if (oldTracks.length > 0) {
+              const shouldClean = await confirmDialog(
+                `Found ${oldTracks.length} tracks with expired storage URLs. Remove them so you can re-import?\n\n(They need to be re-imported with the new permanent URI format)`,
+                { confirmLabel: 'Remove Old Tracks' }
+              );
+              
+              if (shouldClean) {
+                for (const track of oldTracks) {
+                  try {
+                    await bridge.removeTrack(track.id);
+                  } catch (err) {
+                    console.warn('Failed to remove track', track.id, err);
+                  }
+                }
+                notifySuccess(`Removed ${oldTracks.length} old tracks. You can now re-import them.`);
+                
+                const event = new CustomEvent('spectra:refresh-library');
+                window.dispatchEvent(event);
+              }
+            }
+          } catch (err) {
+            console.warn('Failed to check for old tracks', err);
+          }
+        }
+      });
+
       bridge.on('object-storage:files', (files) => {
         storageFiles = Array.isArray(files) ? files : [];
         for (const key of Array.from(selectedKeys)) {
           if (!storageFiles.some((f) => f.Key === key)) selectedKeys.delete(key);
         }
 
+        // Parse and cache albums/artists
+        storageAlbums = groupFilesByAlbum(storageFiles);
+        storageArtists = groupFilesByArtist(storageFiles);
+
         const listEl = document.getElementById('storage-files-list');
         const countEl = document.getElementById('storage-file-count');
         if (!storageFiles || storageFiles.length === 0) {
           if (listEl) listEl.innerHTML = '<div class="empty-state">No audio files found. Configure your bucket settings and ensure files exist.</div>';
+          storageAlbums = [];
+          storageArtists = [];
         } else {
-          renderFilesList(storageFiles);
+          if (currentStorageView === 'files') {
+            renderFilesList(storageFiles);
+          } else if (currentStorageView === 'albums') {
+            renderStorageAlbums();
+          } else if (currentStorageView === 'artists') {
+            renderStorageArtists();
+          }
         }
-        if (countEl) countEl.textContent = `${storageFiles.length} files`;
+        if (countEl) {
+          countEl.textContent = `${storageFiles.length} files · ${storageAlbums.length} albums · ${storageArtists.length} artists`;
+        }
 
         const btnRefresh = document.getElementById('btn-storage-refresh');
         const btnImportAll = document.getElementById('btn-storage-import-all');
@@ -294,6 +389,22 @@
     const btnBrowse = document.getElementById('btn-storage-browse');
     const prefixInput = document.getElementById('storage-prefix');
     const selectAllCheckbox = document.getElementById('storage-select-all');
+    const searchInput = document.getElementById('storage-search-input');
+
+    // Tab switching
+    document.querySelectorAll('.storage-tab').forEach(tab => {
+      tab.addEventListener('click', () => {
+        const targetView = tab.dataset.tab;
+        switchStorageTab(targetView);
+      });
+    });
+
+    // Search input
+    if (searchInput) {
+      searchInput.addEventListener('input', (e) => {
+        handleStorageSearch(e.target.value);
+      });
+    }
     
     if (btnConnect) {
       btnConnect.onclick = async () => {
@@ -322,14 +433,29 @@
           }
           storageFiles = res.files || [];
           storageSettings = await getObjectStorageSettings(true);
+          
+          // Parse and cache albums/artists
+          storageAlbums = groupFilesByAlbum(storageFiles);
+          storageArtists = groupFilesByArtist(storageFiles);
+          
           const listEl = document.getElementById('storage-files-list');
           const countEl = document.getElementById('storage-file-count');
           if (storageFiles.length === 0) {
             if (listEl) listEl.innerHTML = '<div class="empty-state">No audio files found. Configure your bucket settings and ensure files exist.</div>';
+            storageAlbums = [];
+            storageArtists = [];
           } else {
-            renderFilesList(storageFiles);
+            if (currentStorageView === 'files') {
+              renderFilesList(storageFiles);
+            } else if (currentStorageView === 'albums') {
+              renderStorageAlbums();
+            } else if (currentStorageView === 'artists') {
+              renderStorageArtists();
+            }
           }
-          if (countEl) countEl.textContent = `${storageFiles.length} files`;
+          if (countEl) {
+            countEl.textContent = `${storageFiles.length} files · ${storageAlbums.length} albums · ${storageArtists.length} artists`;
+          }
           const btnImportAll = document.getElementById('btn-storage-import-all');
           if (btnImportAll) btnImportAll.disabled = storageFiles.length === 0;
         } catch (err) {
@@ -461,10 +587,13 @@
       return true;
     }
 
-    if (file.url && typeof bridge.addRemote === 'function') {
+    if (file.Key && typeof bridge.addRemote === 'function') {
+      // Always use object-storage:// URI format for persistent access
       const canonical = buildObjectStorageUri(file.Key, settings);
-      const remoteUrl = canonical || file.url;
-      const res = await bridge.addRemote({ url: remoteUrl, title: name });
+      if (!canonical) {
+        throw new Error('Failed to build object-storage URI');
+      }
+      const res = await bridge.addRemote({ url: canonical, title: name });
       if (res && res.success) return true;
       throw new Error(res && res.error ? res.error : 'Failed to add remote track');
     }
@@ -487,6 +616,13 @@
 
   async function importFilesBatch(files, options = {}) {
     const list = Array.isArray(files) ? files.filter(Boolean) : [];
+    // Filter out tiny objects which are likely bogus (Size in bytes)
+    const originalCount = list.length;
+    const filtered = list.filter(f => !(typeof f.Size === 'number' && f.Size < 1024));
+    const skippedCount = originalCount - filtered.length;
+    if (skippedCount > 0) {
+      notify(`Skipped ${skippedCount} tiny file${skippedCount === 1 ? '' : 's'} (under 1KB).`, 'warning');
+    }
     if (!list.length) {
       notify('No files to import.', 'info');
       return;
@@ -513,7 +649,7 @@
         message: options.progressMessage || 'Importing from Object Storage...',
         mode: 'progress',
         progress: 0,
-        count: `0/${list.length}`,
+        count: `0/${filtered.length}`,
         sticky: true,
         dismissible: false
       });
@@ -521,16 +657,16 @@
 
     let success = 0;
 
-    for (let i = 0; i < list.length; i++) {
-      const file = list[i];
+    for (let i = 0; i < filtered.length; i++) {
+      const file = filtered[i];
       const name = (file.Key || '').split('/').pop() || file.Key || 'unknown';
 
       if (typeof notifyUpdateFn === 'function') {
         notifyUpdateFn({
           message: `${options.progressLabel || 'Importing'}: ${name}`,
           mode: 'progress',
-          progress: ((i + 1) / list.length) * 100,
-          count: `${i + 1}/${list.length}`
+          progress: ((i + 1) / filtered.length) * 100,
+          count: `${i + 1}/${filtered.length}`
         });
       }
 
@@ -546,8 +682,8 @@
 
     if (typeof notifyFn === 'function') {
       notifyFn({
-        message: `Import complete (${success}/${list.length})`,
-        type: success === list.length ? 'success' : 'warning',
+        message: `Import complete (${success}/${filtered.length})`,
+        type: success === filtered.length ? 'success' : 'warning',
         autoClose: 2800
       });
     }
@@ -556,6 +692,14 @@
       if (typeof bridge.getLibrary === 'function') await bridge.getLibrary();
     } catch (err) {
       console.warn('Refresh library failed', err);
+    }
+
+    // Trigger library refresh in main UI by firing custom event
+    try {
+      const event = new CustomEvent('spectra:refresh-library');
+      window.dispatchEvent(event);
+    } catch (err) {
+      console.warn('Failed to trigger library refresh event', err);
     }
 
     try {
@@ -602,7 +746,10 @@
 
     listEl.innerHTML = '';
 
-    if (!files || files.length === 0) {
+    // Filter out tiny files (< 1KB) which are likely placeholders
+    const validFiles = Array.isArray(files) ? files.filter(f => typeof f.Size === 'number' && f.Size >= 1024) : [];
+
+    if (!validFiles || validFiles.length === 0) {
       listEl.innerHTML = '<div class="empty-state">No audio files found. Configure your bucket settings and ensure files exist.</div>';
       updateSelectionUI();
       updatePlayingIndicator();
@@ -610,7 +757,7 @@
       return;
     }
 
-    for (const file of files) {
+    for (const file of validFiles) {
       const row = document.createElement('div');
       row.className = 'storage-file-row';
       row.dataset.key = file.Key;
@@ -819,6 +966,346 @@
     const i = Math.floor(Math.log(bytes) / Math.log(k));
     return Math.round(bytes / Math.pow(k, i) * 100) / 100 + ' ' + sizes[i];
   }
+
+  function parseMetadataFromFilename(key) {
+    const fileName = key.split('/').pop() || key;
+    const parts = key.split('/');
+    
+    // Try to extract album/artist from path structure (e.g., "Artist/Album/Song.flac")
+    let artist = 'Unknown Artist';
+    let album = 'Unknown Album';
+    let title = fileName.replace(/\.[^/.]+$/, ''); // Remove extension
+    
+    if (parts.length >= 3) {
+      artist = parts[parts.length - 3];
+      album = parts[parts.length - 2];
+    } else if (parts.length === 2) {
+      album = parts[0];
+    }
+    
+    // Try to parse from filename patterns like "Artist - Album - Title" or "Artist - Title"
+    const dashPattern = /^(.+?)\s*-\s*(.+?)\s*-\s*(.+)$/;
+    const match = fileName.match(dashPattern);
+    if (match) {
+      artist = match[1].trim();
+      album = match[2].trim();
+      title = match[3].replace(/\.[^/.]+$/, '').trim();
+    } else {
+      const simpleDash = /^(.+?)\s*-\s*(.+)$/;
+      const simpleMatch = fileName.match(simpleDash);
+      if (simpleMatch) {
+        artist = simpleMatch[1].trim();
+        title = simpleMatch[2].replace(/\.[^/.]+$/, '').trim();
+      }
+    }
+    
+    return { artist, album, title };
+  }
+
+  function groupFilesByAlbum(files) {
+    const albumsMap = new Map();
+    
+    // Filter out tiny files (< 1KB) which are likely placeholders
+    const validFiles = files.filter(f => typeof f.Size === 'number' && f.Size >= 1024);
+    
+    for (const file of validFiles) {
+      const meta = parseMetadataFromFilename(file.Key);
+      const albumKey = `${meta.artist}|||${meta.album}`;
+      
+      if (!albumsMap.has(albumKey)) {
+        albumsMap.set(albumKey, {
+          name: meta.album,
+          artist: meta.artist,
+          tracks: [],
+          totalSize: 0
+        });
+      }
+      
+      const album = albumsMap.get(albumKey);
+      album.tracks.push({ ...file, ...meta });
+      album.totalSize += file.Size || 0;
+    }
+    
+    return Array.from(albumsMap.values()).sort((a, b) => {
+      const artistCompare = a.artist.localeCompare(b.artist);
+      return artistCompare !== 0 ? artistCompare : a.name.localeCompare(b.name);
+    });
+  }
+
+  function groupFilesByArtist(files) {
+    const artistsMap = new Map();
+    
+    // Filter out tiny files (< 1KB) which are likely placeholders
+    const validFiles = files.filter(f => typeof f.Size === 'number' && f.Size >= 1024);
+    
+    for (const file of validFiles) {
+      const meta = parseMetadataFromFilename(file.Key);
+      
+      if (!artistsMap.has(meta.artist)) {
+        artistsMap.set(meta.artist, {
+          name: meta.artist,
+          albums: new Set(),
+          tracks: [],
+          totalSize: 0
+        });
+      }
+      
+      const artist = artistsMap.get(meta.artist);
+      artist.albums.add(meta.album);
+      artist.tracks.push({ ...file, ...meta });
+      artist.totalSize += file.Size || 0;
+    }
+    
+    return Array.from(artistsMap.values()).map(artist => ({
+      ...artist,
+      albumCount: artist.albums.size,
+      albums: undefined // Remove Set for cleaner output
+    })).sort((a, b) => a.name.localeCompare(b.name));
+  }
+
+  function switchStorageTab(tabName) {
+    currentStorageView = tabName;
+    currentStorageFilter = null;
+    
+    // Update tab buttons
+    document.querySelectorAll('.storage-tab').forEach(tab => {
+      tab.classList.toggle('active', tab.dataset.tab === tabName);
+    });
+    
+    // Update view visibility
+    document.getElementById('storage-view-files').style.display = tabName === 'files' ? 'block' : 'none';
+    document.getElementById('storage-view-albums').style.display = tabName === 'albums' ? 'block' : 'none';
+    document.getElementById('storage-view-artists').style.display = tabName === 'artists' ? 'block' : 'none';
+    
+    // Update controls visibility
+    const controlsFiles = document.getElementById('storage-controls-files');
+    const searchWrapper = document.getElementById('storage-search-wrapper');
+    if (controlsFiles) controlsFiles.style.display = tabName === 'files' ? 'flex' : 'none';
+    if (searchWrapper) searchWrapper.hidden = false;
+    
+    // Update title
+    const title = document.getElementById('storage-view-title');
+    if (title) {
+      if (tabName === 'files') title.textContent = 'Object Storage';
+      else if (tabName === 'albums') title.textContent = 'Object Storage · Albums';
+      else if (tabName === 'artists') title.textContent = 'Object Storage · Artists';
+    }
+    
+    // Clear search
+    const searchInput = document.getElementById('storage-search-input');
+    if (searchInput) searchInput.value = '';
+    
+    // Render appropriate view
+    if (tabName === 'files') {
+      renderFilesList(storageFiles);
+    } else if (tabName === 'albums') {
+      renderStorageAlbums();
+    } else if (tabName === 'artists') {
+      renderStorageArtists();
+    }
+    
+    updateSelectionUI();
+  }
+
+  function handleStorageSearch(query) {
+    const normalized = (query || '').toLowerCase().trim();
+    
+    if (currentStorageView === 'files') {
+      const filtered = normalized
+        ? storageFiles.filter(file => 
+            (file.Key || '').toLowerCase().includes(normalized)
+          )
+        : storageFiles;
+      renderFilesList(filtered);
+    } else if (currentStorageView === 'albums') {
+      const filtered = normalized 
+        ? storageAlbums.filter(album => 
+            album.name.toLowerCase().includes(normalized) || 
+            album.artist.toLowerCase().includes(normalized)
+          )
+        : storageAlbums;
+      renderStorageAlbums(filtered);
+    } else if (currentStorageView === 'artists') {
+      const filtered = normalized
+        ? storageArtists.filter(artist => artist.name.toLowerCase().includes(normalized))
+        : storageArtists;
+      renderStorageArtists(filtered);
+    }
+  }
+
+  function renderStorageAlbums(albumsToRender) {
+    const container = document.getElementById('storage-albums-container');
+    if (!container) return;
+    
+    const albums = albumsToRender || storageAlbums;
+    
+    if (!albums || albums.length === 0) {
+      container.innerHTML = `
+        <div class="empty-state">
+          <span class="material-icons">album</span>
+          <p>No albums found</p>
+        </div>
+      `;
+      return;
+    }
+    
+    container.innerHTML = '';
+    
+    for (const album of albums) {
+      const card = document.createElement('div');
+      card.className = 'storage-album-card';
+      
+      // Use first track's cover if available, or placeholder
+      const firstTrack = album.tracks[0];
+      const coverUrl = firstTrack?.url || '';
+      
+      card.innerHTML = `
+        <div class="storage-album-art">
+          <span class="material-icons">album</span>
+        </div>
+        <div class="storage-album-title">${album.name}</div>
+        <div class="storage-album-artist">${album.artist}</div>
+        <div class="storage-album-count">${album.tracks.length} tracks · ${formatBytes(album.totalSize)}</div>
+        <div class="storage-album-actions">
+          <button class="btn-icon" title="Import Album">
+            <span class="material-icons">library_add</span>
+          </button>
+        </div>
+      `;
+      
+      // Import album button
+      const importBtn = card.querySelector('.btn-icon');
+      importBtn.addEventListener('click', async (e) => {
+        e.stopPropagation();
+        await importAlbum(album);
+      });
+      
+      // Click to view album tracks
+      card.addEventListener('click', () => {
+        viewAlbumTracks(album);
+      });
+      
+      container.appendChild(card);
+    }
+  }
+
+  function renderStorageArtists(artistsToRender) {
+    const container = document.getElementById('storage-artists-container');
+    if (!container) return;
+    
+    const artists = artistsToRender || storageArtists;
+    
+    if (!artists || artists.length === 0) {
+      container.innerHTML = `
+        <div class="empty-state">
+          <span class="material-icons">person</span>
+          <p>No artists found</p>
+        </div>
+      `;
+      return;
+    }
+    
+    container.innerHTML = '';
+    
+    for (const artist of artists) {
+      const card = document.createElement('div');
+      card.className = 'storage-artist-card';
+      
+      card.innerHTML = `
+        <div class="storage-artist-art">
+          <span class="material-icons">person</span>
+        </div>
+        <div class="storage-artist-name">${artist.name}</div>
+        <div class="storage-artist-stats">${artist.tracks.length} tracks · ${artist.albumCount} albums</div>
+        <div class="storage-artist-actions">
+          <button class="btn-icon" title="Import Artist">
+            <span class="material-icons">library_add</span>
+          </button>
+        </div>
+      `;
+      
+      // Import artist button
+      const importBtn = card.querySelector('.btn-icon');
+      importBtn.addEventListener('click', async (e) => {
+        e.stopPropagation();
+        await importArtist(artist);
+      });
+      
+      // Click to view artist tracks
+      card.addEventListener('click', () => {
+        viewArtistTracks(artist);
+      });
+      
+      container.appendChild(card);
+    }
+  }
+
+  async function importAlbum(album) {
+    if (!album || !album.tracks || album.tracks.length === 0) {
+      notify('No tracks to import', 'warning');
+      return;
+    }
+    
+    await importFilesBatch(album.tracks.map(t => ({ Key: t.Key, Size: t.Size, url: t.url, cachedPath: t.cachedPath })), {
+      confirmMessage: `Import album "${album.name}" by ${album.artist}? (${album.tracks.length} tracks)`,
+      progressMessage: `Importing album: ${album.name}`,
+      progressLabel: 'Importing',
+      skipConfirm: false
+    });
+  }
+
+  async function importArtist(artist) {
+    if (!artist || !artist.tracks || artist.tracks.length === 0) {
+      notify('No tracks to import', 'warning');
+      return;
+    }
+    
+    await importFilesBatch(artist.tracks.map(t => ({ Key: t.Key, Size: t.Size, url: t.url, cachedPath: t.cachedPath })), {
+      confirmMessage: `Import all tracks by ${artist.name}? (${artist.tracks.length} tracks from ${artist.albumCount} albums)`,
+      progressMessage: `Importing artist: ${artist.name}`,
+      progressLabel: 'Importing',
+      skipConfirm: false
+    });
+  }
+
+  function viewAlbumTracks(album) {
+    currentStorageFilter = { type: 'album', name: album.name, artist: album.artist };
+    switchStorageTab('files');
+    
+    // Filter and render only tracks from this album
+    const albumTracks = storageFiles.filter(file => {
+      const meta = parseMetadataFromFilename(file.Key);
+      return meta.album === album.name && meta.artist === album.artist;
+    });
+    
+    renderFilesList(albumTracks);
+    
+    // Update title
+    const title = document.getElementById('storage-view-title');
+    if (title) title.textContent = `Album · ${album.name} (${album.artist})`;
+    
+    // Show back button or indicator
+    notify(`Viewing album: ${album.name}`, 'info', { autoClose: 2000 });
+  }
+
+  function viewArtistTracks(artist) {
+    currentStorageFilter = { type: 'artist', name: artist.name };
+    switchStorageTab('files');
+    
+    // Filter and render only tracks from this artist
+    const artistTracks = storageFiles.filter(file => {
+      const meta = parseMetadataFromFilename(file.Key);
+      return meta.artist === artist.name;
+    });
+    
+    renderFilesList(artistTracks);
+    
+    // Update title
+    const title = document.getElementById('storage-view-title');
+    if (title) title.textContent = `Artist · ${artist.name}`;
+    
+    notify(`Viewing artist: ${artist.name}`, 'info', { autoClose: 2000 });
+  }
   
   
   
@@ -832,32 +1319,25 @@
     try {
       const file = storageFiles.find((f) => f.Key === key) || {};
       const settings = await getObjectStorageSettings();
-      let playbackPath = buildObjectStorageUri(file.Key, settings);
+      
+      // Always use object-storage:// URI for persistent playback
+      let playbackPath = buildObjectStorageUri(key || file.Key, settings);
 
-      if (!playbackPath && file.cachedPath) playbackPath = file.cachedPath;
-
-      if (!playbackPath && file.Key && typeof bridge.objectStorageGetUrl === 'function') {
-        try {
-          const res = await bridge.objectStorageGetUrl(file.Key);
-          if (res?.path) playbackPath = res.path;
-          else if (res?.url) playbackPath = res.url;
-        } catch (err) {
-          console.warn('[object-storage] get-url failed', err);
-        }
+      // Fallback to cached path if available
+      if (!playbackPath && file.cachedPath) {
+        playbackPath = file.cachedPath;
       }
 
-      if (!playbackPath && file.url) playbackPath = file.url;
-
       if (!playbackPath) {
-        notifyError('No playable URL available for this file. Try Refresh/Connect.');
+        notifyError('Unable to create playback URI. Check your storage settings.');
         return;
       }
 
-      const title = key.split('/').pop() || key;
-      const trackInfo = { title, path: playbackPath, sourceKey: file.Key };
+      const title = (key || file.Key || '').split('/').pop() || 'Unknown';
+      const trackInfo = { title, path: playbackPath, sourceKey: key || file.Key };
       await bridge.playTrack(playbackPath, { track: trackInfo });
       currentPlayingTrack = trackInfo;
-      currentPlayingKey = file.Key || currentPlayingKey;
+      currentPlayingKey = key || file.Key || currentPlayingKey;
       updatePlayingIndicator();
       updateNowPlayingPanel();
     } catch (err) {
@@ -940,6 +1420,21 @@
         notifyError('Electron bridge unavailable. Restart the app and try again.');
         return;
       }
+      
+      const name = (key || '').split('/').pop() || key || 'file';
+      
+      // Show progress notification for single file import
+      if (Spectra?.ui?.notify) {
+        Spectra.ui.notify({
+          message: `Importing: ${name}`,
+          mode: 'progress',
+          progress: 50,
+          count: '1/1',
+          sticky: true,
+          dismissible: false
+        });
+      }
+      
       const settings = await getObjectStorageSettings();
       const file = storageFiles.find(f => f.Key === key) || {};
       // Prefer cachedPath for importing (local copy). If none, fall back to asking
@@ -948,17 +1443,40 @@
         if (typeof bridge.addFiles === 'function') {
           await bridge.addFiles([file.cachedPath]);
         }
-        notifySuccess('Imported cached file to library.');
-      } else if (file.url) {
+        if (Spectra?.ui?.notify) {
+          Spectra.ui.notify({
+            message: `Imported: ${name}`,
+            type: 'success',
+            autoClose: 2800
+          });
+        }
+        try {
+          const event = new CustomEvent('spectra:refresh-library');
+          window.dispatchEvent(event);
+        } catch (e) {}
+      } else if (file.Key) {
         // Add remote reference to library without downloading
         try {
           const canonical = buildObjectStorageUri(file.Key, settings);
-          const remoteUrl = canonical || file.url;
+          if (!canonical) {
+            notifyError('Failed to build object-storage URI for import.');
+            return;
+          }
           const res = typeof bridge.addRemote === 'function'
-            ? await bridge.addRemote({ url: remoteUrl, title: key.split('/').pop() })
+            ? await bridge.addRemote({ url: canonical, title: key.split('/').pop() })
             : null;
           if (res?.success) {
-            notifySuccess('Added remote track to library.');
+            if (Spectra?.ui?.notify) {
+              Spectra.ui.notify({
+                message: `Imported: ${name}`,
+                type: 'success',
+                autoClose: 2800
+              });
+            }
+            try {
+              const event = new CustomEvent('spectra:refresh-library');
+              window.dispatchEvent(event);
+            } catch (e) {}
           } else {
             notifyError(`Failed to add remote track: ${res?.error || 'unknown'}`);
           }
