@@ -1,6 +1,6 @@
 {
   "name": "spectra",
-  "version": "1.0.11",
+  "version": "1.0.12",
   "type": "module",
   "main": "main.js",
   "scripts": {
