@@ -1,5 +1,4 @@
 
----
 
 # Spectra
 
@@ -8,6 +7,10 @@ A high-quality desktop audio player built with **Electron**, featuring a modern 
 Download binaries, installers, and extras: **[https://spectra.f4ust.com](https://spectra.f4ust.com)**
 
 ---
+
+## Screenshot
+
+![Spectra screenshot](images/screenshot.svg)
 
 ## Features
 
@@ -206,3 +209,8 @@ git config --unset core.hooksPath
 ## License
 
 This project is licensed. See `LICENSE` for details.
+<<<<<<< HEAD
+=======
+
+---
+>>>>>>> 7df181a (Add placeholder screenshot and embed in README)

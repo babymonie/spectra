@@ -1,0 +1,25 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="700" viewBox="0 0 1200 700">
+  <defs>
+    <linearGradient id="g" x1="0" x2="1">
+      <stop offset="0" stop-color="#2b2b2b"/>
+      <stop offset="1" stop-color="#1a1a1a"/>
+    </linearGradient>
+  </defs>
+  <rect width="1200" height="700" fill="#121212"/>
+  <rect x="40" y="40" width="1120" height="620" rx="12" fill="url(#g)" stroke="#2e8bff" stroke-width="2"/>
+  <rect x="64" y="64" width="440" height="540" rx="8" fill="#0f1113" />
+  <rect x="520" y="64" width="640" height="120" rx="6" fill="#0f1113" />
+  <rect x="520" y="200" width="640" height="320" rx="6" fill="#0f1113" />
+  <g fill="#9aa7b2" font-family="Arial, Helvetica, sans-serif">
+    <text x="86" y="100" font-size="22">Library</text>
+    <text x="530" y="100" font-size="22">Now Playing</text>
+    <text x="530" y="140" font-size="14" fill="#cdd7de">Artist • Album • Track</text>
+    <text x="86" y="140" font-size="12">Search...</text>
+    <text x="86" y="180" font-size="12">Track 1</text>
+    <text x="86" y="205" font-size="12">Track 2</text>
+    <text x="86" y="230" font-size="12">Track 3</text>
+  </g>
+  <circle cx="900" cy="460" r="42" fill="#2e8bff" opacity="0.9"/>
+  <text x="879" y="468" font-size="28" fill="#fff">▶</text>
+  <text x="600" y="420" font-size="14" fill="#7f8b92">(Placeholder screenshot — replace with real screenshot.png)</text>
+</svg>
