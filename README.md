@@ -10,7 +10,7 @@ Download binaries, installers, and extras: **[https://spectra.f4ust.com](https:/
 
 ## Screenshot
 
-![Spectra screenshot](images/screenshot.svg)
+![Spectra screenshot](images/screenshot.png)
 
 ## Features
 
