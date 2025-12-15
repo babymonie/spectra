@@ -484,13 +484,14 @@ function setupApplicationMenu() {
           label: 'About Spectra',
           click: () => {
             dialog.showMessageBox(mainWindow, {
-              type: 'info',
+              type: 'none',
               title: 'About Spectra',
               message: 'Spectra',
               detail: `Version: ${version}\n\nA modern, high-fidelity music player with exclusive audio support.\n\nBuilt with Electron and ❤️\n\nGitHub: github.com/babymonie/spectra`,
               buttons: ['OK', 'View on GitHub'],
               defaultId: 0,
-              cancelId: 0
+              cancelId: 0,
+              noLink: true
             }).then(result => {
               if (result.response === 1) {
                 shell.openExternal('https://github.com/babymonie/spectra');

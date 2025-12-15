@@ -159,8 +159,11 @@ const computeLibraryBase = () => {
     base = base.filter((t) => {
       const trackAlbum = normalizeForCompare(t.album || '');
       const trackArtist = normalizeForCompare(t.artist || '');
+      const trackAlbumArtist = normalizeForCompare(t.album_artist || '');
       if (currentAlbumFilter.artist) {
-        return trackAlbum === currentAlbumFilter.album && trackArtist === currentAlbumFilter.artist;
+        // Match album name AND (artist OR album_artist matches the filter)
+        return trackAlbum === currentAlbumFilter.album && 
+               (trackArtist === currentAlbumFilter.artist || trackAlbumArtist === currentAlbumFilter.artist);
       }
       return trackAlbum === currentAlbumFilter.album;
     });
@@ -208,19 +211,34 @@ function updateLibraryHeader() {
   if (!libraryTitleEl) libraryTitleEl = document.querySelector('#view-library h2');
   if (!libraryTitleEl) return;
 
+  const isFiltered = libraryContext.type === 'album' || libraryContext.type === 'artist' || libraryContext.type === 'playlist';
+  
   if (libraryContext.type === 'album') {
     const segments = ['Album'];
     if (libraryContext.name) segments.push(`· ${libraryContext.name}`);
     if (libraryContext.artist) segments.push(`(${libraryContext.artist})`);
-    libraryTitleEl.textContent = segments.join(' ');
+    libraryTitleEl.innerHTML = `<span class="back-to-library" title="Back to Library"><span class="material-icons">arrow_back</span></span> ${segments.join(' ')}`;
   } else if (libraryContext.type === 'artist') {
     const label = libraryContext.name ? `Artist · ${libraryContext.name}` : 'Artist';
-    libraryTitleEl.textContent = label;
+    libraryTitleEl.innerHTML = `<span class="back-to-library" title="Back to Library"><span class="material-icons">arrow_back</span></span> ${label}`;
   } else if (libraryContext.type === 'playlist') {
     const label = libraryContext.name ? `Playlist · ${libraryContext.name}` : 'Playlist';
-    libraryTitleEl.textContent = label;
+    libraryTitleEl.innerHTML = `<span class="back-to-library" title="Back to Library"><span class="material-icons">arrow_back</span></span> ${label}`;
   } else {
     libraryTitleEl.textContent = 'Library';
+  }
+  
+  // Add click handler to back button
+  const backBtn = libraryTitleEl.querySelector('.back-to-library');
+  if (backBtn) {
+    backBtn.onclick = async () => {
+      currentAlbumFilter = null;
+      currentArtistFilter = null;
+      currentPlaylistFilter = null;
+      currentPlaylistTracks = [];
+      setLibraryContext('library');
+      await loadLibrary();
+    };
   }
 }
 
@@ -1150,11 +1168,53 @@ const renderLibrary = () => {
     
     el.innerHTML = `
       <div class="col-title">${displayTitle}</div>
-      <div class="col-artist">${track.artist || 'Unknown Artist'}</div>
-      <div class="col-album">${track.album || 'Unknown Album'}</div>
+      <div class="col-artist clickable-filter">${track.artist || 'Unknown Artist'}</div>
+      <div class="col-album clickable-filter">${track.album || 'Unknown Album'}</div>
       <div class="col-duration">${formatTime(track.duration)}</div>
     `;
+    
+    // Click on artist to filter by artist
+    const artistCell = el.querySelector('.col-artist');
+    artistCell.addEventListener('click', async (e) => {
+      e.stopPropagation();
+      const artistName = track.artist || '';
+      if (!artistName || artistName === 'Unknown Artist') return;
+      
+      const artistToMatch = normalizeForCompare(artistName);
+      currentArtistFilter = artistToMatch;
+      currentAlbumFilter = null;
+      currentPlaylistFilter = null;
+      currentPlaylistTracks = [];
+      setLibraryContext('artist', { name: artistName });
+      
+      const currentQuery = searchInputEl ? searchInputEl.value : '';
+      await handleSearchInput(currentQuery);
+    });
+    
+    // Click on album to filter by album
+    const albumCell = el.querySelector('.col-album');
+    albumCell.addEventListener('click', async (e) => {
+      e.stopPropagation();
+      const albumName = track.album || '';
+      const artistName = track.album_artist || track.artist || '';
+      if (!albumName || albumName === 'Unknown Album') return;
+      
+      const nameToMatch = normalizeForCompare(albumName);
+      const artistToMatch = normalizeForCompare(artistName) || null;
+      currentAlbumFilter = { album: nameToMatch, artist: artistToMatch };
+      currentArtistFilter = null;
+      currentPlaylistFilter = null;
+      currentPlaylistTracks = [];
+      setLibraryContext('album', { name: albumName, artist: artistName });
+      
+      const currentQuery = searchInputEl ? searchInputEl.value : '';
+      await handleSearchInput(currentQuery);
+    });
+    
     el.addEventListener('click', (e) => {
+      // If clicked on artist/album filter cell, don't play
+      if (e.target.classList.contains('clickable-filter')) return;
+      
       // Ctrl/Cmd-click toggles selection without playing
       if (e.ctrlKey || e.metaKey) {
         if (selectedTrackIds.has(track.id)) selectedTrackIds.delete(track.id);

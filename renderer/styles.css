@@ -315,6 +315,41 @@ header > * {
   padding-right: 16px;
 }
 
+/* Clickable filter cells (Artist, Album) */
+.col-artist.clickable-filter,
+.col-album.clickable-filter {
+  cursor: pointer;
+  transition: color 0.15s ease;
+}
+
+.col-artist.clickable-filter:hover,
+.col-album.clickable-filter:hover {
+  color: var(--accent);
+  text-decoration: underline;
+}
+
+/* Back to library button in header */
+.back-to-library {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  cursor: pointer;
+  padding: 4px;
+  margin-right: 8px;
+  border-radius: 50%;
+  transition: background-color 0.15s ease, color 0.15s ease;
+  vertical-align: middle;
+}
+
+.back-to-library:hover {
+  background-color: var(--bg-hover);
+  color: var(--accent);
+}
+
+.back-to-library .material-icons {
+  font-size: 20px;
+}
+
 /* Now Playing Bar */
 .now-playing-bar {
   grid-column: 1 / -1;
