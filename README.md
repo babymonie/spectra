@@ -1,4 +1,3 @@
-Here’s a clean, fully redone **README.md** (no “ChatGPT-y” wording, no “if you need me” lines). Copy-paste as your new README.
 
 ---
 
