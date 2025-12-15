@@ -1,129 +1,209 @@
-
-# Spectra Source-Available License
-
-**Version 1.1 — January 2025**
-**Copyright © 2025 Aloysius (“babymonie”). All rights reserved.**
-
-## 1. Definitions
-
-**“Software”** means the Spectra application and all accompanying materials made available by the Author, including source code, compiled binaries, assets, documentation, build scripts, plugins, configuration files, and other contents of the repository.
-
-**“Author”** means Aloysius (“babymonie”), the copyright holder.
-
-**“User”** means any individual who accesses, views, downloads, clones, copies, compiles, modifies, or runs the Software.
-
-**“Personal Use”** means use by an individual on hardware they own or control, for private, non-commercial purposes, not on behalf of a business, institution, government, or organization.
-
-**“Modify”** means to alter, patch, translate, adapt, or create derivative works of the Software (including private forks).
-
-**“Distribute”** means to provide, publish, share, sublicense, sell, transfer, or otherwise make the Software (or any portion of it) available to any third party, whether publicly or privately. Distribution includes, without limitation, posting to GitHub/GitLab, sharing zip files, sending binaries, providing container images, publishing patches that reconstruct substantial portions of the code, or shipping the Software as part of another product.
-
-**“Hosted Service / SaaS”** means making the Software available for use by others over a network (internet or otherwise), including “software-as-a-service,” “hosted app,” “web app,” “remote client,” “streaming/remote desktop offering,” managed service, or any arrangement where third parties can access or interact with the Software or its functionality remotely.
+Here’s a clean, fully redone **README.md** (no “ChatGPT-y” wording, no “if you need me” lines). Copy-paste as your new README.
 
 ---
 
-## 2. Grant of Permission (Personal Use Only)
+# Spectra
 
-Subject to full compliance with this License, the Author grants the User a limited, non-exclusive, non-transferable, revocable license for **Personal Use** to:
+A high-quality desktop audio player built with **Electron**, featuring a modern library UI, playlists, plugins, and an optional LAN remote control mode.
 
-**2.1 View & Copy**
-Access, download, clone, and make reasonable copies of the Software for personal backup and development on the User’s own devices.
-
-**2.2 Study**
-Analyze the Software’s architecture, design, implementation, and techniques for learning purposes.
-
-**2.3 Execute**
-Compile and run the Software on the User’s own devices for Personal Use.
-
-**2.4 Private Modifications**
-Modify the Software **privately** (including maintaining a private fork), solely for Personal Use, provided that such modified versions are **not Distributed** and are **not used to provide a Hosted Service / SaaS**.
-
-No rights are granted except as expressly stated in this Section 2.
+Download binaries, installers, and extras: **[https://spectra.f4ust.com](https://spectra.f4ust.com)**
 
 ---
 
-## 3. Restrictions (What You May Not Do)
+## Features
 
-The User may not, under any circumstances:
+* ⚡ Modern Electron UI with fast library browsing & search
+* 🎵 FFmpeg decoding pipeline (wide format support)
+* 🔊 Native audio output modes (exclusive/shared depending on platform support)
 
-**3.1 No Distribution**
-Distribute the Software or any portion of it, whether modified or unmodified, including source code, binaries, assets, documentation, screenshots that reveal proprietary implementation details, or other repository content, except as permitted by applicable law.
-
-**3.2 No Public Forks or Mirrors**
-Create or publish public forks, mirrors, or derivative repositories.
-
-**3.3 No Hosted Service / SaaS**
-Use the Software (or any modified version) to provide a Hosted Service / SaaS, or otherwise make it accessible to others over a network.
-
-**3.4 No Commercial / Organizational Use**
-Use the Software for business, institutional, governmental, or organizational purposes, whether for profit or not-for-profit, including internal corporate use, client work, paid services, or operational deployment.
-
-**3.5 No Sublicensing**
-Sublicense, grant, or convey any rights in the Software to any third party.
+  * WASAPI (Windows)
+  * CoreAudio (macOS)
+  * ALSA (Linux)
+* 🗂️ SQLite music library (tracks, playlists, metadata, covers)
+* 🧩 Plugin system (`plugins/`) with example plugins (e.g., Discord Presence, Object Storage, Last.fm)
+* 🌐 Remote control mode (Express + Socket.IO) for LAN control
+* 📦 Electron Builder packaging for Windows, macOS, Linux
 
 ---
 
-## 4. Allowed Local Remote Control (Limited Exception)
+## Download & Install
 
-Spectra may include features that allow **local remote control** (e.g., a controller UI on the User’s own phone/tablet/PC). This is permitted only if:
+### Windows
 
-* access is limited to the User (and optionally their household members) on devices they control, and
-* it is not offered to the public or to any organization, and
-* it is not hosted as a service.
+* Download the installer from the releases page/site and run it.
+* If SmartScreen appears, choose **More info → Run anyway** (only if you trust the source).
 
-If in doubt, it is considered a prohibited Hosted Service / SaaS.
+### macOS
 
----
+* Download the `.dmg` or `.zip`, then drag **Spectra.app** into **Applications**.
+* If macOS blocks the app as “damaged” or “can’t be opened”, see the Gatekeeper troubleshooting section below.
 
-## 5. Intellectual Property
+### Linux
 
-All right, title, and interest in and to the Software remain with the Author.
-This Software is **source-available** and **not open-source**.
+* Use the provided AppImage / deb / rpm (depending on the release).
+* Ensure the file is executable if using AppImage:
 
-No rights are granted under trademark, service mark, trade name, or branding of the Author.
-No patent rights are granted (if any exist).
-
----
-
-## 6. Termination
-
-Any violation of this License immediately terminates all rights granted under Section 2.
-
-Upon termination, the User must:
-
-1. cease all use of the Software, and
-2. delete all copies of the Software (including modified versions) in their possession or control.
+  ```bash
+  chmod +x Spectra.AppImage
+  ```
 
 ---
 
-## 7. No Warranty
+## macOS Gatekeeper Troubleshooting (local testing)
 
-THE SOFTWARE IS PROVIDED “AS IS”, WITHOUT WARRANTY OF ANY KIND.
-THE AUTHOR DISCLAIMS ALL LIABILITY FOR ANY DAMAGES OR LOSSES ARISING FROM USE OF THE SOFTWARE, INCLUDING BUT NOT LIMITED TO LOSS OF DATA, SECURITY ISSUES, HARDWARE/SOFTWARE MALFUNCTION, OR DEFECTIVE OUTPUT.
+Unsigned apps (or apps downloaded outside the App Store) may be quarantined by Gatekeeper. For local testing, you can remove the quarantine attribute.
 
----
+**Clear extended attributes recursively:**
 
-## 8. No Support Obligation
+```bash
+sudo xattr -cr /path/to/Spectra.app
+```
 
-The Author has no obligation to provide updates, maintenance, bug fixes, compatibility, or technical support. The Software may be changed, unpublished, or discontinued at any time.
+**Or remove only the quarantine attribute explicitly:**
 
----
+```bash
+sudo xattr -rd com.apple.quarantine /path/to/Spectra.app
+```
 
-## 9. Governing Law
+Replace `/path/to/Spectra.app` with the real path, for example:
 
-This License is governed by the laws of the Republic of Singapore, excluding its conflict-of-law rules.
-Any dispute, claim, or controversy arising out of or relating to this License or the Software shall be subject to the exclusive jurisdiction of the courts of Singapore.
----
+* `~/Downloads/Spectra-darwin-x64/Spectra.app`
+* `/Applications/Spectra.app`
 
-## 10. Entire Agreement
-
-This License constitutes the entire agreement between the User and the Author regarding the Software and supersedes any prior communications.
-
----
-
-## 11. Acceptance
-
-By accessing, viewing, downloading, cloning, copying, compiling, modifying, or running the Software, the User agrees to be bound by this License. If the User does not agree, they must not access or use the Software.
+> Note: These are workarounds intended for local testing. For public distribution, the recommended approach is **Developer ID signing + notarization**.
 
 ---
 
+## Build From Source
+
+### Requirements
+
+* Node.js (LTS recommended)
+* npm or pnpm
+* FFmpeg available on your system (or packaged as part of your build flow)
+
+### Install dependencies
+
+```bash
+npm install
+```
+
+### Run in development
+
+```bash
+npm run dev
+```
+
+### Build packaged releases
+
+```bash
+npm run build
+```
+
+(Exact script names depend on your `package.json`. If your repo uses different commands like `electron:dev` / `electron:build`, keep those instead.)
+
+---
+
+## Plugins
+
+Spectra supports a plugin folder-based system.
+
+* Plugins live in:
+
+  * `plugins/` (development)
+  * or the app’s plugin directory in user data (depending on your runtime design)
+
+Typical capabilities:
+
+* Add menu items / UI panels
+* Add integrations (Discord Presence, scrobbling, cloud/object storage)
+* Extend metadata behavior or playlist workflows
+
+If you include example plugins in the repo, list them here:
+
+* **Discord Presence** — show currently playing track on Discord
+* **Object Storage** — upload/export media or playlist assets
+* **Last.fm** — scrobble plays (optional)
+
+---
+
+## Remote Control Mode (LAN)
+
+Spectra can run a local server (Express + Socket.IO) to allow control from another device on the same network.
+
+Typical flow:
+
+* Enable Remote Mode in the app
+* Open the provided LAN URL in a browser on your phone/PC
+* Control playback, browse library, manage queue/playlists
+
+(If you have a config flag or CLI arg, document it here.)
+
+---
+
+## Data & Storage
+
+Spectra stores app data in the OS user data directory, including:
+
+* SQLite database (library index)
+* cover art cache
+* settings
+* plugins (if you load from user directory)
+
+Location examples:
+
+* macOS: `~/Library/Application Support/Spectra`
+* Windows: `%APPDATA%\Spectra`
+* Linux: `~/.config/Spectra`
+
+---
+
+## Developer Notes: Git hooks & version bump
+
+This repo includes an optional post-commit version bump flow to keep the `package.json` **patch** version moving automatically.
+
+### Tracked files
+
+* `.githooks/post-commit` — wrapper hook
+* `scripts/post-commit-bump.js` — bumps patch version and commits with:
+  `chore: bump version to X.Y.Z`
+
+### Enable the tracked hooks directory
+
+```bash
+git config core.hooksPath .githooks
+```
+
+After enabling, each `git commit` will trigger a bump commit **unless** the latest commit already matches `chore: bump version to ...` (prevents loops).
+
+### Run bump manually
+
+```bash
+npm run bump-version
+```
+
+### Disable hooks (restore default)
+
+```bash
+git config --unset core.hooksPath
+```
+
+---
+
+## Roadmap (optional)
+
+* ASIO driver support (paid)
+* CD ripping plugin (paid)
+* Mobile remote (paid)
+* Themes (paid)
+
+---
+
+## Recent Changes
+
+* Minor UI fixes: improved album/artist filtering and clickable artist/album cells in the library view.
+
+
+## License
+
+This project is licensed. See `LICENSE` for details.
