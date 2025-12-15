@@ -1,8 +1,4 @@
-Below is a tightened **v1.1** that keeps your original “source-available, personal-only” intent, but updates it to: **allow personal use + allow private mods + ban redistribution + ban SaaS hosting** (and removes the internal contradictions about cloning/copying).
 
-You can paste this directly into `LICENSE`.
-
----
 
 # Spectra Source-Available License
 
