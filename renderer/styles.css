@@ -419,6 +419,17 @@ header > * {
   margin-bottom: 4px;
 }
 
+/* Ensure now-playing title truncates instead of overflowing controls */
+.now-playing-info { min-width: 220px; max-width: 420px; }
+.track-details { min-width: 0; }
+.track-title {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  display: block;
+  max-width: 100%;
+}
+
 .track-artist {
   color: var(--text-secondary);
   font-size: 11px;
@@ -587,6 +598,47 @@ input[type="range"]:hover::-webkit-slider-runnable-track {
   font-size: 12px;
   margin-top: 4px;
 }
+
+/* Album page header (Spotify-like) */
+.album-header {
+  display: flex;
+  gap: 24px;
+  align-items: center;
+  padding: 28px 12px 20px 12px;
+  margin-bottom: 12px;
+  border-radius: 8px;
+  background: linear-gradient(180deg, rgba(0,0,0,0.28), rgba(0,0,0,0.18));
+}
+.album-header-left {
+  flex: 0 0 auto;
+}
+.album-header-art {
+  width: 180px;
+  height: 180px;
+  object-fit: cover;
+  border-radius: 6px;
+  background: #282828;
+  box-shadow: 0 12px 30px rgba(0,0,0,0.6);
+}
+.album-header-art.placeholder {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 48px;
+}
+.album-header-main {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+.album-type { color: var(--text-secondary); font-size: 13px; }
+.album-title-large { font-size: 44px; font-weight: 800; color: var(--text-primary); }
+.album-artist-meta { color: var(--text-secondary); font-size: 14px; }
+.album-actions { display:flex; gap:12px; align-items:center; margin-top:12px; }
+.btn-play { background: var(--accent); color: #000; border: none; padding: 12px 22px; border-radius: 999px; font-weight: 800; cursor: pointer; }
+.btn-play:hover { filter: brightness(1.05); }
+.btn-shuffle { padding: 10px 16px; border-radius: 999px; }
+.album-header .material-icons { vertical-align: middle; }
 
 .empty {
   text-align: center;
@@ -1421,6 +1473,14 @@ input[type="range"]:hover::-webkit-slider-runnable-track {
   letter-spacing: -0.5px;
   text-shadow: 0 4px 20px rgba(0,0,0,0.4);
 }
+/* Truncate long fullscreen titles so they don't overflow controls */
+.fs-title {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  display: block;
+  max-width: 100%;
+}
 
 .fs-artist { 
   font-size: 22px; 
@@ -1428,6 +1488,14 @@ input[type="range"]:hover::-webkit-slider-runnable-track {
   font-weight: 600;
   letter-spacing: 0.2px;
   text-shadow: 0 2px 10px rgba(0,0,0,0.3);
+}
+/* Truncate artist on small screens / narrow layouts */
+.fs-artist {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  display: block;
+  max-width: 100%;
 }
 
 .fs-right { 
@@ -1525,6 +1593,22 @@ input[type="range"]:hover::-webkit-slider-runnable-track {
   background: rgba(255,255,255,0.25);
   transform: scale(1.1);
 }
+
+/* Fullscreen background canvas for wavy/parallax effect */
+.fs-bg-canvas {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  display: block;
+  z-index: 1; /* behind .fullscreen-content which uses higher stacking */
+  transform: scale(1.06);
+  pointer-events: none;
+  opacity: 0.95;
+}
+
+/* Ensure the actual background image is hidden when canvas is used */
+.fs-bg-art { display: none; }
 
 /* responsive */
 @media (max-width: 900px) {

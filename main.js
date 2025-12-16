@@ -1025,7 +1025,9 @@ const handlers = {
     const { filePath, external = false, artist, title } = opts || {};
     if (filePath) {
       try {
-        const embedded = await extractLyrics(filePath);
+        // Resolve special URI schemes (object-storage:// etc.) to a usable path/URL
+        const resolvedPath = await resolveTrackPath(filePath).catch(() => filePath);
+        const embedded = await extractLyrics(resolvedPath);
         if (embedded && typeof embedded === 'string' && embedded !== '[object Object]') {
           return { source: 'embedded', lyrics: embedded };
         }

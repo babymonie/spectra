@@ -364,7 +364,22 @@ export async function extractMetadataFromBuffer(buf, sourceName = 'remote') {
 // Extract embedded lyrics from audio files (ID3 USLT, Vorbis COMMENTS, etc.)
 export async function extractLyrics(filePath) {
 	try {
-		const metadata = await mm.parseFile(filePath, { native: true });
+		let metadata;
+		// If filePath is a remote URL (presigned S3 / object storage), fetch into buffer
+		if (typeof filePath === 'string' && (filePath.startsWith('http://') || filePath.startsWith('https://'))) {
+			try {
+				const res = await fetch(filePath, { timeout: 15000 }).catch(() => null);
+				if (!res || !res.ok) throw new Error('Failed to fetch remote file for metadata');
+				const arrayBuf = await res.arrayBuffer();
+				const buf = Buffer.from(arrayBuf);
+				metadata = await mm.parseBuffer(buf, null, { native: true });
+			} catch (e) {
+				// Fallback: let parseFile try (will likely fail) so we can surface the error
+				metadata = await mm.parseFile(filePath, { native: true }).catch(err => { throw err; });
+			}
+		} else {
+			metadata = await mm.parseFile(filePath, { native: true });
+		}
 		const common = metadata.common || {};
 
 		// music-metadata may expose lyrics in common.lyrics as an array

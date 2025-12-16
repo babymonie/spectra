@@ -101,6 +101,143 @@ function updateRepeatButton(btn) {
   }
 }
 
+// --- Fullscreen background canvas animation helpers ---
+const __fsBg = { raf: null, canvas: null, ctx: null, mouseX: 0.5, mouseY: 0.5, running: false, onMouse: null };
+
+function sampleColorsFromImage(img, maxColors = 5) {
+  try {
+    const w = 64, h = 64;
+    const c = document.createElement('canvas');
+    c.width = w; c.height = h;
+    const cx = c.getContext('2d');
+    cx.drawImage(img, 0, 0, w, h);
+    const data = cx.getImageData(0, 0, w, h).data;
+    const counts = new Map();
+    for (let i = 0; i < data.length; i += 4) {
+      const r = data[i] >> 4; const g = data[i+1] >> 4; const b = data[i+2] >> 4;
+      const key = (r<<8) | (g<<4) | b;
+      counts.set(key, (counts.get(key) || 0) + 1);
+    }
+    const arr = Array.from(counts.entries()).sort((a,b) => b[1]-a[1]).slice(0, maxColors);
+    const colors = arr.map(([key]) => {
+      const r = ((key >> 8) & 0xF) << 4;
+      const g = ((key >> 4) & 0xF) << 4;
+      const b = (key & 0xF) << 4;
+      return `rgba(${r+8},${g+8},${b+8},`;
+    });
+    return colors.length ? colors : ['rgba(24,24,24,', 'rgba(40,40,40,', 'rgba(16,16,16,'];
+  } catch (e) {
+    return ['rgba(24,24,24,', 'rgba(40,40,40,', 'rgba(16,16,16,'];
+  }
+}
+
+function startFsBgAnimationFromSrc(src) {
+  try {
+    const canvas = document.getElementById('fs-bg-canvas');
+    if (!canvas) return;
+    if (!__fsBg.canvas) {
+      __fsBg.canvas = canvas;
+      __fsBg.ctx = canvas.getContext('2d');
+    }
+    const ctx = __fsBg.ctx;
+    let img = new Image();
+    img.crossOrigin = 'anonymous';
+    img.src = src || '';
+
+    img.onload = () => {
+      const palette = sampleColorsFromImage(img, 4);
+      // Build layers
+      const layers = palette.map((base, i) => ({
+        colorBase: base,
+        alpha: 0.18 + (i * 0.08),
+        speed: 0.2 + i*0.18,
+        amplitude: 30 + i*24,
+        wavelength: 0.006 + i*0.004,
+        phase: Math.random()*Math.PI*2
+      }));
+
+      // Resize canvas to display size
+      function resize() {
+        const dpr = window.devicePixelRatio || 1;
+        const w = Math.max(1, canvas.clientWidth);
+        const h = Math.max(1, canvas.clientHeight);
+        canvas.width = Math.floor(w * dpr);
+        canvas.height = Math.floor(h * dpr);
+        ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+      }
+      resize();
+      window.addEventListener('resize', resize);
+
+      // Mouse parallax
+      __fsBg.onMouse = (e) => {
+        const rect = canvas.getBoundingClientRect();
+        __fsBg.mouseX = ((e.clientX - rect.left) / rect.width);
+        __fsBg.mouseY = ((e.clientY - rect.top) / rect.height);
+      };
+      canvas.addEventListener('mousemove', __fsBg.onMouse);
+
+      let start = performance.now();
+      __fsBg.running = true;
+      function frame(t) {
+        const time = (t - start) / 1000;
+        const w = canvas.clientWidth; const h = canvas.clientHeight;
+        ctx.clearRect(0,0,w,h);
+
+        // Draw multiple layered waves
+        for (let li = 0; li < layers.length; li++) {
+          const layer = layers[li];
+          ctx.beginPath();
+          const baseY = h * (0.35 + li * 0.12) + ( (__fsBg.mouseY - 0.5) * 80 * (li+1) );
+          ctx.moveTo(0, h);
+          ctx.lineTo(0, baseY);
+          const step = Math.max(8, Math.floor(w / 60));
+          for (let x = 0; x <= w; x += step) {
+            const y = baseY + Math.sin((x * layer.wavelength) + (time * layer.speed) + layer.phase) * layer.amplitude * (1 + li*0.2);
+            ctx.lineTo(x, y);
+          }
+          ctx.lineTo(w, h);
+          ctx.closePath();
+          const rgba = layer.colorBase + (layer.alpha) + ')';
+          ctx.fillStyle = rgba;
+          ctx.fill();
+        }
+
+        // subtle vignette overlay
+        ctx.fillStyle = 'rgba(0,0,0,0.12)';
+        ctx.fillRect(0,0,w,h);
+
+        __fsBg.raf = requestAnimationFrame(frame);
+      }
+      if (__fsBg.raf) cancelAnimationFrame(__fsBg.raf);
+      __fsBg.raf = requestAnimationFrame(frame);
+    };
+    img.onerror = () => {
+      // fallback: clear canvas
+      const c = __fsBg.canvas; if (c && __fsBg.ctx) __fsBg.ctx.clearRect(0,0,c.width,c.height);
+    };
+  } catch (err) {
+    console.warn('Failed to start fullscreen bg animation', err);
+  }
+}
+
+function stopFsBgAnimation() {
+  try {
+    if (__fsBg.raf) cancelAnimationFrame(__fsBg.raf);
+    __fsBg.raf = null;
+    if (__fsBg.canvas && __fsBg.onMouse) {
+      __fsBg.canvas.removeEventListener('mousemove', __fsBg.onMouse);
+      __fsBg.onMouse = null;
+    }
+    // clear canvas
+    if (__fsBg.ctx && __fsBg.canvas) {
+      __fsBg.ctx.clearRect(0,0,__fsBg.canvas.width, __fsBg.canvas.height);
+    }
+    __fsBg.running = false;
+  } catch (e) {}
+}
+
+// ------------------------------------------------------
+
 const tokenizeQuery = (query) => {
   if (!query) return [];
   return String(query)
@@ -214,10 +351,10 @@ function updateLibraryHeader() {
   const isFiltered = libraryContext.type === 'album' || libraryContext.type === 'artist' || libraryContext.type === 'playlist';
   
   if (libraryContext.type === 'album') {
-    const segments = ['Album'];
-    if (libraryContext.name) segments.push(`· ${libraryContext.name}`);
-    if (libraryContext.artist) segments.push(`(${libraryContext.artist})`);
-    libraryTitleEl.innerHTML = `<span class="back-to-library" title="Back to Library"><span class="material-icons">arrow_back</span></span> ${segments.join(' ')}`;
+    // When viewing an album we render a dedicated album header in the library view.
+    // Hide the smaller H2 header to avoid duplicating the title.
+    libraryTitleEl.style.display = 'none';
+    return;
   } else if (libraryContext.type === 'artist') {
     const label = libraryContext.name ? `Artist · ${libraryContext.name}` : 'Artist';
     libraryTitleEl.innerHTML = `<span class="back-to-library" title="Back to Library"><span class="material-icons">arrow_back</span></span> ${label}`;
@@ -1153,6 +1290,106 @@ const NotificationCenter = (() => {
 // Render Library
 const renderLibrary = () => {
   trackList.innerHTML = '';
+
+  // If we're viewing an album, render a large Spotify-like album header
+  try {
+    const viewLib = document.getElementById('view-library');
+    if (viewLib) {
+      // remove existing header if present
+      const existing = viewLib.querySelector('.album-header');
+      if (existing) existing.remove();
+
+      if (libraryContext.type === 'album') {
+        const header = document.createElement('div');
+        header.className = 'album-header';
+
+        header.innerHTML = `
+          <div class="album-header-left">
+            <img class="album-header-art" src="" alt="Album art">
+          </div>
+          <div class="album-header-main">
+            <div style="display:flex;align-items:center;gap:12px;">
+              <span class="back-to-library" title="Back to Library"><span class="material-icons">arrow_back</span></span>
+              <div class="album-type">Album</div>
+            </div>
+            <div class="album-title-large">${libraryContext.name || ''}</div>
+            <div class="album-artist-meta">${libraryContext.artist || ''} · ${tracks.length} songs</div>
+            <div class="album-actions">
+              <button class="btn-play btn-primary">Play</button>
+              <button class="btn-secondary btn-shuffle">Shuffle</button>
+              <button class="btn-text btn-more"><span class="material-icons">more_horiz</span></button>
+            </div>
+          </div>
+        `;
+
+        // Insert header above the track list header
+        const trackHeader = viewLib.querySelector('.track-list-header');
+        if (trackHeader) trackHeader.parentNode.insertBefore(header, trackHeader);
+
+        // Load cover art from first available track or albumsCache
+        const artEl = header.querySelector('.album-header-art');
+        (async () => {
+          try {
+            let cover = null;
+            // Prefer album-level cached cover
+            const cached = (Array.isArray(albumsCache) ? albumsCache.find(a => normalizeForCompare(a.name || a.album || '') === normalizeForCompare(libraryContext.name || '')) : null);
+            if (cached && (cached.cover_path || cached.coverPath)) cover = cached.cover_path || cached.coverPath;
+            // fallback to first track cover
+            if (!cover) {
+              const first = tracks.find(t => t && (t.cover_path || t.coverPath));
+              if (first) cover = first.cover_path || first.coverPath;
+            }
+            if (cover) {
+              if (cover.startsWith('http') || cover.startsWith('data:')) artEl.src = cover;
+              else {
+                const url = await electron.getCoverImage(cover).catch(() => null);
+                if (url) artEl.src = url;
+                else artEl.classList.add('placeholder');
+              }
+            } else {
+              artEl.classList.add('placeholder');
+            }
+          } catch (err) {
+            artEl.classList.add('placeholder');
+          }
+        })();
+
+        // Wire up play button to play first track in the filtered album
+        const playBtn = header.querySelector('.btn-play');
+        if (playBtn) playBtn.addEventListener('click', async (e) => {
+          e.preventDefault();
+          if (tracks && tracks.length) {
+            await playTrack(tracks[0]);
+          }
+        });
+
+        const shuffleBtn = header.querySelector('.btn-shuffle');
+        if (shuffleBtn) shuffleBtn.addEventListener('click', async (e) => {
+          e.preventDefault();
+          // Quick shuffle: randomize tracks and play first
+          if (!tracks || !tracks.length) return;
+          const copy = [...tracks].sort(() => Math.random() - 0.5);
+          tracks = copy;
+          renderLibrary();
+          await playTrack(tracks[0]);
+        });
+
+        // Back button in the album header should restore library view
+        const backBtn = header.querySelector('.back-to-library');
+        if (backBtn) backBtn.addEventListener('click', async (e) => {
+          e.preventDefault();
+          currentAlbumFilter = null;
+          currentArtistFilter = null;
+          currentPlaylistFilter = null;
+          currentPlaylistTracks = [];
+          setLibraryContext('library');
+          await loadLibrary();
+        });
+      }
+    }
+  } catch (e) {
+    console.warn('Failed to render album header', e);
+  }
   // Selection state for library items
   if (!globalThis.__spectra_selectedTrackIds) globalThis.__spectra_selectedTrackIds = new Set();
   const selectedTrackIds = globalThis.__spectra_selectedTrackIds;
@@ -1741,6 +1978,13 @@ function showFullscreen() {
   // Populate
   fsTitle.textContent = currentTrack.title || 'Unknown Title';
   fsArtist.textContent = currentTrack.artist || 'Unknown Artist';
+  // Provide full text in title attribute so users can see the full name on hover
+  try {
+    fsTitle.title = fsTitle.textContent || '';
+    fsArtist.title = fsArtist.textContent || '';
+  } catch (e) {
+    // ignore if elements missing
+  }
   
   // Update time immediately
   if (fsTotalTime) fsTotalTime.textContent = formatTime(currentTrack.duration);
@@ -1884,13 +2128,27 @@ function showFullscreen() {
   const setArt = (src) => {
     fsArt.src = src || '';
     if (fsBgArt) fsBgArt.src = src || '';
+    if (src) startFsBgAnimationFromSrc(src);
     if (!src) {
       fsArt.classList.add('placeholder');
     } else {
       fsArt.classList.remove('placeholder');
     }
   };
-
+  // Start animated canvas background when we set art for fullscreen
+  if (fsBgArt) {
+    // whenever fsBgArt.src changes we will start the animation
+    const obs = new MutationObserver(() => {
+      const src = fsBgArt.src || '';
+      if (src) startFsBgAnimationFromSrc(src);
+    });
+    // If image already has src, start immediately
+    if (fsBgArt.src) startFsBgAnimationFromSrc(fsBgArt.src);
+    // observe attribute changes (src)
+    obs.observe(fsBgArt, { attributes: true, attributeFilter: ['src'] });
+    // store observer so we can disconnect on hideFullscreen if desired
+    fsBgArt._fsObserver = obs;
+  }
   if (currentTrack.cover_path) {
     if (currentTrack.cover_path.startsWith('http') || currentTrack.cover_path.startsWith('data:')) {
       setArt(currentTrack.cover_path);
@@ -2039,6 +2297,15 @@ function hideFullscreen() {
     overlay._escHandler = null;
   }
   if (fsProgressInterval) clearInterval(fsProgressInterval);
+  // Stop animated background and clean up any observers
+  try {
+    stopFsBgAnimation();
+    const fsBgArt = document.getElementById('fs-bg-art');
+    if (fsBgArt && fsBgArt._fsObserver) {
+      try { fsBgArt._fsObserver.disconnect(); } catch(e) {}
+      fsBgArt._fsObserver = null;
+    }
+  } catch (e) {}
 }
 
 // Attach click on now-playing art to toggle fullscreen
