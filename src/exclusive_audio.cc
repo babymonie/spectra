@@ -33,6 +33,7 @@
 #include <audioclient.h>
 #include <mmreg.h>
 #include <functiondiscoverykeys_devpkey.h>
+#include <avrt.h>
 #pragma comment(lib, "ole32.lib")
 #pragma comment(lib, "avrt.lib")
 #ifndef DBG
@@ -52,6 +53,7 @@
 #include <CoreAudio/CoreAudio.h>
 #include <CoreServices/CoreServices.h>
 #include <CoreFoundation/CoreFoundation.h>
+#include <unistd.h>
 #endif
 
 #if defined(EXCLUSIVE_LINUX)
@@ -107,79 +109,85 @@ static inline void ThrowTypeError(const Napi::Env &env, const std::string &msg)
     Napi::TypeError::New(env, full).ThrowAsJavaScriptException();
 }
 
+// Single-Producer Single-Consumer lock-free ring buffer.
+// Writer: JS / Node thread (producer). Reader: audio render thread (consumer).
 struct RingBuffer
 {
     std::vector<uint8_t> data;
-    size_t writePos{0};
-    size_t readPos{0};
+    size_t capacity{0};
+    std::atomic<size_t> readPos{0};   // head (consumer)
+    std::atomic<size_t> writePos{0};  // tail (producer)
 
     void init(size_t size)
     {
-        data.assign(size ? size : 1, 0);
-        writePos = readPos = 0;
+        // Ensure at least 2 to distinguish full/empty
+        capacity = size ? size : 1;
+        data.assign(capacity, 0);
+        readPos.store(0);
+        writePos.store(0);
     }
 
-    size_t size() const { return data.size(); }
+    size_t size() const { return capacity; }
 
+    // Number of bytes available to read (consumer)
     size_t availableToRead() const
     {
-        if (writePos >= readPos)
-            return writePos - readPos;
-        return data.size() - (readPos - writePos);
+        size_t r = readPos.load(std::memory_order_acquire);
+        size_t w = writePos.load(std::memory_order_acquire);
+        return (w + capacity - r) % capacity;
     }
 
+    // Number of bytes available to write (producer)
     size_t availableToWrite() const
     {
-        return data.size() - availableToRead() - 1;
+        return capacity - availableToRead() - 1;
     }
 
+    // Producer writes up to len bytes. Returns actual written.
     size_t write(const uint8_t *src, size_t len)
     {
-        size_t writable = availableToWrite();
-        if (writable == 0 || len == 0)
+        if (!src || len == 0)
             return 0;
-        if (len > writable)
-            len = writable;
 
-        size_t size = data.size();
-        size_t toEnd = size - writePos;
+        size_t r = readPos.load(std::memory_order_acquire);
+        size_t t = writePos.load(std::memory_order_relaxed);
 
-        if (len <= toEnd)
-        {
-            std::memcpy(&data[writePos], src, len);
-        }
-        else
-        {
-            std::memcpy(&data[writePos], src, toEnd);
-            std::memcpy(&data[0], src + toEnd, len - toEnd);
-        }
+        size_t avail = (t >= r) ? (capacity - (t - r) - 1) : (r - t - 1);
+        if (avail == 0)
+            return 0;
+        if (len > avail)
+            len = avail;
 
-        writePos = (writePos + len) % size;
+        size_t first = std::min(len, capacity - t);
+        std::memcpy(&data[t], src, first);
+        if (len > first)
+            std::memcpy(&data[0], src + first, len - first);
+
+        writePos.store((t + len) % capacity, std::memory_order_release);
         return len;
     }
 
+    // Consumer reads up to len bytes. Returns actual read.
     size_t read(uint8_t *dst, size_t len)
     {
-        size_t readable = availableToRead();
-        if (readable == 0 || len == 0)
+        if (!dst || len == 0)
             return 0;
-        if (len > readable)
-            len = readable;
 
-        size_t size = data.size();
-        size_t toEnd = size - readPos;
+        size_t r = readPos.load(std::memory_order_relaxed);
+        size_t t = writePos.load(std::memory_order_acquire);
 
-        if (len <= toEnd)
-        {
-            std::memcpy(dst, &data[readPos], len);
-        }
-        else
-        {
-            std::memcpy(dst, &data[readPos], toEnd);
-            std::memcpy(dst + toEnd, &data[0], len - toEnd);
-        }
+        size_t avail = (t + capacity - r) % capacity;
+        if (avail == 0)
+            return 0;
+        if (len > avail)
+            len = avail;
 
-        readPos = (readPos + len) % size;
+        size_t first = std::min(len, capacity - r);
+        std::memcpy(dst, &data[r], first);
+        if (len > first)
+            std::memcpy(dst + first, &data[0], len - first);
+
+        readPos.store((r + len) % capacity, std::memory_order_release);
         return len;
     }
 };
@@ -199,8 +207,12 @@ struct OutputStreamState
     std::atomic<bool> paused{false};
 
     RingBuffer ring;
+    // Writers (JS) may wait on this mutex/cv; audio thread never locks the ring.
     std::mutex ringMutex;
     std::condition_variable ringCv;
+
+    // Last observed hardware buffer padding (frames) for latency calc
+    std::atomic<uint32_t> lastHardwarePaddingFrames{0};
 
 #if defined(EXCLUSIVE_WIN32)
     IMMDevice *device{nullptr};
@@ -228,14 +240,15 @@ static size_t WriteToRingBlocking(OutputStreamState *s,
                                   size_t len,
                                   uint32_t timeoutMs)
 {
-    if (!s || !s->open.load() || !src || len == 0)
+    // CRITICAL FIX: Check running state. If the render thread died, we must stop writing.
+    if (!s || !s->open.load() || !s->running.load() || !src || len == 0)
         return 0;
 
     size_t totalWritten = 0;
     auto deadline = std::chrono::steady_clock::now() +
                     std::chrono::milliseconds(timeoutMs);
 
-    while (totalWritten < len && s->running.load())
+    while (totalWritten < len && s->running.load() && s->open.load())
     {
         std::unique_lock<std::mutex> lock(s->ringMutex);
 
@@ -247,6 +260,7 @@ static size_t WriteToRingBlocking(OutputStreamState *s,
                 // Non-blocking: nothing to do
                 break;
             }
+            // Wait for space or until stream stops/closes
             if (s->ringCv.wait_until(lock, deadline) == std::cv_status::timeout)
             {
                 break;
@@ -378,11 +392,22 @@ static void WasapiRenderThread(OutputStreamState *s)
     if (!s || !s->audioClient || !s->renderClient || !s->hEvent)
     {
         DBG("WasapiRenderThread: invalid state");
+        if (s) s->open.store(false); // Mark as closed on error
         return;
     }
 
     const UINT32 frameBytes = s->bytesPerFrame;
     s->running.store(true);
+
+    // Try to register this thread with MMCSS using Pro Audio profile
+    HANDLE mmcssHandle = nullptr;
+    DWORD mmcssTaskIndex = 0;
+    mmcssHandle = AvSetMmThreadCharacteristicsA("Pro Audio", &mmcssTaskIndex);
+    if (!mmcssHandle) {
+        DBG("WasapiRenderThread: AvSetMmThreadCharacteristicsA failed (continuing)");
+    } else {
+        DBG("WasapiRenderThread: registered with MMCSS (Pro Audio)");
+    }
 
     HRESULT hr = s->audioClient->Start();
     if (FAILED(hr))
@@ -390,6 +415,7 @@ static void WasapiRenderThread(OutputStreamState *s)
         SetLastErrorHr("IAudioClient::Start failed", hr);
         DBG("WasapiRenderThread: Start failed");
         s->running.store(false);
+        s->open.store(false); // Mark closed
         return;
     }
 
@@ -398,7 +424,11 @@ static void WasapiRenderThread(OutputStreamState *s)
 
     while (s->running.load())
     {
-        DWORD waitRes = WaitForSingleObject(s->hEvent, 200);
+        DWORD waitRes = WaitForSingleObject(s->hEvent, 500); // 500ms timeout watchdog
+        if (waitRes == WAIT_TIMEOUT) {
+             // Watchdog: if we time out repeatedly, device might be stalled
+             continue; 
+        }
         if (waitRes != WAIT_OBJECT_0)
         {
             continue;
@@ -408,9 +438,14 @@ static void WasapiRenderThread(OutputStreamState *s)
         hr = s->audioClient->GetCurrentPadding(&padding);
         if (FAILED(hr))
         {
+            // Device lost or invalidated (e.g. exclusive mode preempted)
             SetLastErrorHr("GetCurrentPadding failed", hr);
-            break;
+            DBG("WasapiRenderThread: Device invalidated or lost");
+            break; 
         }
+
+        // Track recent hardware padding for stats
+        s->lastHardwarePaddingFrames.store(padding);
 
         UINT32 framesToWrite =
             (s->bufferFrames > padding) ? (s->bufferFrames - padding) : 0;
@@ -436,8 +471,8 @@ static void WasapiRenderThread(OutputStreamState *s)
             temp.resize(bytesRequested);
             size_t bytesFromRing = 0;
             {
-                std::lock_guard<std::mutex> lock(s->ringMutex);
-                bytesFromRing = s->ring.read(temp.data(), bytesRequested);
+                // Lock-free read on audio/render thread (SPSC)
+                    bytesFromRing = s->ring.read(temp.data(), bytesRequested);
             }
             if (bytesFromRing > 0)
             {
@@ -463,6 +498,11 @@ static void WasapiRenderThread(OutputStreamState *s)
     DBG("WasapiRenderThread: stopping");
     s->audioClient->Stop();
     s->running.store(false);
+    s->open.store(false); // CRITICAL: Ensure JS knows the device is closed
+    s->ringCv.notify_all(); // Wake up any blocking writers
+    if (mmcssHandle) {
+        AvRevertMmThreadCharacteristics(mmcssHandle);
+    }
 }
 
 static bool InitWasapi(OutputStreamState *s,
@@ -744,8 +784,10 @@ static void CloseWasapi(OutputStreamState *s)
     if (!s)
         return;
 
-    s->running.store(false);
+    // Order matters:
+    // 1. Mark open/running false to stop new writes and loop conditions
     s->open.store(false);
+    s->running.store(false);
 
     if (s->hEvent)
     {
@@ -797,6 +839,8 @@ static int WriteWasapi(OutputStreamState *s, const uint8_t *data, size_t len, bo
         return -1;
     if (!data || len == 0)
         return 0;
+    // CRITICAL: Return error if render thread is dead
+    if (!s->running.load()) return -1; 
 
     uint32_t timeoutMs = blocking ? 2000u : 0u;
     size_t written = WriteToRingBlocking(s, data, len, timeoutMs);
@@ -1164,8 +1208,10 @@ static OSStatus CoreAudioRenderCallback(void *inRefCon,
     }
     
     const size_t requestedBytes = static_cast<size_t>(inNumberFrames) * s->bytesPerFrame;
+    // Track recent hardware callback size for approximate latency reporting
+    s->lastHardwarePaddingFrames.store(inNumberFrames);
     
-    if (s->paused.load()) {
+        if (s->paused.load()) {
         // Fill with silence when paused
         for (UInt32 i = 0; i < ioData->mNumberBuffers; ++i) {
             std::memset(ioData->mBuffers[i].mData, 0, ioData->mBuffers[i].mDataByteSize);
@@ -1175,14 +1221,11 @@ static OSStatus CoreAudioRenderCallback(void *inRefCon,
     }
     
     // For interleaved audio (most common on macOS)
-    if (ioData->mNumberBuffers == 1) {
+        if (ioData->mNumberBuffers == 1) {
         uint8_t *outputBuffer = static_cast<uint8_t *>(ioData->mBuffers[0].mData);
         size_t bytesFromRing = 0;
-        
-        {
-            std::lock_guard<std::mutex> lock(s->ringMutex);
-            bytesFromRing = s->ring.read(outputBuffer, requestedBytes);
-        }
+        // Lock-free SPSC read by audio thread
+        bytesFromRing = s->ring.read(outputBuffer, requestedBytes);
         
         if (bytesFromRing < requestedBytes) {
             std::memset(outputBuffer + bytesFromRing, 0, requestedBytes - bytesFromRing);
@@ -1194,11 +1237,9 @@ static OSStatus CoreAudioRenderCallback(void *inRefCon,
     else {
         std::vector<uint8_t> interleaved(requestedBytes);
         size_t bytesFromRing = 0;
-        
-        {
-            std::lock_guard<std::mutex> lock(s->ringMutex);
-            bytesFromRing = s->ring.read(interleaved.data(), requestedBytes);
-        }
+
+        // Lock-free SPSC read
+        bytesFromRing = s->ring.read(interleaved.data(), requestedBytes);
         
         if (bytesFromRing < requestedBytes) {
             std::memset(interleaved.data() + bytesFromRing, 0, requestedBytes - bytesFromRing);
@@ -1354,6 +1395,26 @@ static bool InitCoreAudio(OutputStreamState *s,
                 AudioComponentInstanceDispose(audioUnit);
                 SetLastError("Failed to set output device");
                 return false;
+            }
+            // If exclusive requested, try to claim Hog Mode for the device
+            if (exclusive) {
+                AudioObjectPropertyAddress hogAddr = {
+                    kAudioDevicePropertyHogMode,
+                    kAudioObjectPropertyScopeGlobal,
+                    kAudioObjectPropertyElementMain
+                };
+                pid_t pid = getpid();
+                OSStatus hres = AudioObjectSetPropertyData(targetDevice,
+                                                           &hogAddr,
+                                                           0,
+                                                           NULL,
+                                                           sizeof(pid),
+                                                           &pid);
+                if (hres == noErr) {
+                    DBG("InitCoreAudio: Hog Mode enabled for device");
+                } else {
+                    DBG("InitCoreAudio: Hog Mode request failed (continuing)");
+                }
             }
         } else {
             // Device not found, fall back to default
@@ -1778,10 +1839,8 @@ static void AlsaRenderThread(OutputStreamState *s) {
         size_t bytesToRead = s->periodSize * s->bytesPerFrame;
         size_t bytesRead = 0;
         
-        {
-            std::lock_guard<std::mutex> lock(s->ringMutex);
-            bytesRead = s->ring.read(tempBuffer.data(), bytesToRead);
-        }
+        // Lock-free SPSC read on audio/render thread
+        bytesRead = s->ring.read(tempBuffer.data(), bytesToRead);
         
         if (bytesRead < bytesToRead) {
             // Fill remaining with silence
@@ -1806,6 +1865,11 @@ static void AlsaRenderThread(OutputStreamState *s) {
             // We'll handle this by trying again next iteration
         }
         
+        // Try to get ALSA delay (frames in hardware buffer) for stats
+        snd_pcm_sframes_t delayFrames = 0;
+        if (snd_pcm_delay(s->pcmHandle, &delayFrames) == 0 && delayFrames >= 0) {
+            s->lastHardwarePaddingFrames.store(static_cast<uint32_t>(delayFrames));
+        }
         s->ringCv.notify_all();
     }
     
@@ -2193,6 +2257,87 @@ static Napi::Value Write(const Napi::CallbackInfo &info)
     return Napi::Number::New(env, written);
 }
 
+// Async write worker: performs a (possibly blocking) write off the main thread
+class WriteAsyncWorker : public Napi::AsyncWorker
+{
+public:
+    WriteAsyncWorker(const Napi::Function &callback,
+                     uint32_t handle,
+                     std::vector<uint8_t> &&data,
+                     bool blocking)
+        : Napi::AsyncWorker(callback), handle(handle), data(std::move(data)), blocking(blocking), written(0) {}
+
+    void Execute() override
+    {
+        OutputStreamState *s = nullptr;
+        {
+            std::lock_guard<std::mutex> lock(g_streamsMutex);
+            auto it = g_streams.find(handle);
+            if (it != g_streams.end())
+                s = it->second;
+        }
+
+        if (!s)
+        {
+            SetError("Invalid handle");
+            return;
+        }
+
+#if defined(EXCLUSIVE_WIN32)
+        written = WriteWasapi(s, data.data(), data.size(), blocking);
+#elif defined(EXCLUSIVE_MACOS)
+        written = WriteCoreAudio(s, data.data(), data.size(), blocking);
+#elif defined(EXCLUSIVE_LINUX)
+        written = WriteAlsa(s, data.data(), data.size(), blocking);
+#else
+        written = -1;
+#endif
+    }
+
+    void OnOK() override
+    {
+        Napi::HandleScope scope(Env());
+        Callback().Call({ Env().Null(), Napi::Number::New(Env(), static_cast<double>(written)) });
+    }
+
+    void OnError(const Napi::Error &e) override
+    {
+        Napi::HandleScope scope(Env());
+        Callback().Call({ Napi::String::New(Env(), e.Message()) });
+    }
+
+private:
+    uint32_t handle;
+    std::vector<uint8_t> data;
+    bool blocking;
+    int written;
+};
+
+static Napi::Value WriteAsync(const Napi::CallbackInfo &info)
+{
+    Napi::Env env = info.Env();
+    if (info.Length() < 3 || !info[0].IsNumber() || !info[1].IsBuffer() || !info[2].IsFunction())
+    {
+        ThrowTypeError(env, "writeAsync(handle, buffer, callback[, blocking]) requires handle, Buffer and callback");
+        return env.Null();
+    }
+
+    uint32_t handle = info[0].As<Napi::Number>().Uint32Value();
+    Napi::Buffer<uint8_t> buf = info[1].As<Napi::Buffer<uint8_t>>();
+    Napi::Function cb = info[2].As<Napi::Function>();
+
+    bool blocking = true;
+    if (info.Length() >= 4 && info[3].IsBoolean())
+        blocking = info[3].As<Napi::Boolean>().Value();
+
+    std::vector<uint8_t> copy(buf.Length());
+    std::memcpy(copy.data(), buf.Data(), buf.Length());
+
+    WriteAsyncWorker *w = new WriteAsyncWorker(cb, handle, std::move(copy), blocking);
+    w->Queue();
+    return env.Undefined();
+}
+
 static Napi::Value Close(const Napi::CallbackInfo &info)
 {
     Napi::Env env = info.Env();
@@ -2282,15 +2427,20 @@ static Napi::Value GetStats(const Napi::CallbackInfo &info)
     if (!s)
         return env.Null();
 
-    size_t buffered = 0;
-    size_t freeBytes = 0;
-    size_t ringSizeBytes = 0;
+    size_t buffered = s->ring.availableToRead();
+    size_t freeBytes = s->ring.availableToWrite();
+    size_t ringSizeBytes = s->ring.size();
 
+    // Compute latency: ring buffer latency + approximate hardware latency
+    double ringFrames = 0.0;
+    double ringLatencyMs = 0.0;
+    double hardwareLatencyMs = 0.0;
+    if (s->bytesPerFrame > 0)
     {
-        std::lock_guard<std::mutex> lock(s->ringMutex);
-        buffered = s->ring.availableToRead();
-        freeBytes = s->ring.availableToWrite();
-        ringSizeBytes = s->ring.size();
+        ringFrames = static_cast<double>(buffered) / static_cast<double>(s->bytesPerFrame);
+        ringLatencyMs = (ringFrames * 1000.0) / static_cast<double>(s->sampleRate);
+        uint32_t hwPadding = s->lastHardwarePaddingFrames.load();
+        hardwareLatencyMs = (static_cast<double>(hwPadding) * 1000.0) / static_cast<double>(s->sampleRate);
     }
 
     Napi::Object res = Napi::Object::New(env);
@@ -2302,6 +2452,9 @@ static Napi::Value GetStats(const Napi::CallbackInfo &info)
     res.Set("bitDepth", Napi::Number::New(env, s->bitDepth));
     res.Set("bytesPerFrame", Napi::Number::New(env, s->bytesPerFrame));
     res.Set("ringDurationMs", Napi::Number::New(env, s->ringDurationMs));
+    res.Set("ringLatencyMs", Napi::Number::New(env, ringLatencyMs));
+    res.Set("hardwareLatencyMs", Napi::Number::New(env, hardwareLatencyMs));
+    res.Set("totalSystemLatencyMs", Napi::Number::New(env, ringLatencyMs + hardwareLatencyMs));
     res.Set("running", Napi::Boolean::New(env, s->running.load()));
     res.Set("paused", Napi::Boolean::New(env, s->paused.load()));
 
@@ -2418,6 +2571,7 @@ static Napi::Object InitAll(Napi::Env env, Napi::Object exports)
 {
     exports.Set("openOutput", Napi::Function::New(env, OpenOutput));
     exports.Set("write", Napi::Function::New(env, Write));
+    exports.Set("writeAsync", Napi::Function::New(env, WriteAsync));
     exports.Set("close", Napi::Function::New(env, Close));
     exports.Set("getDevices", Napi::Function::New(env, GetDevices));
     exports.Set("isSupported", Napi::Function::New(env, IsSupported));

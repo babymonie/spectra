@@ -1,0 +1,130 @@
+
+---
+
+# Spectra Source-Available License
+
+**Version 1.1 — January 2025**
+**Copyright © 2025 Aloysius (“babymonie”). All rights reserved.**
+
+## 1. Definitions
+
+**“Software”** means the Spectra application and all accompanying materials made available by the Author, including source code, compiled binaries, assets, documentation, build scripts, plugins, configuration files, and other contents of the repository.
+
+**“Author”** means Aloysius (“babymonie”), the copyright holder.
+
+**“User”** means any individual who accesses, views, downloads, clones, copies, compiles, modifies, or runs the Software.
+
+**“Personal Use”** means use by an individual on hardware they own or control, for private, non-commercial purposes, not on behalf of a business, institution, government, or organization.
+
+**“Modify”** means to alter, patch, translate, adapt, or create derivative works of the Software (including private forks).
+
+**“Distribute”** means to provide, publish, share, sublicense, sell, transfer, or otherwise make the Software (or any portion of it) available to any third party, whether publicly or privately. Distribution includes, without limitation, posting to GitHub/GitLab, sharing zip files, sending binaries, providing container images, publishing patches that reconstruct substantial portions of the code, or shipping the Software as part of another product.
+
+**“Hosted Service / SaaS”** means making the Software available for use by others over a network (internet or otherwise), including “software-as-a-service,” “hosted app,” “web app,” “remote client,” “streaming/remote desktop offering,” managed service, or any arrangement where third parties can access or interact with the Software or its functionality remotely.
+
+---
+
+## 2. Grant of Permission (Personal Use Only)
+
+Subject to full compliance with this License, the Author grants the User a limited, non-exclusive, non-transferable, revocable license for **Personal Use** to:
+
+**2.1 View & Copy**
+Access, download, clone, and make reasonable copies of the Software for personal backup and development on the User’s own devices.
+
+**2.2 Study**
+Analyze the Software’s architecture, design, implementation, and techniques for learning purposes.
+
+**2.3 Execute**
+Compile and run the Software on the User’s own devices for Personal Use.
+
+**2.4 Private Modifications**
+Modify the Software **privately** (including maintaining a private fork), solely for Personal Use, provided that such modified versions are **not Distributed** and are **not used to provide a Hosted Service / SaaS**.
+
+No rights are granted except as expressly stated in this Section 2.
+
+---
+
+## 3. Restrictions (What You May Not Do)
+
+The User may not, under any circumstances:
+
+**3.1 No Distribution**
+Distribute the Software or any portion of it, whether modified or unmodified, including source code, binaries, assets, documentation, screenshots that reveal proprietary implementation details, or other repository content, except as permitted by applicable law.
+
+**3.2 No Public Forks or Mirrors**
+Create or publish public forks, mirrors, or derivative repositories.
+
+**3.3 No Hosted Service / SaaS**
+Use the Software (or any modified version) to provide a Hosted Service / SaaS, or otherwise make it accessible to others over a network.
+
+**3.4 No Commercial / Organizational Use**
+Use the Software for business, institutional, governmental, or organizational purposes, whether for profit or not-for-profit, including internal corporate use, client work, paid services, or operational deployment.
+
+**3.5 No Sublicensing**
+Sublicense, grant, or convey any rights in the Software to any third party.
+
+---
+
+## 4. Allowed Local Remote Control (Limited Exception)
+
+Spectra may include features that allow **local remote control** (e.g., a controller UI on the User’s own phone/tablet/PC). This is permitted only if:
+
+* access is limited to the User (and optionally their household members) on devices they control, and
+* it is not offered to the public or to any organization, and
+* it is not hosted as a service.
+
+If in doubt, it is considered a prohibited Hosted Service / SaaS.
+
+---
+
+## 5. Intellectual Property
+
+All right, title, and interest in and to the Software remain with the Author.
+This Software is **source-available** and **not open-source**.
+
+No rights are granted under trademark, service mark, trade name, or branding of the Author.
+No patent rights are granted (if any exist).
+
+---
+
+## 6. Termination
+
+Any violation of this License immediately terminates all rights granted under Section 2.
+
+Upon termination, the User must:
+
+1. cease all use of the Software, and
+2. delete all copies of the Software (including modified versions) in their possession or control.
+
+---
+
+## 7. No Warranty
+
+THE SOFTWARE IS PROVIDED “AS IS”, WITHOUT WARRANTY OF ANY KIND.
+THE AUTHOR DISCLAIMS ALL LIABILITY FOR ANY DAMAGES OR LOSSES ARISING FROM USE OF THE SOFTWARE, INCLUDING BUT NOT LIMITED TO LOSS OF DATA, SECURITY ISSUES, HARDWARE/SOFTWARE MALFUNCTION, OR DEFECTIVE OUTPUT.
+
+---
+
+## 8. No Support Obligation
+
+The Author has no obligation to provide updates, maintenance, bug fixes, compatibility, or technical support. The Software may be changed, unpublished, or discontinued at any time.
+
+---
+
+## 9. Governing Law
+
+This License is governed by the laws of the Republic of Singapore, excluding its conflict-of-law rules.
+Any dispute, claim, or controversy arising out of or relating to this License or the Software shall be subject to the exclusive jurisdiction of the courts of Singapore.
+---
+
+## 10. Entire Agreement
+
+This License constitutes the entire agreement between the User and the Author regarding the Software and supersedes any prior communications.
+
+---
+
+## 11. Acceptance
+
+By accessing, viewing, downloading, cloning, copying, compiling, modifying, or running the Software, the User agrees to be bound by this License. If the User does not agree, they must not access or use the Software.
+
+---

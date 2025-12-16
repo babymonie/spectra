@@ -1,6 +1,3 @@
-// audioEngine.js (ESM, no Speaker/portaudio)
-// Native PCM pipeline: FFmpeg -> exclusive_audio addon (WASAPI/CoreAudio)
-
 import { spawn, spawnSync } from 'node:child_process';
 import { Transform } from 'stream';
 import ffmpegPath from 'ffmpeg-static';
@@ -16,7 +13,6 @@ const resolvedFfmpegPath = (() => {
   try {
     if (!ffmpegPath) {
       console.error('[audioEngine] ffmpeg-static did not provide a binary path');
-      // Try to fall back to system ffmpeg
       const probe = spawnSync('ffmpeg', ['-version'], { stdio: 'ignore' });
       if (probe.status === 0) {
         console.log('[audioEngine] Falling back to system FFmpeg from PATH');
@@ -25,18 +21,15 @@ const resolvedFfmpegPath = (() => {
       return null;
     }
     let p = ffmpegPath;
-    // If running from app.asar, use the unpacked path instead
     if (p.includes('app.asar')) {
       p = p.replace('app.asar', 'app.asar.unpacked');
     }
 
-    // If the bundled/static path exists, use it
     if (existsSync(p)) {
       console.log('[audioEngine] Using bundled FFmpeg binary at:', p);
       return p;
     }
 
-    // Check for a locally installed FFmpeg from ensure-deps at ./bin/ffmpeg(.exe)
     const ffmpegName = process.platform === 'win32' ? 'ffmpeg.exe' : 'ffmpeg';
     const baseDir = process.resourcesPath || process.cwd();
     const localBinPath = path.join(baseDir, 'bin', ffmpegName);
@@ -45,7 +38,7 @@ const resolvedFfmpegPath = (() => {
       return localBinPath;
     }
 
-    console.warn('[audioEngine] Bundled FFmpeg not found at expected path, probing system FFmpeg...');
+    console.warn('[audioEngine] Bundled FFmpeg not found, probing system FFmpeg...');
     const probe = spawnSync('ffmpeg', ['-version'], { stdio: 'ignore' });
     if (probe.status === 0) {
       console.log('[audioEngine] Using system FFmpeg from PATH');
@@ -60,7 +53,6 @@ const resolvedFfmpegPath = (() => {
   }
 })();
 
-// Load the JS wrapper around your native addon
 try {
   const mod = await import('./exclusiveAudio.js');
   exclusiveAudio = mod.default || mod;
@@ -69,7 +61,6 @@ try {
   console.warn('[audioEngine] failed to load exclusiveAudio addon:', exclusiveLoadError);
 }
 
-// Current playback state (one stream at a time)
 let ffmpegProc = null;
 let outputStream = null;
 let currentFile = null;
@@ -80,11 +71,10 @@ let lastOnError = null;
 let lastOptions = {};
 let currentStartTime = 0;
 
-// EQ State
 let eqState = {
   enabled: false,
   preset: 'flat',
-  bands: [0, 0, 0, 0, 0, 0, 0, 0, 0, 0] // 32, 64, 125, 250, 500, 1k, 2k, 4k, 8k, 16k
+  bands: [0, 0, 0, 0, 0, 0, 0, 0, 0, 0] 
 };
 
 function setEQ(state) {
@@ -96,8 +86,6 @@ function setEQ(state) {
   if (state.preset !== undefined) eqState.preset = state.preset;
   if (state.bands && Array.isArray(state.bands)) eqState.bands = [...state.bands];
 
-  // If playback is active and EQ changed, we need to restart to apply FFmpeg filters
-  // Only restart if enabled changed OR (enabled is true AND bands changed)
   const bandsChanged = JSON.stringify(oldBands) !== JSON.stringify(eqState.bands);
   const shouldRestart = (wasEnabled !== eqState.enabled) || (eqState.enabled && bandsChanged);
 
@@ -112,7 +100,6 @@ function getEQ() {
   return { ...eqState };
 }
 
-// Update runtime volume for the active gain stream (0-100)
 function setVolume(v) {
   const pct = Math.min(100, Math.max(0, Number.isFinite(v) ? Number(v) : 100));
   if (currentGainStream) {
@@ -120,28 +107,24 @@ function setVolume(v) {
     _updateLastOptionsVolume(pct);
     return true;
   }
-  // Even if no active gain stream, remember the volume for next playback
   _updateLastOptionsVolume(pct);
   return false;
 }
 
-// Ensure lastOptions.volume tracks runtime changes so subsequent operations
-// (seek which restarts playback) reuse the current volume instead of falling
-// back to default (100%).
 function _updateLastOptionsVolume(v) {
   try {
     const pct = Math.min(100, Math.max(0, Number.isFinite(v) ? Number(v) : 100));
-    lastOptions = { ...(lastOptions || {}), volume: pct };
-  } catch {
-    // ignore
+    // Check if lastOptions is a valid object before spreading
+    if (typeof lastOptions === 'object' && lastOptions !== null) {
+        lastOptions = { ...lastOptions, volume: pct };
+    } else {
+        lastOptions = { volume: pct };
+    }
+  } catch (e) {
+    console.warn('[audioEngine] error updating volume state:', e);
   }
 }
 
-/**
- * Try to open an exclusive/shared stream using your native addon.
- * We try the requested mode first, then the opposite mode as a fallback.
- * If both fail, we throw – main.js will then fall back to the renderer <audio>.
- */
 function createExclusiveStream({ sampleRate, channels, bitDepth, deviceId, mode, bufferMs, bitPerfect, strictBitPerfect }) {
   if (!exclusiveAudio || typeof exclusiveAudio.createExclusiveStream !== 'function') {
     throw new Error('exclusiveAudio addon not available');
@@ -171,45 +154,25 @@ function createExclusiveStream({ sampleRate, channels, bitDepth, deviceId, mode,
     return tryMode(firstMode);
   } catch (e1) {
     lastErr = e1;
-    console.warn(
-      `[audioEngine] ${firstMode} mode failed:`,
-      e1?.message ?? e1
-    );
-    try {
-      // If the addon exposes device enumeration, log available ids to help debug invalid deviceId
-      if (exclusiveAudio && typeof exclusiveAudio.getDevices === 'function') {
-        const devs = exclusiveAudio.getDevices();
-        console.log('[audioEngine] native devices:', Array.isArray(devs) ? devs.map(d => d.id || d.name) : devs);
-      }
-    } catch (ee) {}
+    console.warn(`[audioEngine] ${firstMode} mode failed:`, e1?.message ?? e1);
   }
 
   try {
     return tryMode(secondMode);
   } catch (e2) {
-    console.warn(
-      `[audioEngine] ${secondMode} mode also failed:`,
-      e2?.message ?? e2
-    );
+    console.warn(`[audioEngine] ${secondMode} mode also failed:`, e2?.message ?? e2);
     lastErr = e2;
   }
 
-  // Propagate to caller – main.js will fall back to renderer.
   const err = new Error(
     'Failed to open native audio output: ' + (lastErr?.message ?? String(lastErr))
   );
   throw err;
 }
 
-/**
- * Start playback using native engine.
- * If anything fails, we throw so main.js can fall back to renderer.
- */
 async function playFile(filePath, onEnd, onError, options = {}) {
-  // If the same file is already playing and we are asked to start at ~0 without restart, skip to avoid stream churn
   try {
     const startAt = Number(options?.startTime ?? 0);
-    // For object storage, compare by track path (object-storage:// URI) not presigned URL
     const trackPath = options?.track?.path;
     const currentTrackPath = lastOptions?.track?.path;
     const sameByTrack = trackPath && currentTrackPath && trackPath === currentTrackPath;
@@ -221,7 +184,6 @@ async function playFile(filePath, onEnd, onError, options = {}) {
     }
   } catch {}
 
-  // Clean up any previous playback
   stop();
   try {
     console.log('[audioEngine] playFile called for', filePath);
@@ -234,7 +196,6 @@ async function playFile(filePath, onEnd, onError, options = {}) {
   lastOptions = options;
   isPaused = false;
 
-  // Probe basic audio parameters
   let meta;
   try {
     meta = await parseFile(filePath);
@@ -242,22 +203,25 @@ async function playFile(filePath, onEnd, onError, options = {}) {
     meta = {};
   }
   const fmt = meta?.format || {};
-  // Allow overriding sample rate via options, otherwise use file's rate, or default to 44100
   const sampleRate = options.sampleRate || fmt.sampleRate || 44100;
   const channels = fmt.numberOfChannels || 2;
-  const bitDepth = 16; // we ask FFmpeg for s16le
+  const bitDepth = 16; 
 
-  // Open native output (may throw → handled by main.js)
-  outputStream = createExclusiveStream({
-    sampleRate,
-    channels,
-    bitDepth,
-    deviceId: options.deviceId,
-    mode: options.mode, // 'exclusive' | 'shared' (renderer sends this)
-    bufferMs: options.bufferMs || 250,
-    bitPerfect: !!options.bitPerfect,
-    strictBitPerfect: !!options.strictBitPerfect,
-  });
+  try {
+    outputStream = createExclusiveStream({
+      sampleRate,
+      channels,
+      bitDepth,
+      deviceId: options.deviceId,
+      mode: options.mode,
+      bufferMs: options.bufferMs || 250,
+      bitPerfect: !!options.bitPerfect,
+      strictBitPerfect: !!options.strictBitPerfect,
+    });
+  } catch (err) {
+    if (onError) onError(err);
+    return;
+  }
 
   const actualSampleRate = outputStream.actualSampleRate || sampleRate;
   const actualChannels = outputStream.actualChannels || channels;
@@ -283,11 +247,16 @@ async function playFile(filePath, onEnd, onError, options = {}) {
 
   const isNetworkSource = typeof filePath === 'string' && /^https?:\/\//i.test(filePath);
   if (isNetworkSource) {
-    // Robust streaming options: auto-reconnect when HTTP stream drops
+    // UPDATED: More robust network options for MinIO/S3
     args.push(
       '-reconnect', '1',
       '-reconnect_streamed', '1',
-      '-reconnect_delay_max', '5'
+      '-reconnect_on_network_error', '1',
+      '-reconnect_on_http_error', '4xx,5xx',
+      '-reconnect_delay_max', '10',
+      '-rw_timeout', '15000000', // 15 seconds timeout
+      '-probesize', '10000000',  // More probe data for slow starts
+      '-analyzeduration', '20000000'
     );
   }
 
@@ -300,9 +269,7 @@ async function playFile(filePath, onEnd, onError, options = {}) {
     '-vn'
   );
 
-  // Apply EQ if enabled
   if (eqState.enabled) {
-    // Bands: 32, 64, 125, 250, 500, 1k, 2k, 4k, 8k, 16k
     const freqs = [32, 64, 125, 250, 500, 1000, 2000, 4000, 8000, 16000];
     let entries = '';
     for (let i = 0; i < freqs.length; i++) {
@@ -310,7 +277,6 @@ async function playFile(filePath, onEnd, onError, options = {}) {
       if (i > 0) entries += ';';
       entries += `entry(${freqs[i]},${gain})`;
     }
-    // Use firequalizer for high quality EQ
     args.push('-af', `firequalizer=gain_entry='${entries}'`);
   }
 
@@ -322,7 +288,6 @@ async function playFile(filePath, onEnd, onError, options = {}) {
     'pipe:1'
   );
 
-  // Spawn FFmpeg to decode to raw PCM s16le
   if (!resolvedFfmpegPath) {
     const err = new Error('FFmpeg binary path is not available');
     console.error('[audioEngine] Cannot start FFmpeg:', err.message);
@@ -334,7 +299,13 @@ async function playFile(filePath, onEnd, onError, options = {}) {
 
   if (ffmpegProc.stderr) {
     ffmpegProc.stderr.on('data', (data) => {
-      console.error('[audioEngine] FFmpeg stderr:', data.toString());
+      // Ignore some non-critical warnings
+      const msg = data.toString();
+      if (msg.includes('Stream ends prematurely')) {
+         console.warn('[audioEngine] FFmpeg warning:', msg);
+      } else {
+         console.error('[audioEngine] FFmpeg stderr:', msg);
+      }
     });
   }
 
@@ -347,7 +318,7 @@ async function playFile(filePath, onEnd, onError, options = {}) {
   ffmpegProc.on('close', (code) => {
     console.log('[audioEngine] FFmpeg exited with code:', code);
     const exitErr =
-      code && code !== 0
+      code && code !== 0 && code !== 255 // 255 is often SIGTERM/Kill
         ? new Error('FFmpeg exited with code ' + code)
         : null;
 
@@ -361,8 +332,6 @@ async function playFile(filePath, onEnd, onError, options = {}) {
     }
   });
 
-  // If the caller provided a volume option, apply a simple software gain stage
-  // before piping PCM to the native output. This supports common formats: s16le, f32le, s24le.
   class GainTransform extends Transform {
     constructor(format, channels, volumePercent) {
       super();
@@ -373,7 +342,7 @@ async function playFile(filePath, onEnd, onError, options = {}) {
 
     _transform(chunk, encoding, callback) {
       try {
-        if (this.gain === 1.0) {
+        if (this.gain >= 0.99 && this.gain <= 1.01) {
           this.push(chunk);
           return callback();
         }
@@ -392,7 +361,6 @@ async function playFile(filePath, onEnd, onError, options = {}) {
         }
 
         if (this.format === 'f32le') {
-          // Use DataView to read/write floats from the Buffer backing store
           const view = new DataView(chunk.buffer, chunk.byteOffset, chunk.length);
           const out = Buffer.allocUnsafe(chunk.length);
           for (let i = 0; i + 3 < chunk.length; i += 4) {
@@ -410,7 +378,7 @@ async function playFile(filePath, onEnd, onError, options = {}) {
           const out = Buffer.allocUnsafe(chunk.length);
           for (let i = 0; i + 2 < chunk.length; i += 3) {
             let s = chunk[i] | (chunk[i + 1] << 8) | (chunk[i + 2] << 16);
-            if (s & 0x800000) s |= 0xff000000; // sign extend
+            if (s & 0x800000) s |= 0xff000000;
             let v = Math.round(s * this.gain);
             if (v > 0x7fffff) v = 0x7fffff;
             else if (v < -0x800000) v = -0x800000;
@@ -422,7 +390,6 @@ async function playFile(filePath, onEnd, onError, options = {}) {
           return callback();
         }
 
-        // Unknown format — pass through
         this.push(chunk);
         return callback();
       } catch (err) {
@@ -433,8 +400,11 @@ async function playFile(filePath, onEnd, onError, options = {}) {
 
   if (ffmpegProc.stdout) {
     ffmpegProc.stdout.on('error', (err) => {
-      console.error('[audioEngine] stdout error:', err);
-      if (onError) onError(err);
+      // Avoid spamming logs if error is just EPIPE from closing
+      if (err.code !== 'EPIPE') {
+          console.error('[audioEngine] stdout error:', err);
+          if (onError) onError(err);
+      }
       stop();
     });
 
@@ -457,20 +427,17 @@ function stop() {
   currentStartTime = 0;
   if (ffmpegProc) {
     try {
-      // SIGTERM is more portable on Windows than SIGKILL
       ffmpegProc.kill('SIGTERM');
-    } catch {
-      // ignore
-    }
+    } catch {}
     ffmpegProc = null;
   }
 
   if (outputStream) {
     try {
       outputStream.end();
-    } catch {
-      // ignore
-    }
+      // Force destroy to ensure native handle closes
+      if (typeof outputStream.destroy === 'function') outputStream.destroy();
+    } catch {}
     outputStream = null;
   }
 
@@ -480,17 +447,10 @@ function stop() {
 
 function pause() {
   console.log('[audioEngine] pause called');
-  if (!ffmpegProc || isPaused) {
-      console.log('[audioEngine] pause ignored: proc=', !!ffmpegProc, 'paused=', isPaused);
-      return;
-  }
+  if (!ffmpegProc || isPaused) return;
   try {
-    if (ffmpegProc.stdout) {
-        console.log('[audioEngine] pausing ffmpeg stdout');
-        ffmpegProc.stdout.pause();
-    }
+    if (ffmpegProc.stdout) ffmpegProc.stdout.pause();
     if (outputStream && typeof outputStream.pause === 'function') {
-        console.log('[audioEngine] pausing native output');
         outputStream.pause();
     }
   } catch (e) {
@@ -501,17 +461,10 @@ function pause() {
 
 function resume() {
   console.log('[audioEngine] resume called');
-  if (!ffmpegProc || !isPaused) {
-      console.log('[audioEngine] resume ignored: proc=', !!ffmpegProc, 'paused=', isPaused);
-      return;
-  }
+  if (!ffmpegProc || !isPaused) return;
   try {
-    if (ffmpegProc.stdout) {
-        console.log('[audioEngine] resuming ffmpeg stdout');
-        ffmpegProc.stdout.resume();
-    }
+    if (ffmpegProc.stdout) ffmpegProc.stdout.resume();
     if (outputStream && typeof outputStream.resume === 'function') {
-        console.log('[audioEngine] resuming native output');
         outputStream.resume();
     }
   } catch (e) {
@@ -520,7 +473,6 @@ function resume() {
   isPaused = false;
 }
 
-// For renderer diagnostics (“Engine: native/renderer …”)
 function getStatus() {
   return {
     exclusiveAvailable: !!exclusiveAudio,
@@ -533,7 +485,6 @@ function getStatus() {
   };
 }
 
-// Device enumeration comes straight from your native addon
 function getDevices() {
   if (!exclusiveAudio || typeof exclusiveAudio.getDevices !== 'function') {
     return [];

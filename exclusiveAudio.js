@@ -12,7 +12,7 @@ let native = null;
 try {
   native = bindings('exclusive_audio'); // typical dev load: build/Release/exclusive_audio.node
 } catch (e) {
-  // Fallback loader for packaged apps
+  // Fallback loader for packaged apps and prebuilt bin folders
   try {
     const require = createRequire(import.meta.url);
     const resourcesPath = process.resourcesPath || path.join(process.cwd(), 'resources');
@@ -20,11 +20,12 @@ try {
       path.join(resourcesPath, 'app.asar.unpacked', 'build', 'Release', 'exclusive_audio.node'),
       path.join(resourcesPath, 'app.asar.unpacked', 'build', 'default', 'exclusive_audio.node'),
       path.join(resourcesPath, 'app.asar.unpacked', 'bin', 'spectra.node'),
-      // Also allow for nested platform-specific prebuilt folders under bin/
       path.join(resourcesPath, 'app.asar.unpacked', 'bin'),
+      path.join(process.cwd(), 'bin'),
+      path.join(process.cwd(), 'build', 'Release', 'exclusive_audio.node'),
     ];
 
-    // If bin is a directory, try to find any .node inside it (prebuilt per-platform)
+    // Expand candidates by searching any .node under bin directories
     const tryCandidates = [];
     for (const c of candidates) tryCandidates.push(c);
     const binDir = path.join(resourcesPath, 'app.asar.unpacked', 'bin');
@@ -39,7 +40,6 @@ try {
       try { walk(binDir); } catch (_) {}
     }
 
-    // Try each candidate until one loads
     for (const cand of tryCandidates) {
       try {
         if (fs.existsSync(cand)) {
@@ -53,7 +53,7 @@ try {
     }
   } catch (err) {
     // final fallback: leave native null and allow consumer to handle unsupported platform
-    console.warn('[exclusiveAudio] native addon load failed:', (err && err.message) || e && e.message);
+    console.warn('[exclusiveAudio] native addon load failed:', (err && err.message) || (e && e.message));
   }
 }
 
@@ -70,7 +70,7 @@ if (!native) {
 
 class ExclusiveStream extends Writable {
   constructor(handleOrOptions) {
-    super({ highWaterMark: 0 });
+    super({ highWaterMark: 0 }); // We handle backpressure manually via native.write
     this._handle = 0;
     this._closed = false;
     this._pendingWrites = 0;
@@ -119,33 +119,37 @@ class ExclusiveStream extends Writable {
   }
 
   _write(chunk, encoding, callback) {
-    // console.log('[ExclusiveStream] _write chunk len:', chunk.length);
     if (this._closed) return callback();
 
     let offset = 0;
 
     const tryWrite = () => {
+      // Vital check: if stream was closed while waiting for setTimeout, abort immediately
       if (this._closed) return callback();
+
       try {
-        // native.write returns number of bytes written, or -1 on error
         const toWrite = chunk.subarray(offset);
+        // Returns number of bytes written, or -1 on error (e.g. device lost)
         const written = native.write(this.handle, toWrite);
         
         if (written < 0) {
-           return callback(new Error('exclusive audio write failed'));
+           this._closeNative();
+           return callback(new Error('exclusive audio write failed (device lost?)'));
         }
 
         offset += written;
         this.totalBytesWritten += written;
+        
         if (offset >= chunk.length) {
           callback();
         } else {
-          // Buffer full, retry shortly
-          // console.log('[ExclusiveStream] buffer full, retrying...');
+          // Buffer full, retry shortly. 5ms is aggressive but okay for low latency.
           setTimeout(tryWrite, 5);
         }
       } catch (err) {
         console.error('[ExclusiveStream] write error:', err);
+        // If native call throws, assume fatal error
+        this._closeNative();
         callback(err);
       }
     };
@@ -167,14 +171,13 @@ class ExclusiveStream extends Writable {
   }
 
   _closeNative() {
-      if (!this._closed) {
-      try {
-        native.close(this.handle);
-      } catch (_) {
-        // ignore
-      }
-      this._closed = true;
+    if (this._closed) return;
+    try {
+      if (this.handle) native.close(this.handle);
+    } catch (_) {
+      // ignore
     }
+    this._closed = true;
   }
 
   pause() {
