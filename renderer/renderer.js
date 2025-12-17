@@ -1708,7 +1708,10 @@ async function renderAlbums({ data, forceReload = false } = {}) {
         currentPlaylistTracks = [];
         setLibraryContext('album', { name: albumNameRaw, artist: artistNameRaw });
 
-        const currentQuery = searchInputEl ? searchInputEl.value : '';
+        // When opening an album, ignore any existing search input so the full
+        // album's tracks are shown (previous searches could unintentionally
+        // filter out tracks). Clear the query passed to the search handler.
+        const currentQuery = '';
         switchView('library', true);
         await handleSearchInput(currentQuery);
       };
