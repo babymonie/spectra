@@ -63,6 +63,17 @@
 #include <fcntl.h>
 #endif
 
+// Provide a lightweight debug macro on non-Windows platforms
+#ifndef DBG
+#include <cstdio>
+#define DBG(msg)                          \
+    do                                    \
+    {                                     \
+        fprintf(stderr, "[native] %s\n", msg); \
+        fflush(stderr);                    \
+    } while (0)
+#endif
+
 struct OutputStreamState;
 
 static std::map<uint32_t, OutputStreamState *> g_streams;
