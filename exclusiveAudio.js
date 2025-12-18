@@ -118,45 +118,33 @@ class ExclusiveStream extends Writable {
     return this.totalBytesWritten / bytesPerSecond;
   }
 
-  _write(chunk, encoding, callback) {
+_write(chunk, encoding, callback) {
     if (this._closed) return callback();
 
-    let offset = 0;
+    // Use the native async worker which runs on a libuv thread.
+    // This avoids the 'setTimeout' loop which gets throttled when minimized.
+    native.writeAsync(this.handle, chunk, (err, written) => {
+      if (this._closed) return callback(); // Check if stream closed during async op
 
-    const tryWrite = () => {
-      // Vital check: if stream was closed while waiting for setTimeout, abort immediately
-      if (this._closed) return callback();
-
-      try {
-        const toWrite = chunk.subarray(offset);
-        // Returns number of bytes written, or -1 on error (e.g. device lost)
-        const written = native.write(this.handle, toWrite);
-        
-        if (written < 0) {
-           this._closeNative();
-           return callback(new Error('exclusive audio write failed (device lost?)'));
-        }
-
-        offset += written;
-        this.totalBytesWritten += written;
-        
-        if (offset >= chunk.length) {
-          callback();
-        } else {
-          // Buffer full, retry shortly. 5ms is aggressive but okay for low latency.
-          setTimeout(tryWrite, 5);
-        }
-      } catch (err) {
-        console.error('[ExclusiveStream] write error:', err);
-        // If native call throws, assume fatal error
+      if (err) {
+        console.error('[ExclusiveStream] writeAsync error:', err);
         this._closeNative();
-        callback(err);
+        return callback(new Error(err));
       }
-    };
 
-    tryWrite();
+      if (written < 0) {
+        console.error('[ExclusiveStream] writeAsync failed: device lost');
+        this._closeNative();
+        return callback(new Error("exclusive audio write failed (device lost?)"));
+      }
+
+      this.totalBytesWritten += written;
+      
+      // Successfully written (or blocked until written). 
+      // Call the callback to request the next chunk from the stream.
+      callback();
+    }, true); // 'true' for blocking: ensures backpressure is handled natively
   }
-
   _final(callback) {
     console.log('[ExclusiveStream] _final called');
     if (this._closed) return callback();

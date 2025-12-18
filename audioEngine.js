@@ -70,6 +70,9 @@ let lastOnEnd = null;
 let lastOnError = null;
 let lastOptions = {};
 let currentStartTime = 0;
+let silenceInterval = null;
+let silenceChunk = null;
+let outputFormatInfo = { sampleRate: 44100, channels: 2, bitDepth: 16 };
 
 let eqState = {
   enabled: false,
@@ -226,6 +229,20 @@ async function playFile(filePath, onEnd, onError, options = {}) {
   const actualSampleRate = outputStream.actualSampleRate || sampleRate;
   const actualChannels = outputStream.actualChannels || channels;
   const actualBitDepth = outputStream.actualBitDepth || bitDepth;
+
+  // Remember format info for pause/resume silence filler
+  outputFormatInfo = { sampleRate: actualSampleRate, channels: actualChannels, bitDepth: actualBitDepth };
+
+  // Prepare a silence chunk (~20ms) matching the output format to avoid underruns when paused
+  try {
+    const bytesPerSample = Math.max(1, Math.floor(actualBitDepth / 8));
+    const bytesPerFrame = bytesPerSample * actualChannels;
+    const chunkFrames = Math.max(1, Math.floor(actualSampleRate * 0.02)); // 20ms
+    const chunkBytes = chunkFrames * bytesPerFrame;
+    silenceChunk = Buffer.alloc(chunkBytes, 0);
+  } catch (e) {
+    silenceChunk = null;
+  }
 
   let ffmpegFormat = 's16le';
   let ffmpegCodec = 'pcm_s16le';
@@ -425,6 +442,11 @@ async function playFile(filePath, onEnd, onError, options = {}) {
 
 function stop() {
   currentStartTime = 0;
+  // stop any silence filler
+  if (silenceInterval) {
+    clearInterval(silenceInterval);
+    silenceInterval = null;
+  }
   if (ffmpegProc) {
     try {
       ffmpegProc.kill('SIGTERM');
@@ -450,8 +472,23 @@ function pause() {
   if (!ffmpegProc || isPaused) return;
   try {
     if (ffmpegProc.stdout) ffmpegProc.stdout.pause();
-    if (outputStream && typeof outputStream.pause === 'function') {
-        outputStream.pause();
+    // Instead of pausing the native output (which can cause underruns/hissing),
+    // keep the native stream open and write silence periodically to maintain
+    // a healthy buffer. Start a small interval that writes precomputed silence.
+    if (silenceChunk && outputStream && typeof outputStream.write === 'function') {
+      if (!silenceInterval) {
+        silenceInterval = setInterval(() => {
+          try {
+            // Best-effort write; ignore backpressure and errors
+            outputStream.write(silenceChunk);
+          } catch (e) {
+            // ignore
+          }
+        }, 20);
+      }
+    } else {
+      // Fallback: if we cannot write silence, attempt to pause output stream
+      if (outputStream && typeof outputStream.pause === 'function') outputStream.pause();
     }
   } catch (e) {
     console.error('[audioEngine] pause error:', e);
@@ -464,9 +501,12 @@ function resume() {
   if (!ffmpegProc || !isPaused) return;
   try {
     if (ffmpegProc.stdout) ffmpegProc.stdout.resume();
-    if (outputStream && typeof outputStream.resume === 'function') {
-        outputStream.resume();
+    // Stop silence filler and let the real audio flow resume
+    if (silenceInterval) {
+      clearInterval(silenceInterval);
+      silenceInterval = null;
     }
+    if (outputStream && typeof outputStream.resume === 'function') outputStream.resume();
   } catch (e) {
     console.error('[audioEngine] resume error:', e);
   }

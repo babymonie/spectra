@@ -403,71 +403,58 @@ static void WasapiRenderThread(OutputStreamState *s)
     if (!s || !s->audioClient || !s->renderClient || !s->hEvent)
     {
         DBG("WasapiRenderThread: invalid state");
-        if (s) s->open.store(false); // Mark as closed on error
+        if (s) s->open.store(false);
         return;
     }
 
     const UINT32 frameBytes = s->bytesPerFrame;
     s->running.store(true);
 
-    // Try to register this thread with MMCSS using Pro Audio profile
+    // Register with MMCSS for high-priority audio processing
     HANDLE mmcssHandle = nullptr;
     DWORD mmcssTaskIndex = 0;
     mmcssHandle = AvSetMmThreadCharacteristicsA("Pro Audio", &mmcssTaskIndex);
-    if (!mmcssHandle) {
-        DBG("WasapiRenderThread: AvSetMmThreadCharacteristicsA failed (continuing)");
-    } else {
-        DBG("WasapiRenderThread: registered with MMCSS (Pro Audio)");
-    }
-
+    
     HRESULT hr = s->audioClient->Start();
     if (FAILED(hr))
     {
         SetLastErrorHr("IAudioClient::Start failed", hr);
-        DBG("WasapiRenderThread: Start failed");
         s->running.store(false);
-        s->open.store(false); // Mark closed
+        s->open.store(false); 
+        if (mmcssHandle) AvRevertMmThreadCharacteristics(mmcssHandle);
         return;
     }
 
-    DBG("WasapiRenderThread: loop running");
     std::vector<uint8_t> temp;
 
-    while (s->running.load())
+    while (s->running.load() && s->open.load())
     {
-        DWORD waitRes = WaitForSingleObject(s->hEvent, 500); // 500ms timeout watchdog
-        if (waitRes == WAIT_TIMEOUT) {
-             // Watchdog: if we time out repeatedly, device might be stalled
-             continue; 
-        }
-        if (waitRes != WAIT_OBJECT_0)
-        {
-            continue;
+        // Wait for WASAPI to signal that it needs more data
+        DWORD waitRes = WaitForSingleObject(s->hEvent, 1000); 
+        
+        if (!s->running.load()) break;
+
+        if (waitRes != WAIT_OBJECT_0) {
+            if (waitRes == WAIT_TIMEOUT) continue; // Watchdog timeout, retry loop
+            break; // Fatal error
         }
 
         UINT32 padding = 0;
         hr = s->audioClient->GetCurrentPadding(&padding);
-        if (FAILED(hr))
-        {
-            // Device lost or invalidated (e.g. exclusive mode preempted)
-            SetLastErrorHr("GetCurrentPadding failed", hr);
-            DBG("WasapiRenderThread: Device invalidated or lost");
+        if (FAILED(hr)) {
+            DBG("WasapiRenderThread: Device lost during padding check");
             break; 
         }
 
-        // Track recent hardware padding for stats
         s->lastHardwarePaddingFrames.store(padding);
 
-        UINT32 framesToWrite =
-            (s->bufferFrames > padding) ? (s->bufferFrames - padding) : 0;
-        if (!framesToWrite)
-            continue;
+        UINT32 framesToWrite = (s->bufferFrames > padding) ? (s->bufferFrames - padding) : 0;
+        if (framesToWrite == 0) continue;
 
         BYTE *data = nullptr;
         hr = s->renderClient->GetBuffer(framesToWrite, &data);
-        if (FAILED(hr) || !data)
-        {
-            SetLastErrorHr("GetBuffer failed", hr);
+        if (FAILED(hr) || !data) {
+            DBG("WasapiRenderThread: GetBuffer failed");
             break;
         }
 
@@ -475,47 +462,48 @@ static void WasapiRenderThread(OutputStreamState *s)
 
         if (s->paused.load())
         {
+            // Fill with explicit silence when paused to prevent buzzing/hissing
             std::memset(data, 0, bytesRequested);
         }
         else
         {
             temp.resize(bytesRequested);
-            size_t bytesFromRing = 0;
+            size_t bytesRead = s->ring.read(temp.data(), bytesRequested);
+            
+            if (bytesRead > 0)
             {
-                // Lock-free read on audio/render thread (SPSC)
-                    bytesFromRing = s->ring.read(temp.data(), bytesRequested);
+                std::memcpy(data, temp.data(), bytesRead);
+                // If the ring buffer had less than requested, fill the remainder with silence
+                if (bytesRead < bytesRequested)
+                {
+                    std::memset(data + bytesRead, 0, bytesRequested - bytesRead);
+                }
             }
-            if (bytesFromRing > 0)
+            else
             {
-                std::memcpy(data, temp.data(), bytesFromRing);
-            }
-            if (bytesFromRing < bytesRequested)
-            {
-                std::memset(data + bytesFromRing, 0, bytesRequested - bytesFromRing);
+                // Ring buffer is empty (underrun)
+                std::memset(data, 0, bytesRequested);
             }
         }
 
+        // Release the buffer to the hardware
         hr = s->renderClient->ReleaseBuffer(framesToWrite, 0);
-        if (FAILED(hr))
-        {
-            SetLastErrorHr("ReleaseBuffer failed", hr);
+        if (FAILED(hr)) {
             DBG("WasapiRenderThread: ReleaseBuffer failed");
             break;
         }
 
+        // Notify blocking writers (writeAsync workers) that space is now available
         s->ringCv.notify_all();
     }
 
     DBG("WasapiRenderThread: stopping");
     s->audioClient->Stop();
     s->running.store(false);
-    s->open.store(false); // CRITICAL: Ensure JS knows the device is closed
-    s->ringCv.notify_all(); // Wake up any blocking writers
-    if (mmcssHandle) {
-        AvRevertMmThreadCharacteristics(mmcssHandle);
-    }
+    s->open.store(false); 
+    s->ringCv.notify_all(); 
+    if (mmcssHandle) AvRevertMmThreadCharacteristics(mmcssHandle);
 }
-
 static bool InitWasapi(OutputStreamState *s,
                        const std::string &deviceId,
                        bool exclusive,

@@ -275,90 +275,90 @@ export async function extractMetadata(filePath) {
 	};
 }
 
+// metadataLookup.js
+
 export async function extractMetadataFromBuffer(buf, sourceName = 'remote') {
-	let title = null;
-	let artist = null;
-	let album = null;
-	let albumArtist = null;
-	let duration = null;
-	let format = null;
-	let coverPath = null;
-	let bitrate = null;
-	let sampleRate = null;
-	let bitDepth = null;
-	let channels = null;
-	let lossless = null;
-	let codec = null;
+    let title = null;
+    let artist = null;
+    let album = null;
+    let albumArtist = null;
+    let duration = null;
+    let format = null;
+    let coverPath = null;
+    let bitrate = null;
+    let sampleRate = null;
+    let bitDepth = null;
+    let channels = null;
+    let lossless = null;
+    let codec = null;
 
-	try {
-		// music-metadata can parse from a Buffer. Content-type may be unknown for remote files.
-		const metadata = await mm.parseBuffer(buf, null, { duration: true });
-		const common = metadata.common || {};
-		const fmt = metadata.format || {};
+    try {
+        // FIX: Extract extension to provide a hint for .dff and other DSD formats
+        const ext = path.extname(sourceName.split('?')[0] || '').toLowerCase();
+        let mimeType = null;
 
-		title = common.title || sourceName;
-		artist = (common.artist || null) ?? null;
-		album = (common.album || null) ?? null;
-		albumArtist = (common.albumartist || common['album artist'] || artist || null) ?? null;
-		duration = typeof metadata.format.duration === 'number' ? metadata.format.duration : null;
-		bitrate = typeof fmt.bitrate === 'number' ? Math.round(fmt.bitrate) : null;
-		sampleRate = typeof fmt.sampleRate === 'number' ? Math.round(fmt.sampleRate) : null;
-		bitDepth = typeof fmt.bitsPerSample === 'number' ? Math.round(fmt.bitsPerSample) : null;
-		channels = typeof fmt.numberOfChannels === 'number' ? Math.round(fmt.numberOfChannels) : null;
-		lossless = typeof fmt.lossless === 'boolean' ? (fmt.lossless ? 1 : 0) : null;
-		codec = fmt.codec || fmt.container || format || null;
+        if (ext === '.dff') mimeType = 'audio/x-dff';
+        else if (ext === '.dsf') mimeType = 'audio/x-dsf';
+        else if (ext === '.flac') mimeType = 'audio/flac';
+        else if (ext === '.wav') mimeType = 'audio/wav';
+		else if (ext === '.mp3') mimeType = 'audio/mpeg';
+		else if (ext === '.m4a' || ext === '.mp4') mimeType = 'audio/mp4';
+		else if (ext === '.ogg' || ext === '.oga') mimeType = 'audio/ogg';
+		
 
-		if (Array.isArray(common.picture) && common.picture.length > 0) {
-			coverPath = await saveCoverForAlbum(common.picture[0], album, albumArtist || artist);
-		}
+        // Provide the mimeType hint as the second argument
+        const metadata = await mm.parseBuffer(buf, mimeType, { duration: true });
+        const common = metadata.common || {};
+        const fmt = metadata.format || {};
 
-		// If album is missing, try to recover album and cover using track lookup
-		if (!album && artist && title) {
-			const onlineData = await lookupTrackMetadata(artist, title);
-			if (onlineData) {
-				album = onlineData.album || album;
-				if (!coverPath && onlineData.coverUrl) {
-					try {
-						const imgRes = await fetch(onlineData.coverUrl, { timeout: 5000 }).catch(() => null);
-						if (imgRes?.ok) {
-							const buf = Buffer.from(await imgRes.arrayBuffer());
-							const picture = { data: buf, format: 'image/jpeg' };
-							coverPath = await saveCoverForAlbum(picture, album, albumArtist || artist);
-						}
-					} catch {
-						// Ignore cover download failure
-					}
-				}
-			}
-		}
+        title = common.title || sourceName;
+        artist = (common.artist || null) ?? null;
+        album = (common.album || null) ?? null;
+        albumArtist = (common.albumartist || common['album artist'] || artist || null) ?? null;
+        duration = typeof metadata.format.duration === 'number' ? metadata.format.duration : null;
+        bitrate = typeof fmt.bitrate === 'number' ? Math.round(fmt.bitrate) : null;
+        sampleRate = typeof fmt.sampleRate === 'number' ? Math.round(fmt.sampleRate) : null;
+        bitDepth = typeof fmt.bitsPerSample === 'number' ? Math.round(fmt.bitsPerSample) : null;
+        channels = typeof fmt.numberOfChannels === 'number' ? Math.round(fmt.numberOfChannels) : null;
+        lossless = typeof fmt.lossless === 'boolean' ? (fmt.lossless ? 1 : 0) : null;
+        codec = fmt.codec || fmt.container || format || null;
 
-		// Try online lookup if still no cover (iTunes primary, fallback to Cover Art Archive)
-		if (!coverPath && (album || artist)) {
-			coverPath = await lookupOnlineCover(albumArtist || artist, album);
-		}
+        if (Array.isArray(common.picture) && common.picture.length > 0) {
+            coverPath = await saveCoverForAlbum(common.picture[0], album, albumArtist || artist);
+        }
 
-		// format: try to read container from format.container or fallback
-		format = (metadata.format && metadata.format.container) || format;
-	} catch (err) {
-		console.error('extractMetadataFromBuffer failed for', sourceName, err);
-		title = title || sourceName;
-	}
+        // Online recovery if metadata is sparse
+        if (!album && artist && title) {
+            const onlineData = await lookupTrackMetadata(artist, title);
+            if (onlineData) {
+                album = onlineData.album || album;
+                if (!coverPath && onlineData.coverUrl) {
+                    try {
+                        const imgRes = await fetch(onlineData.coverUrl, { timeout: 5000 }).catch(() => null);
+                        if (imgRes?.ok) {
+                            const pictureBuf = Buffer.from(await imgRes.arrayBuffer());
+                            const picture = { data: pictureBuf, format: 'image/jpeg' };
+                            coverPath = await saveCoverForAlbum(picture, album, albumArtist || artist);
+                        }
+                    } catch { /* Ignore cover failure */ }
+                }
+            }
+        }
 
-	return {
-		title,
-		artist,
-		album,
-		albumArtist,
-		duration,
-		format,
-		coverPath,
-		bitrate,
-		sampleRate,
-		bitDepth,
-		channels,
-		lossless,
-		codec,
-	};
+        if (!coverPath && (album || artist)) {
+            coverPath = await lookupOnlineCover(albumArtist || artist, album);
+        }
+
+        format = (metadata.format && metadata.format.container) || format;
+    } catch (err) {
+        console.error('extractMetadataFromBuffer failed for', sourceName, err);
+        title = title || sourceName;
+    }
+
+    return {
+        title, artist, album, albumArtist, duration, format,
+        coverPath, bitrate, sampleRate, bitDepth, channels, lossless, codec,
+    };
 }
 
 // Extract embedded lyrics from audio files (ID3 USLT, Vorbis COMMENTS, etc.)

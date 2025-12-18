@@ -538,11 +538,14 @@ function createWindow() {
     width: 1200,
     height: 800,
     icon: winIcon,
+    
     webPreferences: {
       preload: path.join(__dirname, 'preload.js'),
       contextIsolation: true,
       nodeIntegration: false,
-      webSecurity: false // Allow loading local resources (cover art)
+      webSecurity: false, // Allow loading local resources (cover art)
+      backgroundThrottling: false,
+      spellcheck: false
     },
     backgroundColor: '#121212',
     // Platform-specific title bar: hiddenInset on macOS for draggable region, default on Windows, frameless on Linux
