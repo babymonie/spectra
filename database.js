@@ -449,6 +449,23 @@ export const getAlbumArtist = (album, artistFallback) => {
     return null;
   }
 };
+export const getAlbumTracks = (albumName) => {
+  if (!db) return [];
+  if (!albumName) return [];
+
+  return all(
+    `
+    SELECT *
+    FROM tracks
+    WHERE LOWER(TRIM(album)) = LOWER(TRIM(?))
+    ORDER BY
+      CASE WHEN title IS NULL OR title = '' THEN 1 ELSE 0 END,
+      title ASC,
+      path ASC
+    `,
+    [albumName]
+  );
+};
 
 export const getAlbums = () => {
   return all(`
@@ -529,6 +546,7 @@ const api = {
   getTrackById,
   updateTrackLyrics,
   updateTrackFields,
-};
+  getAlbumTracks,
+}
 
 export default api;

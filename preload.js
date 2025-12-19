@@ -1,6 +1,8 @@
 const { contextBridge, ipcRenderer } = require('electron');
 
 contextBridge.exposeInMainWorld('electron', {
+  getAlbumTracks: (albumName) => ipcRenderer.invoke('library:get-album-tracks', albumName),
+
   importFile: () => ipcRenderer.invoke('library:import-file'),
   importFolder: () => ipcRenderer.invoke('library:import-folder'),
   addFiles: (paths) => ipcRenderer.invoke('library:add-files', paths),

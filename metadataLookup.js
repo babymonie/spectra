@@ -37,46 +37,67 @@ async function findExistingAlbumCoverOnDisk(albumKey) {
 }
 
 async function saveCoverForAlbum(picture, album, albumArtist) {
-	if (!picture?.data) return null;
+  if (!picture?.data) return null;
 
-	await ensureDir(coversRoot);
+  await ensureDir(coversRoot);
 
-	const albumKey = `${album || ''}::${albumArtist || ''}`.trim() || null;
-	if (!albumKey) return null;
+  const albumKey = `${album || ''}::${albumArtist || ''}`.trim() || null;
+  if (!albumKey) return null;
 
-	const cached = inMemoryAlbumCoverCache.get(albumKey);
-	if (cached) {
-		return cached;
-	}
+  const cached = inMemoryAlbumCoverCache.get(albumKey);
+  if (cached) return cached;
 
-	const existing = await findExistingAlbumCoverOnDisk(albumKey).catch(() => null);
-	if (existing) {
-		inMemoryAlbumCoverCache.set(albumKey, existing);
-		return existing;
-	}
+  const existing = await findExistingAlbumCoverOnDisk(albumKey).catch(() => null);
+  if (existing) {
+    inMemoryAlbumCoverCache.set(albumKey, existing);
+    return existing;
+  }
 
-	const buf = Buffer.isBuffer(picture.data)
-		? picture.data
-		: Buffer.from(picture.data);
-	const hash = hashBuffer(buf).slice(0, 12);
-	const ext = picture.format?.startsWith('image/')
-		? `.${picture.format.split('/')[1]}`
-		: '.jpg';
+  const buf = Buffer.isBuffer(picture.data) ? picture.data : Buffer.from(picture.data);
+  const hash = hashBuffer(buf).slice(0, 12);
 
-	const safe = (albumKey || 'album').replaceAll(/[^a-z0-9]+/gi, '_').toLowerCase();
-	const fileName = `${safe.slice(0, 50)}_${hash}${ext}`;
-	const filePath = path.join(coversRoot, fileName);
+  const safe = albumKey.replaceAll(/[^a-z0-9]+/gi, '_').toLowerCase();
+  const prefix = safe.slice(0, 50) || 'album';
 
-	try {
-		await fsp.writeFile(filePath, buf);
-		inMemoryAlbumCoverCache.set(albumKey, filePath);
-		return filePath;
-	} catch (err) {
-		console.error('Failed to write cover file', filePath, err);
-		return null;
-	}
+  const isJpeg =
+    (picture.format && /image\/jpe?g/i.test(picture.format)) ||
+    (!picture.format && buf.length > 3 && buf[0] === 0xff && buf[1] === 0xd8); // JPEG SOI sniff
+
+  // Always prefer PNG output to avoid “weird JPEG” decoder warnings in Chromium
+  const outPath = path.join(coversRoot, `${prefix}_${hash}.png`);
+
+  try {
+    if (isJpeg && ffmpegPath) {
+      // Write temp input, re-encode to PNG via ffmpeg (no console spam)
+      const tmpIn = path.join(coversRoot, `${prefix}_${hash}.jpg`);
+      await fsp.writeFile(tmpIn, buf);
+
+      const r = spawnSync(
+        ffmpegPath,
+        ['-y', '-loglevel', 'error', '-i', tmpIn, '-frames:v', '1', '-c:v', 'png', outPath],
+        { stdio: 'ignore' }
+      );
+
+      await fsp.unlink(tmpIn).catch(() => {});
+      if (r.status === 0) {
+        inMemoryAlbumCoverCache.set(albumKey, outPath);
+        return outPath;
+      }
+      // If ffmpeg fails, fall through to raw write below.
+    }
+
+    // Non-JPEG (or ffmpeg unavailable): write as-is, but keep extension consistent with mime if you want
+    const ext = picture.format?.startsWith('image/') ? `.${picture.format.split('/')[1]}` : '.jpg';
+    const rawPath = path.join(coversRoot, `${prefix}_${hash}${ext}`);
+    await fsp.writeFile(rawPath, buf);
+
+    inMemoryAlbumCoverCache.set(albumKey, rawPath);
+    return rawPath;
+  } catch (err) {
+    console.error('Failed to write cover file', err);
+    return null;
+  }
 }
-
 async function findLocalCover(filePath) {
 	try {
 		const dir = path.dirname(filePath);

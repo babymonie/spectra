@@ -316,12 +316,34 @@ async function playFile(filePath, onEnd, onError, options = {}) {
 
   if (ffmpegProc.stderr) {
     ffmpegProc.stderr.on('data', (data) => {
-      // Ignore some non-critical warnings
-      const msg = data.toString();
-      if (msg.includes('Stream ends prematurely')) {
-         console.warn('[audioEngine] FFmpeg warning:', msg);
-      } else {
-         console.error('[audioEngine] FFmpeg stderr:', msg);
+      // Normalize and inspect stderr output. Many FFmpeg "warnings"
+      // (especially about embedded album art / JPEGs) are benign for
+      // audio-only pipelines and should not be logged as errors.
+      const raw = String(data || '');
+      const lines = raw.split(/\r?\n/).map(l => l.trim()).filter(Boolean);
+      for (const msg of lines) {
+        // Common messages to downgrade to warning (or ignore)
+        const benignPatterns = [
+          /Stream ends prematurely/i,
+          /Invalid SOS parameters for sequential JPEG/i,
+          /premature end of image/i,
+          /premature end of data/i,
+          /Skipping unsupported/i,
+        ];
+
+        const isBenign = benignPatterns.some((re) => re.test(msg));
+
+        if (isBenign) {
+          console.warn('[audioEngine] FFmpeg warning:', msg);
+          continue;
+        }
+
+        // Treat obvious error lines as errors, otherwise as warnings
+        if (/\berror\b/i.test(msg) || /failed/i.test(msg)) {
+          console.error('[audioEngine] FFmpeg stderr:', msg);
+        } else {
+          console.warn('[audioEngine] FFmpeg stderr:', msg);
+        }
       }
     });
   }

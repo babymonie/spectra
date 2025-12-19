@@ -595,6 +595,8 @@ const handlers = {
   'library:update-track': (id, data) => db.updateTrack(id, data),
   'library:get-albums': () => db.getAlbums(),
   'library:get-artists': () => db.getArtists(),
+  'library:get-album-tracks': (albumName) => db.getAlbumTracks(albumName),
+
   'library:get-cover-image': async (coverPath) => {
     if (!coverPath || coverPath.startsWith('http')) return coverPath;
     try {

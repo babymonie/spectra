@@ -68,6 +68,8 @@ let currentAlbumFilter = null;
 let currentArtistFilter = null;
 let currentPlaylistFilter = null;
 let currentPlaylistTracks = [];
+let currentAlbumTracks = [];
+let currentAlbumTracksKey = null;
 let currentView = 'library';
 let libraryContext = { type: 'library', name: null, artist: null };
 let albumsCache = [];
@@ -295,13 +297,6 @@ const computeLibraryBase = () => {
   if (currentAlbumFilter && currentAlbumFilter.album) {
     base = base.filter((t) => {
       const trackAlbum = normalizeForCompare(t.album || '');
-      const trackArtist = normalizeForCompare(t.artist || '');
-      const trackAlbumArtist = normalizeForCompare(t.album_artist || '');
-      if (currentAlbumFilter.artist) {
-        // Match album name AND (artist OR album_artist matches the filter)
-        return trackAlbum === currentAlbumFilter.album && 
-               (trackArtist === currentAlbumFilter.artist || trackAlbumArtist === currentAlbumFilter.artist);
-      }
       return trackAlbum === currentAlbumFilter.album;
     });
   } else if (currentArtistFilter) {
@@ -334,6 +329,8 @@ function setLibraryContext(type, details = {}) {
     currentArtistFilter = null;
     currentPlaylistFilter = null;
     currentPlaylistTracks = [];
+    currentAlbumTracks = [];
+    currentAlbumTracksKey = null;
   } else if (normalized === 'playlist') {
     currentAlbumFilter = null;
     currentArtistFilter = null;
@@ -464,6 +461,35 @@ async function ensurePlaylistsCache(force = false) {
   return playlistsCache;
 }
 
+async function ensureAlbumTracks(albumNameRaw, force = false) {
+  const key = normalizeForCompare(albumNameRaw || '');
+  if (!key) return [];
+
+  if (!force && currentAlbumTracksKey === key && Array.isArray(currentAlbumTracks)) {
+    return currentAlbumTracks;
+  }
+
+  try {
+    if (electron && typeof electron.getAlbumTracks === 'function') {
+      const list = await electron.getAlbumTracks(albumNameRaw);
+      currentAlbumTracks = Array.isArray(list) ? list : [];
+      currentAlbumTracksKey = key;
+      return currentAlbumTracks;
+    }
+  } catch (err) {
+    console.warn('getAlbumTracks failed for', albumNameRaw, err);
+  }
+
+  // Fallback: derive from cached library (album-only, no artist filter)
+  const fallback = Array.isArray(libraryCache)
+    ? libraryCache.filter((t) => normalizeForCompare(t.album || '') === key)
+    : [];
+
+  currentAlbumTracks = fallback;
+  currentAlbumTracksKey = key;
+  return fallback;
+}
+
 async function handleSearchInput(rawValue = '') {
   const query = (rawValue || '').toLowerCase().trim();
 
@@ -485,6 +511,14 @@ async function handleSearchInput(rawValue = '') {
     const source = await ensurePlaylistsCache();
     const filtered = query ? source.filter((playlist) => playlistMatchesQuery(playlist, query)) : source;
     await renderPlaylists({ data: filtered });
+    return;
+  }
+
+  // Album view loads tracks by album name (do NOT scope by artist).
+  if (libraryContext.type === 'album' && libraryContext.name) {
+    const base = await ensureAlbumTracks(libraryContext.name);
+    tracks = filterTracksByQuery(base, query);
+    renderLibrary();
     return;
   }
 
@@ -1303,6 +1337,19 @@ const renderLibrary = () => {
         const header = document.createElement('div');
         header.className = 'album-header';
 
+
+        const artistMeta = (() => {
+          const set = new Set();
+          for (const t of (Array.isArray(tracks) ? tracks : [])) {
+            const a = (t?.album_artist || t?.artist || '').toString().trim();
+            if (a) set.add(a);
+            if (set.size > 1) break;
+          }
+          if (set.size > 1) return 'Various Artists';
+          if (set.size === 1) return Array.from(set)[0];
+          return (libraryContext.artist || '').toString();
+        })();
+
         header.innerHTML = `
           <div class="album-header-left">
             <img class="album-header-art" src="" alt="Album art">
@@ -1313,7 +1360,7 @@ const renderLibrary = () => {
               <div class="album-type">Album</div>
             </div>
             <div class="album-title-large">${libraryContext.name || ''}</div>
-            <div class="album-artist-meta">${libraryContext.artist || ''} · ${tracks.length} songs</div>
+            <div class="album-artist-meta">${artistMeta} · ${tracks.length} songs</div>
             <div class="album-actions">
               <button class="btn-play btn-primary">Play</button>
               <button class="btn-secondary btn-shuffle">Shuffle</button>
@@ -1437,8 +1484,7 @@ const renderLibrary = () => {
       if (!albumName || albumName === 'Unknown Album') return;
       
       const nameToMatch = normalizeForCompare(albumName);
-      const artistToMatch = normalizeForCompare(artistName) || null;
-      currentAlbumFilter = { album: nameToMatch, artist: artistToMatch };
+      currentAlbumFilter = { album: nameToMatch };
       currentArtistFilter = null;
       currentPlaylistFilter = null;
       currentPlaylistTracks = [];
@@ -1596,11 +1642,9 @@ const handleAlbumDeleteConfirm = async (albumInfo) => {
 const handleAlbumView = async (albumInfo) => {
   const { albumName, artistName } = albumInfo;
   const nameToMatch = normalizeForCompare(albumName);
-  const artistToMatch = normalizeForCompare(artistName) || null;
-  
   if (!nameToMatch) return;
-  
-  currentAlbumFilter = { album: nameToMatch, artist: artistToMatch };
+
+  currentAlbumFilter = { album: nameToMatch };
   currentArtistFilter = null;
   currentPlaylistFilter = null;
   currentPlaylistTracks = [];
@@ -1632,7 +1676,7 @@ const loadLibrary = async () => {
     }
   }
 
-  applyLibrarySearch(query);
+  await handleSearchInput(query);
 };
 
 // Render Albums view
@@ -1694,7 +1738,6 @@ async function renderAlbums({ data, forceReload = false } = {}) {
       const albumNameRaw = album.name || album.album || '';
       const nameToMatch = normalizeForCompare(albumNameRaw);
       const artistNameRaw = album.artist || album.artist_name || '';
-      const artistToMatch = normalizeForCompare(artistNameRaw) || null;
 
       return async () => {
         if (!nameToMatch) {
@@ -1702,7 +1745,7 @@ async function renderAlbums({ data, forceReload = false } = {}) {
           return;
         }
 
-        currentAlbumFilter = { album: nameToMatch, artist: artistToMatch };
+        currentAlbumFilter = { album: nameToMatch };
         currentArtistFilter = null;
         currentPlaylistFilter = null;
         currentPlaylistTracks = [];
