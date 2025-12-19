@@ -47,4 +47,4 @@ notes
 .cache/
 .parcel-cache/
 coverage/
-.nyc_output
+.nyc_output/

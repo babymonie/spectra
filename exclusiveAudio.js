@@ -246,7 +246,9 @@ function drain(handle) {
 function close(handle) {
   return native.close(handle);
 }
-
+function getStats(handle) {
+  return native.getStats(handle);
+}
 export default {
   createExclusiveStream,
   getDevices,
@@ -255,4 +257,5 @@ export default {
   write,
   drain,
   close,
+  getStats,
 };

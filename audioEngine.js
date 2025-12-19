@@ -494,12 +494,13 @@ function pause() {
   if (!ffmpegProc || isPaused) return;
 
   try {
-    if (ffmpegProc.stdout) ffmpegProc.stdout.pause();
-
-    // Use native pause (it already outputs silence in the render thread)
+    // 1) pause output first so it stops consuming ring
     if (outputStream && typeof outputStream.pause === 'function') {
-      outputStream.pause();
+      outputStream.pause(); // calls native.pause(handle)
     }
+
+    // 2) then pause ffmpeg stdout so decoding blocks naturally
+    if (ffmpegProc.stdout) ffmpegProc.stdout.pause();
   } catch (e) {
     console.error('[audioEngine] pause error:', e);
   }
@@ -507,15 +508,19 @@ function pause() {
   isPaused = true;
 }
 
-
 function resume() {
-  console.log('[audioEngine] resume called');
+ console.log('[audioEngine] native stats after resume:', exclusiveAudio.getStats(outputStream.handle));
+
   if (!ffmpegProc || !isPaused) return;
 
   try {
+    // IMPORTANT ORDER:
+    // 1) resume output first (so ring can drain again)
     if (outputStream && typeof outputStream.resume === 'function') {
-      outputStream.resume();
+      outputStream.resume(); // calls native.resume(handle)
     }
+
+    // 2) then resume ffmpeg stdout
     if (ffmpegProc.stdout) ffmpegProc.stdout.resume();
   } catch (e) {
     console.error('[audioEngine] resume error:', e);
@@ -523,6 +528,7 @@ function resume() {
 
   isPaused = false;
 }
+
 
 function getStatus() {
   return {

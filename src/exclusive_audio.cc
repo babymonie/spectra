@@ -38,11 +38,11 @@
 #pragma comment(lib, "avrt.lib")
 #ifndef DBG
 #include <cstdio>
-#define DBG(msg)              \
-    do                        \
-    {                         \
+#define DBG(msg)                      \
+    do                                \
+    {                                 \
         printf("[native] %s\n", msg); \
-        fflush(stdout);       \
+        fflush(stdout);               \
     } while (0)
 #endif
 #endif
@@ -66,11 +66,11 @@
 // Provide a lightweight debug macro on non-Windows platforms
 #ifndef DBG
 #include <cstdio>
-#define DBG(msg)                          \
-    do                                    \
-    {                                     \
+#define DBG(msg)                               \
+    do                                         \
+    {                                          \
         fprintf(stderr, "[native] %s\n", msg); \
-        fflush(stderr);                    \
+        fflush(stderr);                        \
     } while (0)
 #endif
 
@@ -79,6 +79,7 @@ struct OutputStreamState;
 static std::map<uint32_t, OutputStreamState *> g_streams;
 static std::mutex g_streamsMutex;
 static uint32_t g_nextId = 1;
+
 
 static std::string g_lastError;
 
@@ -126,8 +127,8 @@ struct RingBuffer
 {
     std::vector<uint8_t> data;
     size_t capacity{0};
-    std::atomic<size_t> readPos{0};   // head (consumer)
-    std::atomic<size_t> writePos{0};  // tail (producer)
+    std::atomic<size_t> readPos{0};  // head (consumer)
+    std::atomic<size_t> writePos{0}; // tail (producer)
 
     void init(size_t size)
     {
@@ -211,12 +212,14 @@ struct OutputStreamState
 
     // Cached:
     unsigned int bytesPerFrame{(16 / 8) * 2};
-    double       ringDurationMs{0.0};
+    double ringDurationMs{0.0};
 
     std::atomic<bool> open{false};
     std::atomic<bool> running{false};
     std::atomic<bool> paused{false};
-
+    std::atomic<bool> cancelled{false};
+    std::atomic<int> inFlightWrites{0};
+    std::atomic<bool> closing{false};
     RingBuffer ring;
     // Writers (JS) may wait on this mutex/cv; audio thread never locks the ring.
     std::mutex ringMutex;
@@ -403,7 +406,8 @@ static void WasapiRenderThread(OutputStreamState *s)
     if (!s || !s->audioClient || !s->renderClient || !s->hEvent)
     {
         DBG("WasapiRenderThread: invalid state");
-        if (s) s->open.store(false);
+        if (s)
+            s->open.store(false);
         return;
     }
 
@@ -414,14 +418,15 @@ static void WasapiRenderThread(OutputStreamState *s)
     HANDLE mmcssHandle = nullptr;
     DWORD mmcssTaskIndex = 0;
     mmcssHandle = AvSetMmThreadCharacteristicsA("Pro Audio", &mmcssTaskIndex);
-    
+
     HRESULT hr = s->audioClient->Start();
     if (FAILED(hr))
     {
         SetLastErrorHr("IAudioClient::Start failed", hr);
         s->running.store(false);
-        s->open.store(false); 
-        if (mmcssHandle) AvRevertMmThreadCharacteristics(mmcssHandle);
+        s->open.store(false);
+        if (mmcssHandle)
+            AvRevertMmThreadCharacteristics(mmcssHandle);
         return;
     }
 
@@ -430,30 +435,36 @@ static void WasapiRenderThread(OutputStreamState *s)
     while (s->running.load() && s->open.load())
     {
         // Wait for WASAPI to signal that it needs more data
-        DWORD waitRes = WaitForSingleObject(s->hEvent, 1000); 
-        
-        if (!s->running.load()) break;
+        DWORD waitRes = WaitForSingleObject(s->hEvent, 1000);
 
-        if (waitRes != WAIT_OBJECT_0) {
-            if (waitRes == WAIT_TIMEOUT) continue; // Watchdog timeout, retry loop
-            break; // Fatal error
+        if (!s->running.load())
+            break;
+
+        if (waitRes != WAIT_OBJECT_0)
+        {
+            if (waitRes == WAIT_TIMEOUT)
+                continue; // Watchdog timeout, retry loop
+            break;        // Fatal error
         }
 
         UINT32 padding = 0;
         hr = s->audioClient->GetCurrentPadding(&padding);
-        if (FAILED(hr)) {
+        if (FAILED(hr))
+        {
             DBG("WasapiRenderThread: Device lost during padding check");
-            break; 
+            break;
         }
 
         s->lastHardwarePaddingFrames.store(padding);
 
         UINT32 framesToWrite = (s->bufferFrames > padding) ? (s->bufferFrames - padding) : 0;
-        if (framesToWrite == 0) continue;
+        if (framesToWrite == 0)
+            continue;
 
         BYTE *data = nullptr;
         hr = s->renderClient->GetBuffer(framesToWrite, &data);
-        if (FAILED(hr) || !data) {
+        if (FAILED(hr) || !data)
+        {
             DBG("WasapiRenderThread: GetBuffer failed");
             break;
         }
@@ -469,7 +480,7 @@ static void WasapiRenderThread(OutputStreamState *s)
         {
             temp.resize(bytesRequested);
             size_t bytesRead = s->ring.read(temp.data(), bytesRequested);
-            
+
             if (bytesRead > 0)
             {
                 std::memcpy(data, temp.data(), bytesRead);
@@ -488,7 +499,8 @@ static void WasapiRenderThread(OutputStreamState *s)
 
         // Release the buffer to the hardware
         hr = s->renderClient->ReleaseBuffer(framesToWrite, 0);
-        if (FAILED(hr)) {
+        if (FAILED(hr))
+        {
             DBG("WasapiRenderThread: ReleaseBuffer failed");
             break;
         }
@@ -500,9 +512,10 @@ static void WasapiRenderThread(OutputStreamState *s)
     DBG("WasapiRenderThread: stopping");
     s->audioClient->Stop();
     s->running.store(false);
-    s->open.store(false); 
-    s->ringCv.notify_all(); 
-    if (mmcssHandle) AvRevertMmThreadCharacteristics(mmcssHandle);
+    s->open.store(false);
+    s->ringCv.notify_all();
+    if (mmcssHandle)
+        AvRevertMmThreadCharacteristics(mmcssHandle);
 }
 static bool InitWasapi(OutputStreamState *s,
                        const std::string &deviceId,
@@ -839,7 +852,8 @@ static int WriteWasapi(OutputStreamState *s, const uint8_t *data, size_t len, bo
     if (!data || len == 0)
         return 0;
     // CRITICAL: Return error if render thread is dead
-    if (!s->running.load()) return -1; 
+    if (!s->running.load())
+        return -1;
 
     uint32_t timeoutMs = blocking ? 2000u : 0u;
     size_t written = WriteToRingBlocking(s, data, len, timeoutMs);
@@ -975,57 +989,63 @@ static Napi::Array GetWasapiDevices(const Napi::Env &env)
 #if defined(EXCLUSIVE_MACOS)
 
 // Helper function to convert CFString to std::string
-static std::string CFStringToStdString(CFStringRef cfStr) {
-    if (!cfStr) return "";
-    
+static std::string CFStringToStdString(CFStringRef cfStr)
+{
+    if (!cfStr)
+        return "";
+
     const char *cstr = CFStringGetCStringPtr(cfStr, kCFStringEncodingUTF8);
-    if (cstr) return std::string(cstr);
-    
+    if (cstr)
+        return std::string(cstr);
+
     CFIndex length = CFStringGetLength(cfStr);
     CFIndex maxSize = CFStringGetMaximumSizeForEncoding(length, kCFStringEncodingUTF8) + 1;
     std::vector<char> buffer(maxSize);
-    
-    if (CFStringGetCString(cfStr, buffer.data(), maxSize, kCFStringEncodingUTF8)) {
+
+    if (CFStringGetCString(cfStr, buffer.data(), maxSize, kCFStringEncodingUTF8))
+    {
         return std::string(buffer.data());
     }
     return "";
 }
 
 // Get all audio devices on macOS
-static Napi::Array GetCoreAudioDevices(const Napi::Env &env) {
+static Napi::Array GetCoreAudioDevices(const Napi::Env &env)
+{
     Napi::Array arr = Napi::Array::New(env);
     uint32_t outIdx = 0;
-    
+
     // Get all audio devices
     AudioObjectPropertyAddress propAddress = {
         kAudioHardwarePropertyDevices,
         kAudioObjectPropertyScopeGlobal,
-        kAudioObjectPropertyElementMain
-    };
-    
+        kAudioObjectPropertyElementMain};
+
     UInt32 dataSize = 0;
-    OSStatus err = AudioObjectGetPropertyDataSize(kAudioObjectSystemObject, 
-                                                  &propAddress, 
-                                                  0, 
-                                                  NULL, 
+    OSStatus err = AudioObjectGetPropertyDataSize(kAudioObjectSystemObject,
+                                                  &propAddress,
+                                                  0,
+                                                  NULL,
                                                   &dataSize);
-    if (err != noErr) {
+    if (err != noErr)
+    {
         return arr;
     }
-    
+
     UInt32 deviceCount = dataSize / sizeof(AudioDeviceID);
     std::vector<AudioDeviceID> devices(deviceCount);
-    
+
     err = AudioObjectGetPropertyData(kAudioObjectSystemObject,
                                      &propAddress,
                                      0,
                                      NULL,
                                      &dataSize,
                                      devices.data());
-    if (err != noErr) {
+    if (err != noErr)
+    {
         return arr;
     }
-    
+
     // Get default output device
     propAddress.mSelector = kAudioHardwarePropertyDefaultOutputDevice;
     AudioDeviceID defaultDevice = kAudioDeviceUnknown;
@@ -1036,25 +1056,27 @@ static Napi::Array GetCoreAudioDevices(const Napi::Env &env) {
                                NULL,
                                &dataSize,
                                &defaultDevice);
-    
+
     // Process each device
-    for (UInt32 i = 0; i < deviceCount; i++) {
+    for (UInt32 i = 0; i < deviceCount; i++)
+    {
         AudioDeviceID deviceID = devices[i];
-        
+
         // Check if this device has output streams
         propAddress.mSelector = kAudioDevicePropertyStreams;
         propAddress.mScope = kAudioDevicePropertyScopeOutput;
         dataSize = 0;
-        
+
         err = AudioObjectGetPropertyDataSize(deviceID,
                                              &propAddress,
                                              0,
                                              NULL,
                                              &dataSize);
-        if (err != noErr || dataSize == 0) {
+        if (err != noErr || dataSize == 0)
+        {
             continue; // Skip devices with no output
         }
-        
+
         // Get device UID
         propAddress.mSelector = kAudioDevicePropertyDeviceUID;
         CFStringRef deviceUID = NULL;
@@ -1065,10 +1087,11 @@ static Napi::Array GetCoreAudioDevices(const Napi::Env &env) {
                                          NULL,
                                          &dataSize,
                                          &deviceUID);
-        if (err != noErr || !deviceUID) {
+        if (err != noErr || !deviceUID)
+        {
             continue;
         }
-        
+
         // Get device name
         propAddress.mSelector = kAudioDevicePropertyDeviceNameCFString;
         CFStringRef deviceName = NULL;
@@ -1079,17 +1102,20 @@ static Napi::Array GetCoreAudioDevices(const Napi::Env &env) {
                                          NULL,
                                          &dataSize,
                                          &deviceName);
-        
+
         std::string uid = CFStringToStdString(deviceUID);
         std::string name = deviceName ? CFStringToStdString(deviceName) : "Unknown Device";
-        
-        if (deviceUID) CFRelease(deviceUID);
-        if (deviceName) CFRelease(deviceName);
-        
-        if (uid.empty()) {
+
+        if (deviceUID)
+            CFRelease(deviceUID);
+        if (deviceName)
+            CFRelease(deviceName);
+
+        if (uid.empty())
+        {
             continue;
         }
-        
+
         // Get supported sample rates
         propAddress.mSelector = kAudioDevicePropertyAvailableNominalSampleRates;
         dataSize = 0;
@@ -1098,12 +1124,13 @@ static Napi::Array GetCoreAudioDevices(const Napi::Env &env) {
                                              0,
                                              NULL,
                                              &dataSize);
-        
+
         std::vector<AudioValueRange> sampleRates;
         Napi::Array ratesArray = Napi::Array::New(env);
         uint32_t rateIdx = 0;
-        
-        if (err == noErr && dataSize > 0) {
+
+        if (err == noErr && dataSize > 0)
+        {
             sampleRates.resize(dataSize / sizeof(AudioValueRange));
             err = AudioObjectGetPropertyData(deviceID,
                                              &propAddress,
@@ -1111,42 +1138,48 @@ static Napi::Array GetCoreAudioDevices(const Napi::Env &env) {
                                              NULL,
                                              &dataSize,
                                              sampleRates.data());
-            
-            if (err == noErr) {
+
+            if (err == noErr)
+            {
                 // Add common sample rates within the supported range
                 double commonRates[] = {44100.0, 48000.0, 88200.0, 96000.0, 176400.0, 192000.0};
-                for (size_t j = 0; j < sizeof(commonRates)/sizeof(commonRates[0]); j++) {
+                for (size_t j = 0; j < sizeof(commonRates) / sizeof(commonRates[0]); j++)
+                {
                     bool supported = false;
-                    for (const auto& range : sampleRates) {
-                        if (commonRates[j] >= range.mMinimum && commonRates[j] <= range.mMaximum) {
+                    for (const auto &range : sampleRates)
+                    {
+                        if (commonRates[j] >= range.mMinimum && commonRates[j] <= range.mMaximum)
+                        {
                             supported = true;
                             break;
                         }
                     }
-                    if (supported) {
+                    if (supported)
+                    {
                         ratesArray.Set(rateIdx++, Napi::Number::New(env, commonRates[j]));
                     }
                 }
             }
         }
-        
+
         // If no specific rates found, add defaults
-        if (rateIdx == 0) {
+        if (rateIdx == 0)
+        {
             ratesArray.Set((uint32_t)0, Napi::Number::New(env, 44100.0));
             ratesArray.Set((uint32_t)1, Napi::Number::New(env, 48000.0));
             ratesArray.Set((uint32_t)2, Napi::Number::New(env, 96000.0));
         }
-        
+
         // Create device object
         Napi::Object deviceObj = Napi::Object::New(env);
         deviceObj.Set("id", Napi::String::New(env, uid));
         deviceObj.Set("name", Napi::String::New(env, name));
         deviceObj.Set("isDefault", Napi::Boolean::New(env, deviceID == defaultDevice));
         deviceObj.Set("sampleRates", ratesArray);
-        
+
         arr.Set(outIdx++, deviceObj);
     }
-    
+
     return arr;
 }
 
@@ -1155,34 +1188,39 @@ static bool TrySetFormat(AudioUnit audioUnit,
                          unsigned int sampleRate,
                          unsigned int channels,
                          unsigned int bitDepth,
-                         bool isFloat) {
+                         bool isFloat)
+{
     AudioStreamBasicDescription asbd = {0};
     asbd.mSampleRate = sampleRate;
     asbd.mFormatID = kAudioFormatLinearPCM;
-    
-    if (isFloat) {
+
+    if (isFloat)
+    {
         asbd.mFormatFlags = kAudioFormatFlagIsFloat | kAudioFormatFlagIsPacked;
-    } else {
+    }
+    else
+    {
         asbd.mFormatFlags = kAudioFormatFlagIsSignedInteger | kAudioFormatFlagIsPacked;
     }
-    
-    if (bitDepth > 8) {
+
+    if (bitDepth > 8)
+    {
         asbd.mFormatFlags |= kAudioFormatFlagIsAlignedHigh;
     }
-    
+
     asbd.mBitsPerChannel = bitDepth;
     asbd.mChannelsPerFrame = channels;
     asbd.mBytesPerFrame = (bitDepth / 8) * channels;
     asbd.mFramesPerPacket = 1;
     asbd.mBytesPerPacket = asbd.mBytesPerFrame * asbd.mFramesPerPacket;
-    
+
     OSStatus err = AudioUnitSetProperty(audioUnit,
-                                       kAudioUnitProperty_StreamFormat,
-                                       kAudioUnitScope_Input,
-                                       0,
-                                       &asbd,
-                                       sizeof(asbd));
-    
+                                        kAudioUnitProperty_StreamFormat,
+                                        kAudioUnitScope_Input,
+                                        0,
+                                        &asbd,
+                                        sizeof(asbd));
+
     return err == noErr;
 }
 
@@ -1192,189 +1230,214 @@ static OSStatus CoreAudioRenderCallback(void *inRefCon,
                                         const AudioTimeStamp *inTimeStamp,
                                         UInt32 inBusNumber,
                                         UInt32 inNumberFrames,
-                                        AudioBufferList *ioData) {
+                                        AudioBufferList *ioData)
+{
     (void)ioActionFlags;
     (void)inTimeStamp;
     (void)inBusNumber;
-    
+
     OutputStreamState *s = static_cast<OutputStreamState *>(inRefCon);
-    if (!s || !s->running.load()) {
+    if (!s || !s->running.load())
+    {
         // Fill with silence
-        for (UInt32 i = 0; i < ioData->mNumberBuffers; ++i) {
+        for (UInt32 i = 0; i < ioData->mNumberBuffers; ++i)
+        {
             std::memset(ioData->mBuffers[i].mData, 0, ioData->mBuffers[i].mDataByteSize);
         }
         return noErr;
     }
-    
+
     const size_t requestedBytes = static_cast<size_t>(inNumberFrames) * s->bytesPerFrame;
     // Track recent hardware callback size for approximate latency reporting
     s->lastHardwarePaddingFrames.store(inNumberFrames);
-    
-        if (s->paused.load()) {
+
+    if (s->paused.load())
+    {
         // Fill with silence when paused
-        for (UInt32 i = 0; i < ioData->mNumberBuffers; ++i) {
+        for (UInt32 i = 0; i < ioData->mNumberBuffers; ++i)
+        {
             std::memset(ioData->mBuffers[i].mData, 0, ioData->mBuffers[i].mDataByteSize);
         }
         s->ringCv.notify_all();
         return noErr;
     }
-    
+
     // For interleaved audio (most common on macOS)
-        if (ioData->mNumberBuffers == 1) {
+    if (ioData->mNumberBuffers == 1)
+    {
         uint8_t *outputBuffer = static_cast<uint8_t *>(ioData->mBuffers[0].mData);
         size_t bytesFromRing = 0;
         // Lock-free SPSC read by audio thread
         bytesFromRing = s->ring.read(outputBuffer, requestedBytes);
-        
-        if (bytesFromRing < requestedBytes) {
+
+        if (bytesFromRing < requestedBytes)
+        {
             std::memset(outputBuffer + bytesFromRing, 0, requestedBytes - bytesFromRing);
         }
-        
+
         ioData->mBuffers[0].mDataByteSize = static_cast<UInt32>(requestedBytes);
-    } 
+    }
     // For non-interleaved audio (less common)
-    else {
+    else
+    {
         std::vector<uint8_t> interleaved(requestedBytes);
         size_t bytesFromRing = 0;
 
         // Lock-free SPSC read
         bytesFromRing = s->ring.read(interleaved.data(), requestedBytes);
-        
-        if (bytesFromRing < requestedBytes) {
+
+        if (bytesFromRing < requestedBytes)
+        {
             std::memset(interleaved.data() + bytesFromRing, 0, requestedBytes - bytesFromRing);
         }
-        
+
         // Deinterleave if needed
         UInt32 bytesPerChannel = requestedBytes / ioData->mNumberBuffers;
-        for (UInt32 i = 0; i < ioData->mNumberBuffers; ++i) {
+        for (UInt32 i = 0; i < ioData->mNumberBuffers; ++i)
+        {
             uint8_t *channelBuffer = static_cast<uint8_t *>(ioData->mBuffers[i].mData);
-            
+
             // Extract channel i from interleaved data
-            for (UInt32 frame = 0; frame < inNumberFrames; ++frame) {
+            for (UInt32 frame = 0; frame < inNumberFrames; ++frame)
+            {
                 size_t srcOffset = frame * s->bytesPerFrame + i * (s->bitDepth / 8);
                 size_t dstOffset = frame * (s->bitDepth / 8);
-                
-                if (srcOffset + (s->bitDepth / 8) <= interleaved.size()) {
-                    std::memcpy(channelBuffer + dstOffset, 
-                               interleaved.data() + srcOffset, 
-                               s->bitDepth / 8);
-                } else {
+
+                if (srcOffset + (s->bitDepth / 8) <= interleaved.size())
+                {
+                    std::memcpy(channelBuffer + dstOffset,
+                                interleaved.data() + srcOffset,
+                                s->bitDepth / 8);
+                }
+                else
+                {
                     std::memset(channelBuffer + dstOffset, 0, s->bitDepth / 8);
                 }
             }
-            
+
             ioData->mBuffers[i].mDataByteSize = bytesPerChannel;
         }
     }
-    
+
     s->ringCv.notify_all();
     return noErr;
 }
 
 // Initialize CoreAudio with device selection and format negotiation
 static bool InitCoreAudio(OutputStreamState *s,
-                         const std::string &deviceId,
-                         bool exclusive,
-                         double bufferMs,
-                         bool bitPerfect) {
-    if (!s) return false;
-    
+                          const std::string &deviceId,
+                          bool exclusive,
+                          double bufferMs,
+                          bool bitPerfect)
+{
+    if (!s)
+        return false;
+
     SetLastError("");
-    
+
     AudioComponentDescription desc = {0};
     desc.componentType = kAudioUnitType_Output;
     desc.componentSubType = kAudioUnitSubType_HALOutput; // Use HAL for device selection
     desc.componentManufacturer = kAudioUnitManufacturer_Apple;
     desc.componentFlags = 0;
     desc.componentFlagsMask = 0;
-    
+
     AudioComponent comp = AudioComponentFindNext(NULL, &desc);
-    if (!comp) {
+    if (!comp)
+    {
         SetLastError("AudioComponentFindNext failed");
         return false;
     }
-    
+
     AudioComponentInstance audioUnit = NULL;
     OSStatus err = AudioComponentInstanceNew(comp, &audioUnit);
-    if (err != noErr || !audioUnit) {
+    if (err != noErr || !audioUnit)
+    {
         SetLastError("AudioComponentInstanceNew failed");
         return false;
     }
-    
+
     // Enable output
     UInt32 enableIO = 1;
     err = AudioUnitSetProperty(audioUnit,
-                              kAudioOutputUnitProperty_EnableIO,
-                              kAudioUnitScope_Output,
-                              0,
-                              &enableIO,
-                              sizeof(enableIO));
-    if (err != noErr) {
+                               kAudioOutputUnitProperty_EnableIO,
+                               kAudioUnitScope_Output,
+                               0,
+                               &enableIO,
+                               sizeof(enableIO));
+    if (err != noErr)
+    {
         AudioComponentInstanceDispose(audioUnit);
         SetLastError("Failed to enable output");
         return false;
     }
-    
+
     // Disable input
     enableIO = 0;
     err = AudioUnitSetProperty(audioUnit,
-                              kAudioOutputUnitProperty_EnableIO,
-                              kAudioUnitScope_Input,
-                              1,
-                              &enableIO,
-                              sizeof(enableIO));
-    if (err != noErr) {
+                               kAudioOutputUnitProperty_EnableIO,
+                               kAudioUnitScope_Input,
+                               1,
+                               &enableIO,
+                               sizeof(enableIO));
+    if (err != noErr)
+    {
         AudioComponentInstanceDispose(audioUnit);
         SetLastError("Failed to disable input");
         return false;
     }
-    
+
     // Select specific device if requested
-    if (!deviceId.empty() && deviceId != "default") {
+    if (!deviceId.empty() && deviceId != "default")
+    {
         AudioDeviceID targetDevice = kAudioDeviceUnknown;
-        
+
         // Find device by UID
         AudioObjectPropertyAddress propAddress = {
             kAudioHardwarePropertyDevices,
             kAudioObjectPropertyScopeGlobal,
-            kAudioObjectPropertyElementMain
-        };
-        
+            kAudioObjectPropertyElementMain};
+
         UInt32 dataSize = 0;
         err = AudioObjectGetPropertyDataSize(kAudioObjectSystemObject,
-                                            &propAddress,
-                                            0,
-                                            NULL,
-                                            &dataSize);
-        if (err == noErr) {
+                                             &propAddress,
+                                             0,
+                                             NULL,
+                                             &dataSize);
+        if (err == noErr)
+        {
             UInt32 deviceCount = dataSize / sizeof(AudioDeviceID);
             std::vector<AudioDeviceID> devices(deviceCount);
-            
+
             err = AudioObjectGetPropertyData(kAudioObjectSystemObject,
-                                            &propAddress,
-                                            0,
-                                            NULL,
-                                            &dataSize,
-                                            devices.data());
-            
-            if (err == noErr) {
-                for (UInt32 i = 0; i < deviceCount; i++) {
+                                             &propAddress,
+                                             0,
+                                             NULL,
+                                             &dataSize,
+                                             devices.data());
+
+            if (err == noErr)
+            {
+                for (UInt32 i = 0; i < deviceCount; i++)
+                {
                     propAddress.mSelector = kAudioDevicePropertyDeviceUID;
                     CFStringRef deviceUID = NULL;
                     dataSize = sizeof(deviceUID);
-                    
+
                     err = AudioObjectGetPropertyData(devices[i],
-                                                    &propAddress,
-                                                    0,
-                                                    NULL,
-                                                    &dataSize,
-                                                    &deviceUID);
-                    
-                    if (err == noErr && deviceUID) {
+                                                     &propAddress,
+                                                     0,
+                                                     NULL,
+                                                     &dataSize,
+                                                     &deviceUID);
+
+                    if (err == noErr && deviceUID)
+                    {
                         std::string uid = CFStringToStdString(deviceUID);
                         CFRelease(deviceUID);
-                        
-                        if (uid == deviceId) {
+
+                        if (uid == deviceId)
+                        {
                             targetDevice = devices[i];
                             break;
                         }
@@ -1382,26 +1445,28 @@ static bool InitCoreAudio(OutputStreamState *s,
                 }
             }
         }
-        
-        if (targetDevice != kAudioDeviceUnknown) {
+
+        if (targetDevice != kAudioDeviceUnknown)
+        {
             err = AudioUnitSetProperty(audioUnit,
-                                      kAudioOutputUnitProperty_CurrentDevice,
-                                      kAudioUnitScope_Global,
-                                      0,
-                                      &targetDevice,
-                                      sizeof(targetDevice));
-            if (err != noErr) {
+                                       kAudioOutputUnitProperty_CurrentDevice,
+                                       kAudioUnitScope_Global,
+                                       0,
+                                       &targetDevice,
+                                       sizeof(targetDevice));
+            if (err != noErr)
+            {
                 AudioComponentInstanceDispose(audioUnit);
                 SetLastError("Failed to set output device");
                 return false;
             }
             // If exclusive requested, try to claim Hog Mode for the device
-            if (exclusive) {
+            if (exclusive)
+            {
                 AudioObjectPropertyAddress hogAddr = {
                     kAudioDevicePropertyHogMode,
                     kAudioObjectPropertyScopeGlobal,
-                    kAudioObjectPropertyElementMain
-                };
+                    kAudioObjectPropertyElementMain};
                 pid_t pid = getpid();
                 OSStatus hres = AudioObjectSetPropertyData(targetDevice,
                                                            &hogAddr,
@@ -1409,191 +1474,227 @@ static bool InitCoreAudio(OutputStreamState *s,
                                                            NULL,
                                                            sizeof(pid),
                                                            &pid);
-                if (hres == noErr) {
+                if (hres == noErr)
+                {
                     DBG("InitCoreAudio: Hog Mode enabled for device");
-                } else {
+                }
+                else
+                {
                     DBG("InitCoreAudio: Hog Mode request failed (continuing)");
                 }
             }
-        } else {
+        }
+        else
+        {
             // Device not found, fall back to default
         }
     }
-    
+
     // Try to set the requested format
     bool formatSet = false;
-    
-    if (exclusive) {
+
+    if (exclusive)
+    {
         // Try different formats in order of preference
         std::vector<std::pair<unsigned int, bool>> candidates;
-        
-        if (s->bitDepth == 32) {
-            if (bitPerfect) {
+
+        if (s->bitDepth == 32)
+        {
+            if (bitPerfect)
+            {
                 candidates.push_back({32, true});  // Float32
                 candidates.push_back({32, false}); // Int32
-            } else {
+            }
+            else
+            {
                 candidates.push_back({32, true});  // Float32
                 candidates.push_back({32, false}); // Int32
                 candidates.push_back({24, false}); // Int24
                 candidates.push_back({16, false}); // Int16
             }
-        } else if (s->bitDepth == 24) {
-            if (bitPerfect) {
+        }
+        else if (s->bitDepth == 24)
+        {
+            if (bitPerfect)
+            {
                 candidates.push_back({24, false}); // Int24
-            } else {
+            }
+            else
+            {
                 candidates.push_back({24, false}); // Int24
                 candidates.push_back({32, true});  // Float32
                 candidates.push_back({32, false}); // Int32
                 candidates.push_back({16, false}); // Int16
             }
-        } else if (s->bitDepth == 16) {
-            if (bitPerfect) {
+        }
+        else if (s->bitDepth == 16)
+        {
+            if (bitPerfect)
+            {
                 candidates.push_back({16, false}); // Int16
-            } else {
+            }
+            else
+            {
                 candidates.push_back({16, false}); // Int16
                 candidates.push_back({32, true});  // Float32
                 candidates.push_back({24, false}); // Int24
             }
         }
-        
-        for (const auto &candidate : candidates) {
-            if (TrySetFormat(audioUnit, s->sampleRate, s->channels, 
-                            candidate.first, candidate.second)) {
+
+        for (const auto &candidate : candidates)
+        {
+            if (TrySetFormat(audioUnit, s->sampleRate, s->channels,
+                             candidate.first, candidate.second))
+            {
                 s->bitDepth = candidate.first;
                 formatSet = true;
                 break;
             }
         }
     }
-    
+
     // If exclusive mode failed or not requested, try to get the default format
-    if (!formatSet) {
+    if (!formatSet)
+    {
         // Get current format to see what's supported
         AudioStreamBasicDescription currentASBD = {0};
         UInt32 dataSize = sizeof(currentASBD);
-        
+
         err = AudioUnitGetProperty(audioUnit,
-                                  kAudioUnitProperty_StreamFormat,
-                                  kAudioUnitScope_Input,
-                                  0,
-                                  &currentASBD,
-                                  &dataSize);
-        
-        if (err == noErr) {
+                                   kAudioUnitProperty_StreamFormat,
+                                   kAudioUnitScope_Input,
+                                   0,
+                                   &currentASBD,
+                                   &dataSize);
+
+        if (err == noErr)
+        {
             s->sampleRate = currentASBD.mSampleRate;
             s->channels = currentASBD.mChannelsPerFrame;
             s->bitDepth = currentASBD.mBitsPerChannel;
-            
+
             // Try to match requested sample rate if possible
-            if (currentASBD.mSampleRate != s->sampleRate) {
+            if (currentASBD.mSampleRate != s->sampleRate)
+            {
                 // Try to set the requested rate
                 currentASBD.mSampleRate = s->sampleRate;
                 err = AudioUnitSetProperty(audioUnit,
-                                          kAudioUnitProperty_StreamFormat,
-                                          kAudioUnitScope_Input,
-                                          0,
-                                          &currentASBD,
-                                          sizeof(currentASBD));
-                
-                if (err != noErr) {
+                                           kAudioUnitProperty_StreamFormat,
+                                           kAudioUnitScope_Input,
+                                           0,
+                                           &currentASBD,
+                                           sizeof(currentASBD));
+
+                if (err != noErr)
+                {
                     // Revert to actual sample rate
                     err = AudioUnitGetProperty(audioUnit,
-                                              kAudioUnitProperty_StreamFormat,
-                                              kAudioUnitScope_Input,
-                                              0,
-                                              &currentASBD,
-                                              &dataSize);
-                    if (err == noErr) {
+                                               kAudioUnitProperty_StreamFormat,
+                                               kAudioUnitScope_Input,
+                                               0,
+                                               &currentASBD,
+                                               &dataSize);
+                    if (err == noErr)
+                    {
                         s->sampleRate = currentASBD.mSampleRate;
                     }
                 }
             }
         }
     }
-    
+
     s->bytesPerFrame = (s->bitDepth / 8) * s->channels;
-    
+
     // Set up render callback
     AURenderCallbackStruct renderCallback = {0};
     renderCallback.inputProc = CoreAudioRenderCallback;
     renderCallback.inputProcRefCon = s;
-    
+
     err = AudioUnitSetProperty(audioUnit,
-                              kAudioUnitProperty_SetRenderCallback,
-                              kAudioUnitScope_Input,
-                              0,
-                              &renderCallback,
-                              sizeof(renderCallback));
-    if (err != noErr) {
+                               kAudioUnitProperty_SetRenderCallback,
+                               kAudioUnitScope_Input,
+                               0,
+                               &renderCallback,
+                               sizeof(renderCallback));
+    if (err != noErr)
+    {
         AudioComponentInstanceDispose(audioUnit);
         SetLastError("Failed to set render callback");
         return false;
     }
-    
+
     // Initialize audio unit
     err = AudioUnitInitialize(audioUnit);
-    if (err != noErr) {
+    if (err != noErr)
+    {
         AudioComponentInstanceDispose(audioUnit);
         SetLastError("AudioUnitInitialize failed");
         return false;
     }
-    
+
     // Configure ring buffer
-    if (bufferMs < 20.0) bufferMs = 20.0;
-    if (bufferMs > 2000.0) bufferMs = 2000.0;
-    
+    if (bufferMs < 20.0)
+        bufferMs = 20.0;
+    if (bufferMs > 2000.0)
+        bufferMs = 2000.0;
+
     double ringFramesD = (static_cast<double>(s->sampleRate) * bufferMs) / 1000.0;
     // Ensure at least 2 periods of audio
     double minFrames = static_cast<double>(s->sampleRate) / 50.0; // 20ms
-    if (ringFramesD < minFrames) {
+    if (ringFramesD < minFrames)
+    {
         ringFramesD = minFrames;
     }
-    
+
     size_t ringFrames = static_cast<size_t>(ringFramesD);
     size_t ringBytes = ringFrames * s->bytesPerFrame;
-    
+
     s->ring.init(ringBytes);
     s->ringDurationMs = static_cast<double>(ringFrames) * 1000.0 / static_cast<double>(s->sampleRate);
-    
+
     // Start audio unit
     err = AudioOutputUnitStart(audioUnit);
-    if (err != noErr) {
+    if (err != noErr)
+    {
         AudioUnitUninitialize(audioUnit);
         AudioComponentInstanceDispose(audioUnit);
         SetLastError("AudioOutputUnitStart failed");
         return false;
     }
-    
+
     s->audioUnit = audioUnit;
     s->open.store(true);
     s->running.store(true);
-    
+
     return true;
 }
 
 static int WriteCoreAudio(OutputStreamState *s,
-                         const uint8_t *data,
-                         size_t len,
-                         bool blocking) {
+                          const uint8_t *data,
+                          size_t len,
+                          bool blocking)
+{
     if (!s || !s->open.load())
         return -1;
     if (!data || len == 0)
         return 0;
-    
+
     uint32_t timeoutMs = blocking ? 2000u : 0u;
     size_t written = WriteToRingBlocking(s, data, len, timeoutMs);
     return static_cast<int>(written);
 }
 
-static void CloseCoreAudio(OutputStreamState *s) {
+static void CloseCoreAudio(OutputStreamState *s)
+{
     if (!s)
         return;
-    
+
     s->running.store(false);
     s->open.store(false);
     s->ringCv.notify_all();
-    
-    if (s->audioUnit) {
+
+    if (s->audioUnit)
+    {
         AudioOutputUnitStop(s->audioUnit);
         AudioUnitUninitialize(s->audioUnit);
         AudioComponentInstanceDispose(s->audioUnit);
@@ -1606,272 +1707,334 @@ static void CloseCoreAudio(OutputStreamState *s) {
 #if defined(EXCLUSIVE_LINUX)
 
 // Convert ALSA sample format to bit depth
-static unsigned int AlsaFormatToBitDepth(snd_pcm_format_t format) {
-    switch (format) {
-        case SND_PCM_FORMAT_S16_LE:
-        case SND_PCM_FORMAT_S16_BE:
-            return 16;
-        case SND_PCM_FORMAT_S24_LE:
-        case SND_PCM_FORMAT_S24_BE:
-        case SND_PCM_FORMAT_S24_3LE:
-        case SND_PCM_FORMAT_S24_3BE:
-            return 24;
-        case SND_PCM_FORMAT_S32_LE:
-        case SND_PCM_FORMAT_S32_BE:
-            return 32;
-        case SND_PCM_FORMAT_FLOAT_LE:
-        case SND_PCM_FORMAT_FLOAT_BE:
-            return 32; // Float32
-        default:
-            return 16;
+static unsigned int AlsaFormatToBitDepth(snd_pcm_format_t format)
+{
+    switch (format)
+    {
+    case SND_PCM_FORMAT_S16_LE:
+    case SND_PCM_FORMAT_S16_BE:
+        return 16;
+    case SND_PCM_FORMAT_S24_LE:
+    case SND_PCM_FORMAT_S24_BE:
+    case SND_PCM_FORMAT_S24_3LE:
+    case SND_PCM_FORMAT_S24_3BE:
+        return 24;
+    case SND_PCM_FORMAT_S32_LE:
+    case SND_PCM_FORMAT_S32_BE:
+        return 32;
+    case SND_PCM_FORMAT_FLOAT_LE:
+    case SND_PCM_FORMAT_FLOAT_BE:
+        return 32; // Float32
+    default:
+        return 16;
     }
 }
 
 // Convert bit depth to ALSA sample format
-static snd_pcm_format_t BitDepthToAlsaFormat(unsigned int bitDepth, bool isFloat) {
-    if (isFloat && bitDepth == 32) {
+static snd_pcm_format_t BitDepthToAlsaFormat(unsigned int bitDepth, bool isFloat)
+{
+    if (isFloat && bitDepth == 32)
+    {
         return SND_PCM_FORMAT_FLOAT_LE;
     }
-    
-    switch (bitDepth) {
-        case 16: return SND_PCM_FORMAT_S16_LE;
-        case 24: return SND_PCM_FORMAT_S24_LE;
-        case 32: return SND_PCM_FORMAT_S32_LE;
-        default: return SND_PCM_FORMAT_S16_LE;
+
+    switch (bitDepth)
+    {
+    case 16:
+        return SND_PCM_FORMAT_S16_LE;
+    case 24:
+        return SND_PCM_FORMAT_S24_LE;
+    case 32:
+        return SND_PCM_FORMAT_S32_LE;
+    default:
+        return SND_PCM_FORMAT_S16_LE;
     }
 }
 
 // Try to set hardware parameters
 static bool TrySetAlsaParams(snd_pcm_t *pcm,
-                            OutputStreamState *s,
-                            bool exclusive,
-                            bool bitPerfect) {
+                             OutputStreamState *s,
+                             bool exclusive,
+                             bool bitPerfect)
+{
     int err;
     snd_pcm_hw_params_t *hwParams = nullptr;
-    
+
     // Allocate hardware parameters structure
     snd_pcm_hw_params_alloca(&hwParams);
-    
+
     // Fill it in with default values
     err = snd_pcm_hw_params_any(pcm, hwParams);
-    if (err < 0) {
+    if (err < 0)
+    {
         SetLastErrorAlsa("Cannot initialize hardware parameters", err);
         return false;
     }
-    
+
     // Set access type (exclusive or shared)
     snd_pcm_access_t access = exclusive ? SND_PCM_ACCESS_RW_INTERLEAVED : SND_PCM_ACCESS_RW_INTERLEAVED;
     err = snd_pcm_hw_params_set_access(pcm, hwParams, access);
-    if (err < 0) {
-        if (exclusive) {
+    if (err < 0)
+    {
+        if (exclusive)
+        {
             // Try shared mode if exclusive fails
             access = SND_PCM_ACCESS_RW_INTERLEAVED;
             err = snd_pcm_hw_params_set_access(pcm, hwParams, access);
-            if (err < 0) {
+            if (err < 0)
+            {
                 SetLastErrorAlsa("Cannot set access type", err);
                 return false;
             }
-        } else {
+        }
+        else
+        {
             SetLastErrorAlsa("Cannot set access type", err);
             return false;
         }
     }
-    
+
     // Try different formats
     bool formatSet = false;
-    
-    if (exclusive) {
+
+    if (exclusive)
+    {
         // Try different formats in order of preference
         std::vector<std::pair<unsigned int, bool>> candidates;
-        
-        if (s->bitDepth == 32) {
-            if (bitPerfect) {
+
+        if (s->bitDepth == 32)
+        {
+            if (bitPerfect)
+            {
                 candidates.push_back({32, true});  // Float32
                 candidates.push_back({32, false}); // Int32
-            } else {
+            }
+            else
+            {
                 candidates.push_back({32, true});  // Float32
                 candidates.push_back({32, false}); // Int32
                 candidates.push_back({24, false}); // Int24
                 candidates.push_back({16, false}); // Int16
             }
-        } else if (s->bitDepth == 24) {
-            if (bitPerfect) {
+        }
+        else if (s->bitDepth == 24)
+        {
+            if (bitPerfect)
+            {
                 candidates.push_back({24, false}); // Int24
-            } else {
+            }
+            else
+            {
                 candidates.push_back({24, false}); // Int24
                 candidates.push_back({32, true});  // Float32
                 candidates.push_back({32, false}); // Int32
                 candidates.push_back({16, false}); // Int16
             }
-        } else if (s->bitDepth == 16) {
-            if (bitPerfect) {
+        }
+        else if (s->bitDepth == 16)
+        {
+            if (bitPerfect)
+            {
                 candidates.push_back({16, false}); // Int16
-            } else {
+            }
+            else
+            {
                 candidates.push_back({16, false}); // Int16
                 candidates.push_back({32, true});  // Float32
                 candidates.push_back({24, false}); // Int24
             }
         }
-        
-        for (const auto &candidate : candidates) {
+
+        for (const auto &candidate : candidates)
+        {
             snd_pcm_format_t format = BitDepthToAlsaFormat(candidate.first, candidate.second);
             err = snd_pcm_hw_params_set_format(pcm, hwParams, format);
-            if (err >= 0) {
+            if (err >= 0)
+            {
                 s->bitDepth = candidate.first;
                 formatSet = true;
                 break;
             }
         }
     }
-    
+
     // If exclusive mode failed or not requested, try to get a supported format
-    if (!formatSet) {
+    if (!formatSet)
+    {
         // Get first supported format
         snd_pcm_format_t format;
         err = snd_pcm_hw_params_get_format(hwParams, &format);
-        if (err >= 0) {
+        if (err >= 0)
+        {
             s->bitDepth = AlsaFormatToBitDepth(format);
-        } else {
+        }
+        else
+        {
             // Default to S16_LE
             err = snd_pcm_hw_params_set_format(pcm, hwParams, SND_PCM_FORMAT_S16_LE);
-            if (err < 0) {
+            if (err < 0)
+            {
                 SetLastErrorAlsa("Cannot set sample format", err);
                 return false;
             }
             s->bitDepth = 16;
         }
     }
-    
+
     // Set channels
     err = snd_pcm_hw_params_set_channels(pcm, hwParams, s->channels);
-    if (err < 0) {
+    if (err < 0)
+    {
         // Try to get supported channels
         unsigned int minCh, maxCh;
         err = snd_pcm_hw_params_get_channels_min(hwParams, &minCh);
-        if (err >= 0) {
+        if (err >= 0)
+        {
             err = snd_pcm_hw_params_get_channels_max(hwParams, &maxCh);
-            if (err >= 0 && s->channels >= minCh && s->channels <= maxCh) {
+            if (err >= 0 && s->channels >= minCh && s->channels <= maxCh)
+            {
                 // Try exact number
                 err = snd_pcm_hw_params_set_channels(pcm, hwParams, s->channels);
             }
         }
-        if (err < 0) {
+        if (err < 0)
+        {
             // Set to 2 channels (stereo) as fallback
             err = snd_pcm_hw_params_set_channels(pcm, hwParams, 2);
-            if (err < 0) {
+            if (err < 0)
+            {
                 SetLastErrorAlsa("Cannot set channels", err);
                 return false;
             }
             s->channels = 2;
         }
     }
-    
+
     // Set sample rate
     unsigned int actualRate = s->sampleRate;
     err = snd_pcm_hw_params_set_rate_near(pcm, hwParams, &actualRate, 0);
-    if (err < 0) {
+    if (err < 0)
+    {
         SetLastErrorAlsa("Cannot set sample rate", err);
         return false;
     }
     s->sampleRate = actualRate;
-    
+
     // Set buffer size based on latency
     snd_pcm_uframes_t bufferSize = (s->sampleRate * 100) / 1000; // 100ms default
-    snd_pcm_uframes_t periodSize = bufferSize / 4; // 4 periods per buffer
-    
+    snd_pcm_uframes_t periodSize = bufferSize / 4;               // 4 periods per buffer
+
     err = snd_pcm_hw_params_set_buffer_size_near(pcm, hwParams, &bufferSize);
-    if (err < 0) {
+    if (err < 0)
+    {
         SetLastErrorAlsa("Cannot set buffer size", err);
         return false;
     }
-    
+
     err = snd_pcm_hw_params_set_period_size_near(pcm, hwParams, &periodSize, 0);
-    if (err < 0) {
+    if (err < 0)
+    {
         SetLastErrorAlsa("Cannot set period size", err);
         return false;
     }
-    
+
     // Apply hardware parameters
     err = snd_pcm_hw_params(pcm, hwParams);
-    if (err < 0) {
+    if (err < 0)
+    {
         SetLastErrorAlsa("Cannot set hardware parameters", err);
         return false;
     }
-    
+
     // Get actual buffer and period size
     snd_pcm_hw_params_get_buffer_size(hwParams, &s->bufferSize);
     snd_pcm_hw_params_get_period_size(hwParams, &s->periodSize, 0);
-    
+
     s->bytesPerFrame = (s->bitDepth / 8) * s->channels;
-    
+
     return true;
 }
 
 // ALSA render thread
-static void AlsaRenderThread(OutputStreamState *s) {
-    if (!s || !s->pcmHandle) {
+static void AlsaRenderThread(OutputStreamState *s)
+{
+    if (!s || !s->pcmHandle)
+    {
         return;
     }
-    
+
     s->running.store(true);
-    
+
     std::vector<uint8_t> tempBuffer(s->periodSize * s->bytesPerFrame);
-    
-    while (s->running.load()) {
-        if (s->paused.load()) {
+
+    while (s->running.load())
+    {
+        if (s->paused.load())
+        {
             // Fill buffer with silence when paused
             std::memset(tempBuffer.data(), 0, tempBuffer.size());
-            
+
             int err = snd_pcm_writei(s->pcmHandle, tempBuffer.data(), s->periodSize);
-            if (err == -EPIPE) {
+            if (err == -EPIPE)
+            {
                 // Underrun occurred
                 snd_pcm_prepare(s->pcmHandle);
-            } else if (err < 0) {
+            }
+            else if (err < 0)
+            {
                 SetLastErrorAlsa("Write error", err);
                 break;
             }
-            
+
             std::this_thread::sleep_for(std::chrono::milliseconds(10));
             continue;
         }
-        
+
         size_t bytesToRead = s->periodSize * s->bytesPerFrame;
         size_t bytesRead = 0;
-        
+
         // Lock-free SPSC read on audio/render thread
         bytesRead = s->ring.read(tempBuffer.data(), bytesToRead);
-        
-        if (bytesRead < bytesToRead) {
+
+        if (bytesRead < bytesToRead)
+        {
             // Fill remaining with silence
             std::memset(tempBuffer.data() + bytesRead, 0, bytesToRead - bytesRead);
         }
-        
+
         snd_pcm_sframes_t framesToWrite = bytesToRead / s->bytesPerFrame;
         snd_pcm_sframes_t framesWritten = snd_pcm_writei(s->pcmHandle, tempBuffer.data(), framesToWrite);
-        
-        if (framesWritten == -EPIPE) {
+
+        if (framesWritten == -EPIPE)
+        {
             // Underrun occurred
             int err = snd_pcm_prepare(s->pcmHandle);
-            if (err < 0) {
+            if (err < 0)
+            {
                 SetLastErrorAlsa("Cannot recover from underrun", err);
                 break;
             }
-        } else if (framesWritten < 0) {
+        }
+        else if (framesWritten < 0)
+        {
             SetLastErrorAlsa("Write error", framesWritten);
             break;
-        } else if (framesWritten < framesToWrite) {
+        }
+        else if (framesWritten < framesToWrite)
+        {
             // Short write
             // We'll handle this by trying again next iteration
         }
-        
+
         // Try to get ALSA delay (frames in hardware buffer) for stats
         snd_pcm_sframes_t delayFrames = 0;
-        if (snd_pcm_delay(s->pcmHandle, &delayFrames) == 0 && delayFrames >= 0) {
+        if (snd_pcm_delay(s->pcmHandle, &delayFrames) == 0 && delayFrames >= 0)
+        {
             s->lastHardwarePaddingFrames.store(static_cast<uint32_t>(delayFrames));
         }
         s->ringCv.notify_all();
     }
-    
+
     s->running.store(false);
 }
 
@@ -1880,148 +2043,169 @@ static bool InitAlsa(OutputStreamState *s,
                      const std::string &deviceId,
                      bool exclusive,
                      double bufferMs,
-                     bool bitPerfect) {
-    if (!s) return false;
-    
+                     bool bitPerfect)
+{
+    if (!s)
+        return false;
+
     SetLastError("");
-    
+
     // Default ALSA device if none specified
     const char *device = deviceId.empty() ? "default" : deviceId.c_str();
-    
+
     // Open PCM device
     snd_pcm_t *pcm = nullptr;
     int err = snd_pcm_open(&pcm, device, SND_PCM_STREAM_PLAYBACK, 0);
-    if (err < 0) {
+    if (err < 0)
+    {
         SetLastErrorAlsa("Cannot open audio device", err);
         return false;
     }
-    
+
     // Try to set hardware parameters
-    if (!TrySetAlsaParams(pcm, s, exclusive, bitPerfect)) {
+    if (!TrySetAlsaParams(pcm, s, exclusive, bitPerfect))
+    {
         snd_pcm_close(pcm);
         return false;
     }
-    
+
     // Configure ring buffer
-    if (bufferMs < 20.0) bufferMs = 20.0;
-    if (bufferMs > 2000.0) bufferMs = 2000.0;
-    
+    if (bufferMs < 20.0)
+        bufferMs = 20.0;
+    if (bufferMs > 2000.0)
+        bufferMs = 2000.0;
+
     double ringFramesD = (static_cast<double>(s->sampleRate) * bufferMs) / 1000.0;
     // Ensure at least 4 periods
-    if (ringFramesD < static_cast<double>(s->periodSize) * 4) {
+    if (ringFramesD < static_cast<double>(s->periodSize) * 4)
+    {
         ringFramesD = static_cast<double>(s->periodSize) * 4;
     }
-    
+
     size_t ringFrames = static_cast<size_t>(ringFramesD);
     size_t ringBytes = ringFrames * s->bytesPerFrame;
-    
+
     s->ring.init(ringBytes);
     s->ringDurationMs = static_cast<double>(ringFrames) * 1000.0 / static_cast<double>(s->sampleRate);
-    
+
     // Start playback
     err = snd_pcm_prepare(pcm);
-    if (err < 0) {
+    if (err < 0)
+    {
         snd_pcm_close(pcm);
         SetLastErrorAlsa("Cannot prepare audio interface", err);
         return false;
     }
-    
+
     s->pcmHandle = pcm;
     s->open.store(true);
-    
+
     // Start render thread
     s->renderThread = std::thread(AlsaRenderThread, s);
-    
+
     return true;
 }
 
 static int WriteAlsa(OutputStreamState *s,
                      const uint8_t *data,
                      size_t len,
-                     bool blocking) {
+                     bool blocking)
+{
     if (!s || !s->open.load())
         return -1;
     if (!data || len == 0)
         return 0;
-    
+
     uint32_t timeoutMs = blocking ? 2000u : 0u;
     size_t written = WriteToRingBlocking(s, data, len, timeoutMs);
     return static_cast<int>(written);
 }
 
-static void CloseAlsa(OutputStreamState *s) {
+static void CloseAlsa(OutputStreamState *s)
+{
     if (!s)
         return;
-    
+
     s->running.store(false);
     s->open.store(false);
     s->ringCv.notify_all();
-    
-    if (s->renderThread.joinable()) {
+
+    if (s->renderThread.joinable())
+    {
         s->renderThread.join();
     }
-    
-    if (s->pcmHandle) {
+
+    if (s->pcmHandle)
+    {
         snd_pcm_drain(s->pcmHandle); // Drain remaining samples
         snd_pcm_close(s->pcmHandle);
         s->pcmHandle = nullptr;
     }
 }
 
-static Napi::Array GetAlsaDevices(const Napi::Env &env) {
+static Napi::Array GetAlsaDevices(const Napi::Env &env)
+{
     Napi::Array arr = Napi::Array::New(env);
     uint32_t outIdx = 0;
-    
+
     // Add default device
     Napi::Object defaultDev = Napi::Object::New(env);
     defaultDev.Set("id", Napi::String::New(env, "default"));
     defaultDev.Set("name", Napi::String::New(env, "Default ALSA Device"));
     defaultDev.Set("isDefault", Napi::Boolean::New(env, true));
-    
+
     Napi::Array rates = Napi::Array::New(env);
     rates.Set(uint32_t(0), Napi::Number::New(env, 44100));
     rates.Set(uint32_t(1), Napi::Number::New(env, 48000));
     rates.Set(uint32_t(2), Napi::Number::New(env, 96000));
     defaultDev.Set("sampleRates", rates);
-    
+
     arr.Set(outIdx++, defaultDev);
-    
+
     // Try to enumerate ALSA devices
     // Note: This is a simplified enumeration. Real ALSA enumeration is more complex.
     void **hints = nullptr;
     int err = snd_device_name_hint(-1, "pcm", &hints);
-    if (err == 0 && hints) {
-        for (void **hint = hints; *hint != nullptr; hint++) {
+    if (err == 0 && hints)
+    {
+        for (void **hint = hints; *hint != nullptr; hint++)
+        {
             char *name = snd_device_name_get_hint(*hint, "NAME");
             char *desc = snd_device_name_get_hint(*hint, "DESC");
             char *ioid = snd_device_name_get_hint(*hint, "IOID");
-            
-            if (name && (ioid == nullptr || strcmp(ioid, "Output") == 0)) {
+
+            if (name && (ioid == nullptr || strcmp(ioid, "Output") == 0))
+            {
                 std::string deviceName = name;
                 std::string deviceDesc = desc ? desc : name;
-                
+
                 // Skip duplicates and "null" device
-                if (deviceName != "default" && deviceName.find("null") == std::string::npos) {
+                if (deviceName != "default" && deviceName.find("null") == std::string::npos)
+                {
                     Napi::Object dev = Napi::Object::New(env);
                     dev.Set("id", Napi::String::New(env, deviceName));
                     dev.Set("name", Napi::String::New(env, deviceDesc));
-                dev.Set("isDefault", Napi::Boolean::New(env, false));
-                
-                Napi::Array devRates = Napi::Array::New(env);
-                devRates.Set((uint32_t)0, Napi::Number::New(env, 44100));
-                devRates.Set((uint32_t)1, Napi::Number::New(env, 48000));
-                devRates.Set((uint32_t)2, Napi::Number::New(env, 96000));
-                dev.Set("sampleRates", devRates);                    arr.Set(outIdx++, dev);
+                    dev.Set("isDefault", Napi::Boolean::New(env, false));
+
+                    Napi::Array devRates = Napi::Array::New(env);
+                    devRates.Set((uint32_t)0, Napi::Number::New(env, 44100));
+                    devRates.Set((uint32_t)1, Napi::Number::New(env, 48000));
+                    devRates.Set((uint32_t)2, Napi::Number::New(env, 96000));
+                    dev.Set("sampleRates", devRates);
+                    arr.Set(outIdx++, dev);
                 }
             }
-            
-            if (name) free(name);
-            if (desc) free(desc);
-            if (ioid) free(ioid);
+
+            if (name)
+                free(name);
+            if (desc)
+                free(desc);
+            if (ioid)
+                free(ioid);
         }
         snd_device_name_free_hint(hints);
     }
-    
+
     return arr;
 }
 
@@ -2141,18 +2325,21 @@ static Napi::Value OpenOutput(const Napi::CallbackInfo &info)
 #elif defined(EXCLUSIVE_MACOS)
 
     bool exclusive = (mode == "exclusive");
-    
+
     ok = InitCoreAudio(s, deviceId, exclusive, bufferMs, bitPerfect);
-    if (!ok) {
-        if (strictBitPerfect && exclusive) {
+    if (!ok)
+    {
+        if (strictBitPerfect && exclusive)
+        {
             delete s;
             ThrowTypeError(env, "Exclusive format not supported in strict bitPerfect mode");
             return env.Null();
         }
-        
+
         // Try without exclusive mode as fallback
         ok = InitCoreAudio(s, deviceId, false, bufferMs, false);
-        if (!ok) {
+        if (!ok)
+        {
             delete s;
             ThrowTypeError(env, "Failed to open CoreAudio output");
             return env.Null();
@@ -2162,18 +2349,21 @@ static Napi::Value OpenOutput(const Napi::CallbackInfo &info)
 #elif defined(EXCLUSIVE_LINUX)
 
     bool exclusive = (mode == "exclusive");
-    
+
     ok = InitAlsa(s, deviceId, exclusive, bufferMs, bitPerfect);
-    if (!ok) {
-        if (strictBitPerfect && exclusive) {
+    if (!ok)
+    {
+        if (strictBitPerfect && exclusive)
+        {
             delete s;
             ThrowTypeError(env, "Exclusive format not supported in strict bitPerfect mode");
             return env.Null();
         }
-        
+
         // Try without exclusive mode as fallback
         ok = InitAlsa(s, deviceId, false, bufferMs, false);
-        if (!ok) {
+        if (!ok)
+        {
             delete s;
             ThrowTypeError(env, "Failed to open ALSA output");
             return env.Null();
@@ -2264,53 +2454,101 @@ public:
                      uint32_t handle,
                      std::vector<uint8_t> &&data,
                      bool blocking)
-        : Napi::AsyncWorker(callback), handle(handle), data(std::move(data)), blocking(blocking), written(0) {}
+        : Napi::AsyncWorker(callback),
+          handle(handle),
+          data(std::move(data)),
+          blocking(blocking),
+          written(0),
+          cancelled(false) {}
 
-    void Execute() override
+void Execute() override
+{
+    OutputStreamState* s = nullptr;
+
     {
-        OutputStreamState *s = nullptr;
-        {
-            std::lock_guard<std::mutex> lock(g_streamsMutex);
-            auto it = g_streams.find(handle);
-            if (it != g_streams.end())
-                s = it->second;
-        }
-
-        if (!s)
-        {
-            SetError("Invalid handle");
+        std::lock_guard<std::mutex> lock(g_streamsMutex);
+        auto it = g_streams.find(handle);
+        if (it == g_streams.end()) {
+            cancelled.store(true);
             return;
         }
 
+        s = it->second;
+
+        if (!s || s->closing.load()) {
+            cancelled.store(true);
+            return;
+        }
+
+        // IMPORTANT: increment while lock is held
+        s->inFlightWrites.fetch_add(1, std::memory_order_acq_rel);
+    }
+
+    // Do the write outside the lock
 #if defined(EXCLUSIVE_WIN32)
-        written = WriteWasapi(s, data.data(), data.size(), blocking);
+    written = WriteWasapi(s, data.data(), data.size(), blocking);
 #elif defined(EXCLUSIVE_MACOS)
-        written = WriteCoreAudio(s, data.data(), data.size(), blocking);
+    written = WriteCoreAudio(s, data.data(), data.size(), blocking);
 #elif defined(EXCLUSIVE_LINUX)
-        written = WriteAlsa(s, data.data(), data.size(), blocking);
+    written = WriteAlsa(s, data.data(), data.size(), blocking);
 #else
-        written = -1;
+    written = -1;
 #endif
-    }
 
-    void OnOK() override
-    {
-        Napi::HandleScope scope(Env());
-        Callback().Call({ Env().Null(), Napi::Number::New(Env(), static_cast<double>(written)) });
-    }
+    // Decrement at end
+    s->inFlightWrites.fetch_sub(1, std::memory_order_acq_rel);
+}
 
-    void OnError(const Napi::Error &e) override
+   void OnOK() override
+{
+    if (cancelled.load()) return;
+
+    Napi::Env env = Env();
+    if (!env) return;
+
+    Napi::HandleScope scope(env);
+
+    Callback().Call({
+        env.Null(),
+        Napi::Number::New(env, static_cast<double>(written))
+    });
+
+    // If JS threw, clear it so it can’t crash the process
+    if (env.IsExceptionPending())
     {
-        Napi::HandleScope scope(Env());
-        Callback().Call({ Napi::String::New(Env(), e.Message()) });
+        env.GetAndClearPendingException();
     }
+}
+
+void OnError(const Napi::Error &e) override
+{
+    if (cancelled.load()) return;
+
+    Napi::Env env = Env();
+    if (!env) return;
+
+    Napi::HandleScope scope(env);
+
+    Callback().Call({
+        Napi::String::New(env, e.Message()),
+        env.Undefined()
+    });
+
+    if (env.IsExceptionPending())
+    {
+        env.GetAndClearPendingException();
+    }
+}
+
 
 private:
     uint32_t handle;
     std::vector<uint8_t> data;
     bool blocking;
     int written;
+    std::atomic<bool> cancelled;
 };
+
 
 static Napi::Value WriteAsync(const Napi::CallbackInfo &info)
 {
@@ -2361,6 +2599,10 @@ static Napi::Value Close(const Napi::CallbackInfo &info)
 
     if (s)
     {
+        // Mark closing
+        s->closing.store(true);
+
+        // Stop backend
 #if defined(EXCLUSIVE_WIN32)
         CloseWasapi(s);
 #elif defined(EXCLUSIVE_MACOS)
@@ -2368,11 +2610,19 @@ static Napi::Value Close(const Napi::CallbackInfo &info)
 #elif defined(EXCLUSIVE_LINUX)
         CloseAlsa(s);
 #endif
+
+        // WAIT for async workers
+        while (s->inFlightWrites.load(std::memory_order_acquire) > 0)
+        {
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        }
+
         delete s;
     }
 
     return env.Undefined();
 }
+
 
 static Napi::Value GetDevices(const Napi::CallbackInfo &info)
 {
@@ -2458,7 +2708,8 @@ static Napi::Value GetStats(const Napi::CallbackInfo &info)
     res.Set("paused", Napi::Boolean::New(env, s->paused.load()));
 
 #if defined(EXCLUSIVE_LINUX)
-    if (s->bufferSize > 0 && s->periodSize > 0) {
+    if (s->bufferSize > 0 && s->periodSize > 0)
+    {
         res.Set("bufferSize", Napi::Number::New(env, s->bufferSize));
         res.Set("periodSize", Napi::Number::New(env, s->periodSize));
     }
@@ -2551,9 +2802,8 @@ static Napi::Value Drain(const Napi::CallbackInfo &info)
 
     {
         std::unique_lock<std::mutex> lock(s->ringMutex);
-        s->ringCv.wait(lock, [s]() {
-            return s->ring.availableToRead() == 0 || !s->running.load();
-        });
+        s->ringCv.wait(lock, [s]()
+                       { return s->ring.availableToRead() == 0 || !s->running.load(); });
     }
 
     return env.Undefined();
