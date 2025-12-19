@@ -492,46 +492,35 @@ function stop() {
 function pause() {
   console.log('[audioEngine] pause called');
   if (!ffmpegProc || isPaused) return;
+
   try {
     if (ffmpegProc.stdout) ffmpegProc.stdout.pause();
-    // Instead of pausing the native output (which can cause underruns/hissing),
-    // keep the native stream open and write silence periodically to maintain
-    // a healthy buffer. Start a small interval that writes precomputed silence.
-    if (silenceChunk && outputStream && typeof outputStream.write === 'function') {
-      if (!silenceInterval) {
-        silenceInterval = setInterval(() => {
-          try {
-            // Best-effort write; ignore backpressure and errors
-            outputStream.write(silenceChunk);
-          } catch (e) {
-            // ignore
-          }
-        }, 20);
-      }
-    } else {
-      // Fallback: if we cannot write silence, attempt to pause output stream
-      if (outputStream && typeof outputStream.pause === 'function') outputStream.pause();
+
+    // Use native pause (it already outputs silence in the render thread)
+    if (outputStream && typeof outputStream.pause === 'function') {
+      outputStream.pause();
     }
   } catch (e) {
     console.error('[audioEngine] pause error:', e);
   }
+
   isPaused = true;
 }
+
 
 function resume() {
   console.log('[audioEngine] resume called');
   if (!ffmpegProc || !isPaused) return;
+
   try {
-    if (ffmpegProc.stdout) ffmpegProc.stdout.resume();
-    // Stop silence filler and let the real audio flow resume
-    if (silenceInterval) {
-      clearInterval(silenceInterval);
-      silenceInterval = null;
+    if (outputStream && typeof outputStream.resume === 'function') {
+      outputStream.resume();
     }
-    if (outputStream && typeof outputStream.resume === 'function') outputStream.resume();
+    if (ffmpegProc.stdout) ffmpegProc.stdout.resume();
   } catch (e) {
     console.error('[audioEngine] resume error:', e);
   }
+
   isPaused = false;
 }
 

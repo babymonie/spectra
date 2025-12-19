@@ -117,34 +117,42 @@ class ExclusiveStream extends Writable {
     if (bytesPerSecond === 0) return 0;
     return this.totalBytesWritten / bytesPerSecond;
   }
-
 _write(chunk, encoding, callback) {
-    if (this._closed) return callback();
+  if (this._closed) return callback();
 
-    // Use the native async worker which runs on a libuv thread.
-    // This avoids the 'setTimeout' loop which gets throttled when minimized.
+  // IMPORTANT: prevent "callback called multiple times"
+  let doneCalled = false;
+  const done = (err) => {
+    if (doneCalled) return;
+    doneCalled = true;
+    callback(err);
+  };
+
+  try {
     native.writeAsync(this.handle, chunk, (err, written) => {
-      if (this._closed) return callback(); // Check if stream closed during async op
+      // If we were closed while the async write was in-flight, just finish quietly.
+      if (this._closed) return done();
 
       if (err) {
-        console.error('[ExclusiveStream] writeAsync error:', err);
         this._closeNative();
-        return callback(new Error(err));
+        return done(new Error(err));
       }
 
       if (written < 0) {
-        console.error('[ExclusiveStream] writeAsync failed: device lost');
         this._closeNative();
-        return callback(new Error("exclusive audio write failed (device lost?)"));
+        return done(new Error("exclusive audio write failed (device lost?)"));
       }
 
       this.totalBytesWritten += written;
-      
-      // Successfully written (or blocked until written). 
-      // Call the callback to request the next chunk from the stream.
-      callback();
-    }, true); // 'true' for blocking: ensures backpressure is handled natively
+      return done();
+    }, true);
+  } catch (e) {
+    // If native.writeAsync itself throws synchronously
+    try { this._closeNative(); } catch {}
+    return done(e instanceof Error ? e : new Error(String(e)));
   }
+}
+
   _final(callback) {
     console.log('[ExclusiveStream] _final called');
     if (this._closed) return callback();
