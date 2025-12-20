@@ -9,7 +9,7 @@ import { extractMetadata, extractMetadataFromBuffer } from './metadataLookup.js'
 import { extractLyrics } from './metadataLookup.js';
 import db from './database.js';
 import RemoteServer from './remoteServer.js';
-
+import  registerThemeIpc  from './themeManager.js';
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 

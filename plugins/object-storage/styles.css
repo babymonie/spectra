@@ -22,10 +22,10 @@
   justify-content: space-between;
   align-items: center;
   padding: 12px 16px;
-  background-color: #1e1e1e;
+  background-color: var(--bg-elevated);
   border-radius: 8px;
   margin-bottom: 16px;
-  border: 1px solid #333;
+  border: 1px solid var(--border);
 }
 
 .status-indicator {
@@ -48,7 +48,7 @@
   display: flex;
   gap: 4px;
   margin-bottom: 20px;
-  border-bottom: 2px solid #282828;
+  border-bottom: 2px solid var(--bg-hover);
   padding-bottom: 0;
 }
 
@@ -91,8 +91,8 @@
 .storage-search-wrapper {
   display: flex;
   align-items: center;
-  background-color: #282828;
-  border: 1px solid #333;
+  background-color: var(--bg-control);
+  border: 1px solid var(--border);
   border-radius: 4px;
   padding: 0 12px;
   margin-bottom: 20px;
@@ -128,8 +128,8 @@
   flex: 1;
   display: flex;
   align-items: center;
-  background-color: #282828;
-  border: 1px solid #333;
+  background-color: var(--bg-control);
+  border: 1px solid var(--border);
   border-radius: 4px;
   padding: 0 12px;
   transition: border-color 0.2s;
@@ -157,24 +157,12 @@
 }
 
 .storage-files-container {
-  background-color: #181818;
+  background-color: var(--bg-elevated);
   border-radius: 8px;
   overflow: hidden;
-  border: 1px solid #282828;
+  border: 1px solid var(--bg-hover);
 }
 
-.track-list-header {
-  display: grid;
-  grid-template-columns: 44px 48px 3fr 1fr 1.5fr 110px;
-  padding: 12px 16px;
-  background-color: #202020;
-  border-bottom: 1px solid #333;
-  color: var(--text-secondary);
-  font-size: 12px;
-  text-transform: uppercase;
-  letter-spacing: 0.5px;
-  font-weight: 600;
-}
 
 .storage-files-list {
   max-height: calc(100vh - 300px);
@@ -185,7 +173,7 @@
   display: grid;
   grid-template-columns: 44px 48px 3fr 1fr 1.5fr 110px;
   padding: 10px 16px;
-  border-bottom: 1px solid #282828;
+  border-bottom: 1px solid var(--bg-hover);
   align-items: center;
   transition: background-color 0.1s;
 }
@@ -260,11 +248,11 @@
 }
 
 .storage-file-row.playing {
-  background: linear-gradient(90deg, rgba(29, 185, 84, 0.1) 0%, rgba(24,24,24,0) 65%);
+  background: linear-gradient(90deg, rgba(var(--accent-rgb), 0.1) 0%, rgba(24,24,24,0) 65%);
 }
 
 .storage-file-row.playing .col-icon .material-icons {
-  color: #4caf50;
+  color: var(--accent);
 }
 
 .storage-now-playing {
@@ -284,7 +272,7 @@
 
 .np-indicator .material-icons {
   font-size: 28px;
-  color: #4caf50;
+  color: var(--accent);
 }
 
 .np-meta {
@@ -342,7 +330,7 @@
 
 /* Album cards */
 .storage-album-card {
-  background-color: #181818;
+  background-color: var(--bg-elevated);
   border-radius: 8px;
   padding: 16px;
   cursor: pointer;
@@ -352,15 +340,15 @@
 }
 
 .storage-album-card:hover {
-  background-color: #282828;
-  border-color: #333;
+  background-color: var(--bg-hover);
+  border-color: var(--border);
   transform: translateY(-2px);
 }
 
 .storage-album-art {
   width: 100%;
   aspect-ratio: 1;
-  background: linear-gradient(135deg, #333 0%, #1a1a1a 100%);
+  background: linear-gradient(135deg, var(--bg-control-hover) 0%, #1a1a1a 100%);
   border-radius: 6px;
   margin-bottom: 12px;
   display: flex;
@@ -418,7 +406,7 @@
 
 /* Artist cards */
 .storage-artist-card {
-  background-color: #181818;
+  background-color: var(--bg-elevated);
   border-radius: 8px;
   padding: 16px;
   cursor: pointer;
@@ -428,8 +416,8 @@
 }
 
 .storage-artist-card:hover {
-  background-color: #282828;
-  border-color: #333;
+  background-color: var(--bg-hover);
+  border-color: var(--border);
   transform: translateY(-2px);
 }
 
@@ -488,11 +476,11 @@
 
 .storage-files-list::-webkit-scrollbar-track,
 .storage-grid-container::-webkit-scrollbar-track {
-  background: #181818;
+  background: var(--bg-elevated);
 }
 
 .storage-files-list::-webkit-scrollbar-thumb {
-  background: #333;
+  background: var(--bg-control-hover);
   border-radius: 4px;
 }
 
@@ -548,7 +536,7 @@
 
 .btn-secondary {
   background-color: transparent;
-  border: 1px solid #555;
+  border: 1px solid var(--border);
   color: var(--text-primary);
 }
 
@@ -559,7 +547,7 @@
 .btn-secondary:disabled {
   opacity: 0.5;
   cursor: not-allowed;
-  border-color: #333;
+  border-color: var(--border);
   color: var(--text-secondary);
 }
 

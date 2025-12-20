@@ -240,6 +240,168 @@ function stopFsBgAnimation() {
 
 // ------------------------------------------------------
 
+// Ensure a <style> element with the given id exists and return it
+function ensureStyleEl(id) {
+  let el = document.getElementById(id);
+  if (!el) {
+    el = document.createElement('style');
+    el.id = id;
+    document.head.appendChild(el);
+  }
+  return el;
+}
+
+async function applyActiveThemeNow() {
+  const { themeCss, quickCss } = await window.themes.getActiveCss();
+  ensureStyleEl('spectra-theme-style').textContent = themeCss || '';
+  ensureStyleEl('spectra-quickcss-style').textContent = quickCss || '';
+}
+
+// call on app load
+document.addEventListener('DOMContentLoaded', () => {
+  // Ensure style elements exist once at startup
+  ensureStyleEl('spectra-theme-style');
+  ensureStyleEl('spectra-quickcss-style');
+
+  applyActiveThemeNow().catch(console.error);
+});
+
+async function refreshThemeGrid() {
+  const grid = document.getElementById("themesGrid");
+  if (!grid) return;
+
+  const { themes, selectedTheme } = await window.themes.list();
+
+  grid.innerHTML = "";
+
+  // Default theme card
+  grid.appendChild(makeThemeCard({
+    name: "Default",
+    desc: "Built-in Spectra theme",
+    active: selectedTheme == null,
+    selectableName: null,
+    removable: false
+  }));
+
+  for (const t of themes) {
+    grid.appendChild(makeThemeCard({
+      name: t.name,
+      desc: `Local theme • ${t.filename}`,
+      active: selectedTheme === t.name,
+      selectableName: t.name,
+      removable: true
+    }));
+  }
+}
+
+function makeThemeCard({ name, desc, active, selectableName, removable }) {
+  const card = document.createElement("div");
+  card.className = `theme-card ${active ? "active" : ""}`;
+
+  const meta = document.createElement("div");
+  meta.className = "theme-meta";
+  meta.innerHTML = `
+    <div class="theme-name">${escapeHtml(name)}</div>
+    <div class="theme-desc">${escapeHtml(desc)}</div>
+  `;
+
+  const actions = document.createElement("div");
+  actions.className = "theme-actions-inline";
+
+  const btnSelect = document.createElement("button");
+  btnSelect.className = `theme-iconbtn select ${active ? "active" : ""}`;
+  btnSelect.title = "Select theme";
+  btnSelect.textContent = "✓";
+
+  btnSelect.addEventListener("click", async () => {
+    const { themeCss, quickCss } = await window.themes.select(selectableName); // null => default
+    document.getElementById("spectra-theme-style").textContent = themeCss || "";
+    document.getElementById("spectra-quickcss-style").textContent = quickCss || "";
+    await refreshThemeGrid();
+  });
+
+  actions.appendChild(btnSelect);
+
+  if (removable) {
+    const btnRemove = document.createElement("button");
+    btnRemove.className = "theme-iconbtn";
+    btnRemove.title = "Delete theme";
+    btnRemove.textContent = "✕";
+
+    btnRemove.addEventListener("click", async () => {
+      await window.themes.remove(selectableName);
+      // After remove, re-apply active css in case active theme got deleted
+      const { themeCss, quickCss } = await window.themes.getActiveCss();
+      document.getElementById("spectra-theme-style").textContent = themeCss || "";
+      document.getElementById("spectra-quickcss-style").textContent = quickCss || "";
+      await refreshThemeGrid();
+    });
+
+    actions.appendChild(btnRemove);
+  }
+
+  card.appendChild(meta);
+  card.appendChild(actions);
+  return card;
+}
+
+function escapeHtml(str) {
+  return String(str)
+    .replaceAll("&", "&amp;")
+    .replaceAll("<", "&lt;")
+    .replaceAll(">", "&gt;")
+    .replaceAll('"', "&quot;")
+    .replaceAll("'", "&#039;");
+}
+
+function initThemesSettingsUI() {
+  // Tabs
+  const tabs = document.querySelectorAll(".themes-tab");
+  tabs.forEach((tab) => {
+    tab.addEventListener("click", () => {
+      tabs.forEach((t) => t.classList.remove("active"));
+      tab.classList.add("active");
+
+      const target = tab.dataset.tab;
+      document.getElementById("themes-panel-local").classList.toggle("active", target === "local");
+      document.getElementById("themes-panel-quickcss").classList.toggle("active", target === "quickcss");
+    });
+  });
+
+  // Buttons
+  document.getElementById("btnOpenThemesFolder")?.addEventListener("click", () => window.themes.openFolder());
+  document.getElementById("btnImportTheme")?.addEventListener("click", async () => {
+    await window.themes.importDialog();
+    await refreshThemeGrid();
+  });
+  document.getElementById("btnReloadThemes")?.addEventListener("click", refreshThemeGrid);
+
+  // QuickCSS
+  const editor = document.getElementById("quickCssEditor");
+  if (editor) {
+    window.themes.getQuickCss().then(({ quickCss }) => (editor.value = quickCss || ""));
+
+    document.getElementById("btnSaveQuickCss")?.addEventListener("click", async () => {
+      await window.themes.setQuickCss(editor.value);
+      // apply immediately
+      const { themeCss, quickCss } = await window.themes.getActiveCss();
+      document.getElementById("spectra-theme-style").textContent = themeCss || "";
+      document.getElementById("spectra-quickcss-style").textContent = quickCss || "";
+    });
+
+    document.getElementById("btnClearQuickCss")?.addEventListener("click", async () => {
+      editor.value = "";
+      await window.themes.setQuickCss("");
+      document.getElementById("spectra-quickcss-style").textContent = "";
+    });
+  }
+
+  refreshThemeGrid().catch(console.error);
+}
+
+// Call this when your Settings page is mounted/created
+initThemesSettingsUI();
+
 const tokenizeQuery = (query) => {
   if (!query) return [];
   return String(query)
@@ -1561,7 +1723,7 @@ const showWebAlbumContextMenu = (event, albumInfo) => {
     position: fixed;
     left: ${event.clientX}px;
     top: ${event.clientY}px;
-    background: #282828;
+    background: var(--bg-hover);
     border: 1px solid #383838;
     border-radius: 4px;
     padding: 4px 0;

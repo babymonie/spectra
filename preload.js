@@ -1,5 +1,14 @@
 const { contextBridge, ipcRenderer } = require('electron');
-
+contextBridge.exposeInMainWorld("themes", {
+  list: () => ipcRenderer.invoke("themes:list"),
+  getActiveCss: () => ipcRenderer.invoke("themes:getActiveCss"),
+  select: (nameOrNull) => ipcRenderer.invoke("themes:select", nameOrNull),
+  openFolder: () => ipcRenderer.invoke("themes:openFolder"),
+  importDialog: () => ipcRenderer.invoke("themes:importDialog"),
+  remove: (name) => ipcRenderer.invoke("themes:remove", name),
+  getQuickCss: () => ipcRenderer.invoke("themes:getQuickCss"),
+  setQuickCss: (css) => ipcRenderer.invoke("themes:setQuickCss", css),
+});
 contextBridge.exposeInMainWorld('electron', {
   getAlbumTracks: (albumName) => ipcRenderer.invoke('library:get-album-tracks', albumName),
 
@@ -76,5 +85,6 @@ contextBridge.exposeInMainWorld('electron', {
   objectStorageList: (prefix) => ipcRenderer.invoke('object-storage:list', prefix),
   relinkTrack: (info) => ipcRenderer.invoke('track:relink', info),
   downloadTrack: (opts) => ipcRenderer.invoke('track:download', opts),
-  on: (channel, callback) => ipcRenderer.on(channel, (event, ...args) => callback(...args))
+  on: (channel, callback) => ipcRenderer.on(channel, (event, ...args) => callback(...args)),
+  
 });

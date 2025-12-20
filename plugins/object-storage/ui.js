@@ -351,7 +351,7 @@
           if (statusText) statusText.textContent = `Connected`;
           if (statusIcon) {
             statusIcon.textContent = 'cloud_done';
-            statusIcon.style.color = '#4caf50';
+            statusIcon.style.color = 'var(--accent)';
           }
           getObjectStorageSettings(true);
           // enable controls when connected
