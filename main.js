@@ -1,6 +1,7 @@
 
 import { app, BrowserWindow, ipcMain, dialog, Menu, protocol, globalShortcut, Tray, nativeImage, shell } from 'electron';
 import path from 'path';
+import net from 'net';
 import { fileURLToPath } from 'url';
 import fs from 'fs';
 import audioEngine from './audioEngine.js';
@@ -161,6 +162,35 @@ function loadPluginConfig() {
     console.error('Failed to read plugins-config.json', e);
   }
   return {};
+}
+
+// Helper: test preferred port and fall back to a free ephemeral port if it's in use
+function findAvailablePort(preferredPort, host = '0.0.0.0') {
+  return new Promise((resolve) => {
+    try {
+      const tester = net.createServer();
+      tester.once('error', (err) => {
+        tester.close?.();
+        if (err && err.code === 'EADDRINUSE') {
+          // Preferred port in use — bind ephemeral port
+          const tester2 = net.createServer();
+          tester2.listen(0, host, () => {
+            const p = tester2.address().port;
+            tester2.close(() => resolve(p));
+          });
+          tester2.once('error', () => resolve(0));
+        } else {
+          resolve(0);
+        }
+      });
+      tester.listen(preferredPort, host, () => {
+        const p = tester.address().port;
+        tester.close(() => resolve(p));
+      });
+    } catch (e) {
+      resolve(0);
+    }
+  });
 }
 
 function savePluginConfig(cfg) {
@@ -1091,18 +1121,39 @@ const handlers = {
   'audio:set-volume': (val) => { audioEngine.setVolume(val); broadcastState(); },
   'audio:seek': (time) => { audioEngine.seek(time); broadcastState(); },
   'audio:get-time': () => audioEngine.getTime(),
-  'remote:toggle': (enable) => {
+  'remote:toggle': async (enable) => {
+    // Lazily create RemoteServer if missing
     if (!remoteServer) {
-      console.warn('[main] remote:toggle invoked but remote server is unavailable');
-      return false;
+      remoteServer = new RemoteServer(path.join(__dirname, 'renderer'), async (channel, ...args) => {
+        if (handlers[channel]) return handlers[channel](...args);
+        throw new Error(`Unknown channel: ${channel}`);
+      }, { pluginRoots: [pluginsDir, repoPluginsDir] });
     }
+
     if (enable) {
+      try {
+        const chosen = await findAvailablePort(remoteServerPort, remoteServerHost);
+        if (chosen && chosen !== remoteServerPort) {
+          console.log(`[main] Preferred remote port ${remoteServerPort} unavailable, using ${chosen}`);
+          remoteServerPort = chosen;
+        }
+      } catch (e) {
+        console.warn('[main] Failed to find available port for remote server', e);
+      }
       remoteServer.start(remoteServerPort, remoteServerHost);
+      // Broadcast current remote info to renderer and remote clients
+      try {
+        broadcast('remote:info', { host: remoteServerHost, port: remoteServerPort, isRunning: !!remoteServer.isRunning });
+      } catch (e) { /* noop */ }
     } else {
       remoteServer.stop();
+      try {
+        broadcast('remote:info', { host: remoteServerHost, port: remoteServerPort, isRunning: !!remoteServer.isRunning });
+      } catch (e) { /* noop */ }
     }
     return remoteServer.isRunning;
   },
+  'remote:get-info': () => ({ host: remoteServerHost, port: remoteServerPort, isRunning: !!(remoteServer && remoteServer.isRunning) }),
   'plugins:list': async () => {
     const plugins = [];
     const cfg = loadPluginConfig();
@@ -1513,9 +1564,33 @@ app.whenReady().then(async () => {
       throw new Error(`Unknown channel: ${channel}`);
     }, { pluginRoots: [pluginsDir, repoPluginsDir] });
 
+    // Choose an available port: prefer configured port, but fall back to a free port if in use
+    try {
+      const chosen = await findAvailablePort(remoteServerPort, remoteServerHost);
+      if (chosen && chosen !== remoteServerPort) {
+        console.log(`[main] Preferred remote port ${remoteServerPort} unavailable, using ${chosen}`);
+        remoteServerPort = chosen;
+      }
+    } catch (e) {
+      console.warn('[main] Failed to pick alternative remote port, using configured port', e);
+    }
+
     remoteServer.start(remoteServerPort, remoteServerHost);
   } else {
     console.log('[main] Remote server disabled via CLI/env flag.');
+  }
+  // Register theme IPC handlers (themeManager exports an object with registerThemeIpc)
+  try {
+    if (registerThemeIpc && typeof registerThemeIpc.registerThemeIpc === 'function') {
+      registerThemeIpc.registerThemeIpc();
+      console.log('[themes] Theme IPC handlers registered');
+    } else if (typeof registerThemeIpc === 'function') {
+      // fallback if the import was the function itself
+      registerThemeIpc();
+      console.log('[themes] Theme IPC handlers registered (function)');
+    }
+  } catch (e) {
+    console.error('[themes] Failed to register theme IPC handlers', e);
   }
   
   // Load plugins after app is ready

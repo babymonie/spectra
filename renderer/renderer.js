@@ -298,6 +298,14 @@ function makeThemeCard({ name, desc, active, selectableName, removable }) {
   const card = document.createElement("div");
   card.className = `theme-card ${active ? "active" : ""}`;
 
+  // left column: preview + meta
+  const left = document.createElement("div");
+  left.className = "theme-left";
+
+  const preview = document.createElement("div");
+  preview.className = "theme-preview";
+  // preview can be styled dynamically later (background, gradients, etc.)
+
   const meta = document.createElement("div");
   meta.className = "theme-meta";
   meta.innerHTML = `
@@ -305,13 +313,16 @@ function makeThemeCard({ name, desc, active, selectableName, removable }) {
     <div class="theme-desc">${escapeHtml(desc)}</div>
   `;
 
+  left.appendChild(preview);
+  left.appendChild(meta);
+
   const actions = document.createElement("div");
   actions.className = "theme-actions-inline";
 
   const btnSelect = document.createElement("button");
   btnSelect.className = `theme-iconbtn select ${active ? "active" : ""}`;
   btnSelect.title = "Select theme";
-  btnSelect.textContent = "✓";
+  btnSelect.innerHTML = '<span class="material-icons">check</span>';
 
   btnSelect.addEventListener("click", async () => {
     const { themeCss, quickCss } = await window.themes.select(selectableName); // null => default
@@ -326,7 +337,7 @@ function makeThemeCard({ name, desc, active, selectableName, removable }) {
     const btnRemove = document.createElement("button");
     btnRemove.className = "theme-iconbtn";
     btnRemove.title = "Delete theme";
-    btnRemove.textContent = "✕";
+    btnRemove.innerHTML = '<span class="material-icons">delete</span>';
 
     btnRemove.addEventListener("click", async () => {
       await window.themes.remove(selectableName);
@@ -340,7 +351,7 @@ function makeThemeCard({ name, desc, active, selectableName, removable }) {
     actions.appendChild(btnRemove);
   }
 
-  card.appendChild(meta);
+  card.appendChild(left);
   card.appendChild(actions);
   return card;
 }
@@ -956,7 +967,13 @@ const loadSettingsUI = async () => {
   }
   if (remoteEnableCheckbox) {
     remoteEnableCheckbox.checked = settings.remoteEnabled;
-    electron.toggleRemote(settings.remoteEnabled);
+    // Ensure UI shows actual runtime remote URL/port
+    electron.toggleRemote(settings.remoteEnabled).then(async () => {
+      try {
+        const info = await electron.getRemoteInfo();
+        updateRemoteUrlDisplay(info);
+      } catch (e) { /* noop */ }
+    }).catch(() => {});
   }
   // Minimize-to-tray checkbox
   const minimizeTrayCheckbox = document.getElementById('minimize-tray-checkbox');
@@ -981,7 +998,12 @@ const saveSettings = () => {
   if (remoteEnableCheckbox) {
     settings.remoteEnabled = remoteEnableCheckbox.checked;
     localStorage.setItem('spectra_remoteEnabled', settings.remoteEnabled);
-    electron.toggleRemote(settings.remoteEnabled);
+    electron.toggleRemote(settings.remoteEnabled).then(async () => {
+      try {
+        const info = await electron.getRemoteInfo();
+        updateRemoteUrlDisplay(info);
+      } catch (e) {}
+    }).catch(() => {});
   }
 
   // Minimize-to-tray
@@ -2075,6 +2097,25 @@ const showPlaybackError = async (errInfo) => {
 // Listen for playback errors from main and show relink prompt
 electron.on('audio:error', (errInfo) => {
   showPlaybackError(errInfo);
+});
+
+// Update the remote URL display in settings
+const updateRemoteUrlDisplay = (info) => {
+  try {
+    const el = document.getElementById('remote-url-display');
+    if (!el) return;
+    if (!info || !info.port) {
+      el.textContent = 'http://localhost:3000';
+      return;
+    }
+    const host = (info.host === '0.0.0.0' || info.host === '::') ? 'localhost' : info.host;
+    el.textContent = `${host.startsWith('http') ? host : 'http://' + host}:${info.port}`;
+  } catch (e) { /* noop */ }
+};
+
+// Listen for runtime updates when remote server starts/stops or changes port
+electron.on('remote:info', (info) => {
+  updateRemoteUrlDisplay(info);
 });
 
 // Update Now Playing UI

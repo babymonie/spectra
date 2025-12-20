@@ -39,6 +39,7 @@ contextBridge.exposeInMainWorld('electron', {
   getDevices: () => ipcRenderer.invoke('audio:get-devices'),
   getPlayerState: () => ipcRenderer.invoke('player:get-state'),
   toggleRemote: (enable) => ipcRenderer.invoke('remote:toggle', enable),
+  getRemoteInfo: () => ipcRenderer.invoke('remote:get-info'),
   getPlugins: () => ipcRenderer.invoke('plugins:list'),
   // Remove listeners for a channel (used by plugin cleanup)
   off: (channel) => ipcRenderer.removeAllListeners && ipcRenderer.removeAllListeners(channel),
