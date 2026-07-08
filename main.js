@@ -216,6 +216,7 @@ let tray = null;
 let remoteServer;
 let libraryDeduped = false;
 let currentTrackMetadata = null;
+let currentPlaybackOptions = {};
 // Pending files opened before app is ready
 const pendingOpenFiles = [];
 
@@ -709,19 +710,15 @@ const handlers = {
           console.log('No track id found to update; skipping DB update');
         }
 
-        // Try to play again with updated path
-        await audioEngine.playFile(newPath, () => {
-          broadcast('audio:ended');
-          broadcastState();
-        }, (err) => {
-          console.error('Playback error after relink:', err);
-          broadcast('audio:error', {
-            message: String(err?.message || err),
-            filePath: newPath,
-            track: currentTrackMetadata
-          });
-          broadcastState();
-        }, { ...currentPlaybackOptions, track: currentTrackMetadata });
+        if (trackId) {
+          currentTrackMetadata = db.getTrackById(trackId) || { ...(targetTrack || {}), id: trackId, path: newPath };
+        } else {
+          currentTrackMetadata = { ...(targetTrack || {}), path: newPath, title: targetTrack?.title || path.basename(newPath) };
+        }
+
+        // Reuse the normal play handler so relink keeps the selected backend,
+        // ASIO window handle, EQ compatibility, queue metadata, and broadcasts.
+        await handlers['audio:play'](newPath, { ...(currentPlaybackOptions || {}), track: currentTrackMetadata });
 
         return { ok: true, newPath };
       } catch (e) {
@@ -777,6 +774,7 @@ const handlers = {
         currentTrackMetadata = track || { path: filePath, title: path.basename(filePath) };
       }
 
+      currentPlaybackOptions = { ...options, track: currentTrackMetadata };
       await audioEngine.playFile(playPath, () => {
         emitPluginEvent('track-stopped', currentTrackMetadata);
         broadcast('audio:ended');
@@ -790,7 +788,7 @@ const handlers = {
           track: currentTrackMetadata
         });
         broadcastState();
-      }, options);
+      }, currentPlaybackOptions);
       
       // Emit track started event to plugins
       emitPluginEvent('track-started', currentTrackMetadata);

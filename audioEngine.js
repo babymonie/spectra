@@ -280,6 +280,33 @@ let eqState = {
   bands: [0, 0, 0, 0, 0, 0, 0, 0, 0, 0] 
 };
 
+function applyEqPlaybackCompatibility(options = {}) {
+  const next = { ...(options || {}) };
+  if (eqState.enabled) {
+    if (next.__preEqBitPerfect === undefined) next.__preEqBitPerfect = !!next.bitPerfect;
+    if (next.__preEqStrictBitPerfect === undefined) next.__preEqStrictBitPerfect = !!next.strictBitPerfect;
+    if (next.__preEqDsdTransport === undefined) next.__preEqDsdTransport = next.dsdTransport || 'pcm';
+    next.bitPerfect = false;
+    next.strictBitPerfect = false;
+    if (next.dsdTransport === 'dop' || next.dsdTransport === 'native') {
+      next.dsdTransport = 'pcm';
+    }
+  } else {
+    if (next.__preEqBitPerfect !== undefined) {
+      next.bitPerfect = !!next.__preEqBitPerfect;
+      delete next.__preEqBitPerfect;
+    }
+    if (next.__preEqStrictBitPerfect !== undefined) {
+      next.strictBitPerfect = !!next.__preEqStrictBitPerfect;
+      delete next.__preEqStrictBitPerfect;
+    }
+    if (next.__preEqDsdTransport !== undefined) {
+      next.dsdTransport = next.__preEqDsdTransport;
+      delete next.__preEqDsdTransport;
+    }
+  }
+  return next;
+}
 function setEQ(state) {
   console.log('[audioEngine] setEQ:', state);
   const wasEnabled = eqState.enabled;
@@ -411,7 +438,7 @@ function createExclusiveStream({ sampleRate, channels, bitDepth, deviceId, mode,
 }
 
 async function playFile(filePath, onEnd, onError, options = {}) {
-  options = routePlaybackOptionsForBackendHealth(options);
+  options = applyEqPlaybackCompatibility(routePlaybackOptionsForBackendHealth(options));
   try {
     const startAt = Number(options?.startTime ?? 0);
     const trackPath = options?.track?.path;
