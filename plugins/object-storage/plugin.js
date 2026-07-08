@@ -1,14 +1,17 @@
 // object-storage plugin.js
 import { S3Client, ListObjectsV2Command, GetObjectCommand, PutObjectCommand } from '@aws-sdk/client-s3';
 import { Upload } from '@aws-sdk/lib-storage';
-import { ipcMain } from 'electron';
+import { createRequire } from 'node:module';
 import { getSignedUrl } from '@aws-sdk/s3-request-presigner';
 import { createWriteStream } from 'fs';
 import { mkdir, access, stat, readdir, unlink, readFile } from 'fs/promises';
 import { join, basename, extname, dirname } from 'path';
 import { pipeline } from 'stream/promises';
-import { app, BrowserWindow } from 'electron';
 import { Readable } from 'stream';
+
+const require = createRequire(import.meta.url);
+const electron = require('electron');
+const { app, BrowserWindow, ipcMain } = electron;
 
 let s3Client = null;
 let settings = {};

@@ -168,24 +168,41 @@
               </select>
             </div>
             <div class="setting-item">
-              <label for="mode-select">Mode</label>
+              <label for="mode-select">Backend</label>
               <select id="mode-select">
-                <option value="shared">Shared</option>
-                <option value="exclusive">Exclusive</option>
+                <option value="shared">WASAPI Shared</option>
+                <option value="exclusive">WASAPI Exclusive</option>
+                <option value="asio">ASIO</option>
               </select>
             </div>
             <div class="setting-item">
-              <label for="samplerate-select">Sample Rate (Hz)</label>
+              <label for="dsd-transport-select">DSD Transport</label>
+              <select id="dsd-transport-select">
+                <option value="pcm">PCM Decode</option>
+                <option value="dop">DoP over WASAPI Exclusive</option>
+                <option value="native">Native DSD over ASIO</option>
+              </select>
+            </div>
+            <div class="setting-item">
+              <label for="samplerate-mode-select">Sample Rate Policy</label>
+              <select id="samplerate-mode-select">
+                <option value="source">Source native</option>
+                <option value="fixed">Fixed rate</option>
+                <option value="upsample">Upsample to selected rate</option>
+              </select>
+            </div>
+            <div class="setting-item">
+              <label for="samplerate-select">Target Sample Rate (Hz)</label>
               <div style="display: flex; gap: 8px; align-items: center">
                 <select id="samplerate-select">
-                  <option value="">Auto (Default)</option>
+                  <option value="">Source native / no resampling</option>
                   <option value="44100">44100</option>
                   <option value="48000">48000</option>
                   <option value="88200">88200</option>
                   <option value="96000">96000</option>
                   <option value="176400">176400</option>
                   <option value="192000">192000</option>
-                  <option value="custom">Custom…</option>
+                  <option value="custom">Custom...</option>
                 </select>
                 <input
                   type="number"
@@ -196,6 +213,38 @@
                   style="display: none; width: 140px"
                 />
               </div>
+            </div>
+            <div class="setting-item">
+              <label for="buffer-ms-select">Buffer / Latency</label>
+              <select id="buffer-ms-select">
+                <option value="20">20 ms / low latency</option>
+                <option value="50">50 ms</option>
+                <option value="100">100 ms / balanced</option>
+                <option value="250">250 ms / safer</option>
+                <option value="500">500 ms / maximum stability</option>
+              </select>
+            </div>
+            <div class="setting-item">
+              <label for="buffer-frames-input">Buffer Samples</label>
+              <input
+                type="number"
+                id="buffer-frames-input"
+                placeholder="Auto"
+                min="16"
+                step="1"
+              />
+            </div>
+            <div class="settings-actions">
+              <button id="btn-asio-control-panel" class="btn-secondary" type="button">Open ASIO Control Panel</button>
+            </div>
+            <div class="audio-output-status" id="audio-output-status">
+              <div><span>Device</span><strong id="audio-status-device">Default</strong></div>
+              <div><span>Supported rates</span><strong id="audio-status-rates">Unknown</strong></div>
+              <div><span>Opened backend</span><strong id="audio-status-backend">Not playing</strong></div>
+              <div><span>Opened format</span><strong id="audio-status-format">Not playing</strong></div>
+              <div><span>Buffer</span><strong id="audio-status-buffer">Not playing</strong></div>
+              <div><span>Fallback</span><strong id="audio-status-fallback">No</strong></div>
+              <div><span>DSP</span><strong id="audio-status-dsp">None</strong></div>
             </div>
             <div class="setting-item checkbox">
               <input type="checkbox" id="bitperfect-checkbox" />
@@ -584,7 +633,7 @@
       ></canvas>
       <div class="fullscreen-backdrop"></div>
       <div class="fullscreen-content">
-        <button id="fs-close" class="fs-close" aria-label="Close">✕</button>
+        <button id="fs-close" class="fs-close" aria-label="Close">&times;</button>
         <div class="fs-left">
           <img id="fs-art" class="fs-art" src="" alt="Album art" />
 
@@ -642,3 +691,4 @@
     <script src="renderer.js" type="module"></script>
   </body>
 </html>
+

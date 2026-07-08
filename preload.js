@@ -10,7 +10,7 @@ contextBridge.exposeInMainWorld("themes", {
   setQuickCss: (css) => ipcRenderer.invoke("themes:setQuickCss", css),
 });
 contextBridge.exposeInMainWorld('electron', {
-  getAlbumTracks: (albumName) => ipcRenderer.invoke('library:get-album-tracks', albumName),
+  getAlbumTracks: (albumName, artistName) => ipcRenderer.invoke('library:get-album-tracks', albumName, artistName),
 
   importFile: () => ipcRenderer.invoke('library:import-file'),
   importFolder: () => ipcRenderer.invoke('library:import-folder'),
@@ -37,6 +37,7 @@ contextBridge.exposeInMainWorld('electron', {
   getTime: () => ipcRenderer.invoke('audio:get-time'),
   setVolume: (val) => ipcRenderer.invoke('audio:set-volume', val),
   getDevices: () => ipcRenderer.invoke('audio:get-devices'),
+  openAsioControlPanel: (deviceId) => ipcRenderer.invoke('audio:open-asio-control-panel', deviceId),
   getPlayerState: () => ipcRenderer.invoke('player:get-state'),
   toggleRemote: (enable) => ipcRenderer.invoke('remote:toggle', enable),
   getRemoteInfo: () => ipcRenderer.invoke('remote:get-info'),
@@ -55,7 +56,8 @@ contextBridge.exposeInMainWorld('electron', {
   reorderPlaylist: (playlistId, orderedTrackIds) => ipcRenderer.invoke('playlists:reorder', playlistId, orderedTrackIds),
   // Queue management
   getQueue: () => ipcRenderer.invoke('queue:get'),
-  setQueue: (tracks) => ipcRenderer.invoke('queue:set', tracks),
+  setQueue: (tracks, current) => ipcRenderer.invoke('queue:set', tracks, current),
+  setQueueCurrent: (current) => ipcRenderer.invoke('queue:set-current', current),
   addToQueue: (track) => ipcRenderer.invoke('queue:add', track),
   removeFromQueue: (index) => ipcRenderer.invoke('queue:remove', index),
   clearQueue: () => ipcRenderer.invoke('queue:clear'),

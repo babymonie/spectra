@@ -1,8 +1,12 @@
 // themeManager.js
-import { app, ipcMain, shell, dialog } from "electron";
+import { createRequire } from "node:module";
 import { join, basename, extname } from "path";
 import { existsSync, readFileSync } from "fs";
 import { mkdir, readFile, writeFile, readdir, unlink, copyFile } from "fs/promises";
+
+const require = createRequire(import.meta.url);
+const electron = require("electron");
+const { app, ipcMain, shell, dialog } = electron;
 
 function safeBaseName(name) {
   return String(name || "")

@@ -10,6 +10,12 @@ let repeatMode = 'off'; // 'off', 'all', 'one'
 let playbackQueue = [];
 let queueIndex = -1;
 
+// The list of tracks the current playback session is drawing from. This is
+// separate from `tracks` (the list currently shown in the library view) so
+// that browsing a different album while music is playing does not change
+// what plays next. Set by startPlayback() and used by advanceToNext/Prev/Next.
+let playbackContext = { list: [], type: 'library', key: null };
+
 // DOM Elements (assigned in init)
 let trackList;
 let btnPlay;
@@ -26,11 +32,17 @@ let totalTimeEl;
 // Settings Elements
 let deviceSelect;
 let modeSelect;
+let dsdTransportSelect;
 let bitPerfectCheckbox;
 let strictBitPerfectCheckbox;
 let remoteEnableCheckbox;
 let sampleRateSelect;
+let sampleRateModeSelect;
 let sampleRateCustomInput;
+let bufferMsSelect;
+let bufferFramesInput;
+let asioControlPanelButton;
+let outputDevices = [];
 
 // Navigation Elements
 let navLibrary;
@@ -52,6 +64,7 @@ let editModal;
 let editTitle;
 let editArtist;
 let editAlbum;
+let editAlbumArtist;
 let btnSaveEdit;
 let btnCancelEdit;
 let notificationBar;
@@ -93,6 +106,51 @@ function normalizeForCompare(s) {
     return s.toString().trim().toLowerCase().normalize('NFKD').replace(/[\u0300-\u036f]/g, '');
   }
 }
+
+const UNKNOWN_ARTIST_RE = /^(unknown|unknown artist|<unknown>|n\/?a|none|null|-|—)$/i;
+const cleanArtistName = (value) => String(value || '').replace(/\s+/g, ' ').trim();
+const isMeaningfulArtistName = (value) => {
+  const cleaned = cleanArtistName(value);
+  return !!cleaned && !UNKNOWN_ARTIST_RE.test(cleaned);
+};
+const splitArtistNames = (value) => {
+  const raw = cleanArtistName(value);
+  if (!isMeaningfulArtistName(raw)) return [];
+  return raw
+    .replace(/\s+(feat\.?|ft\.?|featuring|with)\s+/gi, ';')
+    .split(/\s*(?:,|;|\/|\||&|\band\b|،|，|、|؛)\s*/i)
+    .map(cleanArtistName)
+    .filter(isMeaningfulArtistName);
+};
+
+const getTrackArtistNames = (track) => {
+  const artists = splitArtistNames(track?.artist);
+  if (artists.length) return artists;
+  return splitArtistNames(track?.album_artist || track?.name);
+};
+
+const getDisplayArtistName = (track) => {
+  const rawArtist = cleanArtistName(track?.artist);
+  if (isMeaningfulArtistName(rawArtist)) return rawArtist;
+  return getTrackArtistNames(track)[0] || 'Unknown Artist';
+};
+
+const normalizeAlbumArtistKey = (trackOrArtist) => {
+  if (typeof trackOrArtist === 'string') return normalizeForCompare(cleanArtistName(trackOrArtist));
+  const albumArtist = isMeaningfulArtistName(trackOrArtist?.album_artist) ? trackOrArtist.album_artist : '';
+  const primary = albumArtist || getTrackArtistNames(trackOrArtist)[0] || '';
+  return normalizeForCompare(primary);
+};
+
+const getTrackArtistKeys = (track) => getTrackArtistNames(track).map((name) => normalizeForCompare(name));
+
+const canonicalArtistDisplayName = (trackOrArtist) => {
+  const raw = typeof trackOrArtist === 'string'
+    ? trackOrArtist
+    : (trackOrArtist?.name || trackOrArtist?.artist || trackOrArtist?.album_artist || '');
+  const cleaned = cleanArtistName(raw);
+  return isMeaningfulArtistName(cleaned) ? cleaned : 'Unknown Artist';
+};
 function updateRepeatButton(btn) {
   if (!btn) return;
   btn.classList.remove('active', 'repeat-one');
@@ -468,15 +526,16 @@ const computeLibraryBase = () => {
   let base = Array.isArray(libraryCache) ? libraryCache : [];
 
   if (currentAlbumFilter && currentAlbumFilter.album) {
+    const albumKey = currentAlbumFilter.album;
+    const artistKey = currentAlbumFilter.artist || '';
     base = base.filter((t) => {
       const trackAlbum = normalizeForCompare(t.album || '');
-      return trackAlbum === currentAlbumFilter.album;
+      if (trackAlbum !== albumKey) return false;
+      if (!artistKey) return true;
+      return normalizeAlbumArtistKey(t) === artistKey;
     });
   } else if (currentArtistFilter) {
-    base = base.filter((t) => {
-      const trackArtist = normalizeForCompare(t.artist || '');
-      return trackArtist === currentArtistFilter;
-    });
+    base = base.filter((t) => getTrackArtistKeys(t).includes(currentArtistFilter));
   }
 
   return base;
@@ -518,23 +577,21 @@ function updateLibraryHeader() {
   if (!libraryTitleEl) libraryTitleEl = document.querySelector('#view-library h2');
   if (!libraryTitleEl) return;
 
-  const isFiltered = libraryContext.type === 'album' || libraryContext.type === 'artist' || libraryContext.type === 'playlist';
-  
   if (libraryContext.type === 'album') {
     // When viewing an album we render a dedicated album header in the library view.
     // Hide the smaller H2 header to avoid duplicating the title.
     libraryTitleEl.style.display = 'none';
     return;
   } else if (libraryContext.type === 'artist') {
-    const label = libraryContext.name ? `Artist · ${libraryContext.name}` : 'Artist';
-    libraryTitleEl.innerHTML = `<span class="back-to-library" title="Back to Library"><span class="material-icons">arrow_back</span></span> ${label}`;
+    const label = libraryContext.name ? `Artist - ${libraryContext.name}` : 'Artist';
+    libraryTitleEl.innerHTML = `<span class="back-to-library" title="Back to Library"><span class="material-icons">arrow_back</span></span> ${esc(label)}`;
   } else if (libraryContext.type === 'playlist') {
-    const label = libraryContext.name ? `Playlist · ${libraryContext.name}` : 'Playlist';
-    libraryTitleEl.innerHTML = `<span class="back-to-library" title="Back to Library"><span class="material-icons">arrow_back</span></span> ${label}`;
+    const label = libraryContext.name ? `Playlist - ${libraryContext.name}` : 'Playlist';
+    libraryTitleEl.innerHTML = `<span class="back-to-library" title="Back to Library"><span class="material-icons">arrow_back</span></span> ${esc(label)}`;
   } else {
     libraryTitleEl.textContent = 'Library';
   }
-  
+
   // Add click handler to back button
   const backBtn = libraryTitleEl.querySelector('.back-to-library');
   if (backBtn) {
@@ -598,10 +655,36 @@ async function ensureAlbumsCache(force = false) {
   }
   try {
     const albums = await electron.getAlbums();
-    albumsCache = Array.isArray(albums) ? albums : [];
+    const raw = Array.isArray(albums) ? albums : [];
+    const merged = new Map();
+    for (const album of raw) {
+      const name = String(album?.name || album?.album || '').replace(/\s+/g, ' ').trim();
+      if (!name) continue;
+      const artist = canonicalArtistDisplayName(album?.artist || album?.artist_name || '');
+      const key = `${normalizeForCompare(name)}::${normalizeAlbumArtistKey(artist)}`;
+      if (!merged.has(key)) {
+        merged.set(key, {
+          name,
+          artist: artist || 'Unknown Artist',
+          track_count: 0,
+          cover_path: album?.cover_path || album?.coverPath || '',
+        });
+      }
+      const row = merged.get(key);
+      const trk = Number(album?.track_count ?? album?.trackCount ?? 0);
+      if (Number.isFinite(trk) && trk > 0) row.track_count += trk;
+      if (!row.cover_path && (album?.cover_path || album?.coverPath)) {
+        row.cover_path = album.cover_path || album.coverPath;
+      }
+    }
+    albumsCache = Array.from(merged.values()).sort((a, b) =>
+      String(a.artist || '').localeCompare(String(b.artist || ''), undefined, { sensitivity: 'base' }) ||
+      String(a.name || '').localeCompare(String(b.name || ''), undefined, { sensitivity: 'base' })
+    );
   } catch (err) {
     console.error('Failed to load albums:', err);
     albumsCache = [];
+    artistsCache = [];
   }
   return albumsCache;
 }
@@ -612,7 +695,30 @@ async function ensureArtistsCache(force = false) {
   }
   try {
     const artists = await electron.getArtists();
-    artistsCache = Array.isArray(artists) ? artists : [];
+    const raw = Array.isArray(artists) ? artists : [];
+    const merged = new Map();
+    for (const artist of raw) {
+      const name = canonicalArtistDisplayName(artist?.name || artist?.artist || '');
+      const key = normalizeForCompare(name);
+      if (!key) continue;
+      if (!merged.has(key)) {
+        merged.set(key, {
+          name,
+          track_count: 0,
+          album_count: 0,
+          cover_path: artist?.cover_path || '',
+        });
+      }
+      const row = merged.get(key);
+      const trk = Number(artist?.track_count ?? artist?.trackCount ?? 0);
+      const alb = Number(artist?.album_count ?? artist?.albumCount ?? 0);
+      if (Number.isFinite(trk) && trk > 0) row.track_count += trk;
+      if (Number.isFinite(alb) && alb > row.album_count) row.album_count = alb;
+      if (!row.cover_path && artist?.cover_path) row.cover_path = artist.cover_path;
+    }
+    artistsCache = Array.from(merged.values()).sort((a, b) =>
+      String(a.name || '').localeCompare(String(b.name || ''), undefined, { sensitivity: 'base' })
+    );
   } catch (err) {
     console.error('Failed to load artists:', err);
     artistsCache = [];
@@ -634,32 +740,39 @@ async function ensurePlaylistsCache(force = false) {
   return playlistsCache;
 }
 
-async function ensureAlbumTracks(albumNameRaw, force = false) {
+async function ensureAlbumTracks(albumNameRaw, albumArtistRaw = '', force = false) {
   const key = normalizeForCompare(albumNameRaw || '');
+  const artistKey = normalizeForCompare(albumArtistRaw || '');
+  const cacheKey = `${key}::${artistKey}`;
   if (!key) return [];
 
-  if (!force && currentAlbumTracksKey === key && Array.isArray(currentAlbumTracks)) {
+  if (!force && currentAlbumTracksKey === cacheKey && Array.isArray(currentAlbumTracks)) {
     return currentAlbumTracks;
   }
 
   try {
     if (electron && typeof electron.getAlbumTracks === 'function') {
-      const list = await electron.getAlbumTracks(albumNameRaw);
+      const list = await electron.getAlbumTracks(albumNameRaw, albumArtistRaw || null);
       currentAlbumTracks = Array.isArray(list) ? list : [];
-      currentAlbumTracksKey = key;
+      currentAlbumTracksKey = cacheKey;
       return currentAlbumTracks;
     }
   } catch (err) {
     console.warn('getAlbumTracks failed for', albumNameRaw, err);
   }
 
-  // Fallback: derive from cached library (album-only, no artist filter)
+  // Fallback: derive from cached library.
   const fallback = Array.isArray(libraryCache)
-    ? libraryCache.filter((t) => normalizeForCompare(t.album || '') === key)
+    ? libraryCache.filter((t) => {
+      const albumMatch = normalizeForCompare(t.album || '') === key;
+      if (!albumMatch) return false;
+      if (!artistKey) return true;
+      return normalizeAlbumArtistKey(t) === artistKey;
+    })
     : [];
 
   currentAlbumTracks = fallback;
-  currentAlbumTracksKey = key;
+  currentAlbumTracksKey = cacheKey;
   return fallback;
 }
 
@@ -687,9 +800,9 @@ async function handleSearchInput(rawValue = '') {
     return;
   }
 
-  // Album view loads tracks by album name (do NOT scope by artist).
+  // Album view loads tracks by normalized album + album artist context.
   if (libraryContext.type === 'album' && libraryContext.name) {
-    const base = await ensureAlbumTracks(libraryContext.name);
+    const base = await ensureAlbumTracks(libraryContext.name, libraryContext.artist);
     tracks = filterTracksByQuery(base, query);
     renderLibrary();
     return;
@@ -698,7 +811,85 @@ async function handleSearchInput(rawValue = '') {
   applyLibrarySearch(query);
 }
 
-// Helper function to render queue
+// Escape HTML to prevent injection when rendering track metadata from DB
+function esc(s) {
+  return String(s ?? '').replace(/[&<>"']/g, (c) => ({
+    '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;',
+  }[c]));
+}
+
+// Render a single queue row (Spotify-like): thumbnail + title/artist + duration + remove
+function buildQueueItem(track, index, { isCurrent = false } = {}) {
+  const item = document.createElement('div');
+  item.className = 'queue-item' + (isCurrent ? ' current' : '');
+  item.dataset.index = String(index);
+
+  const title = track.title || (track.path ? String(track.path).split(/[/\\]/).pop() : 'Unknown Title');
+  const artist = getDisplayArtistName(track);
+  const album = track.album || '';
+  const durationStr = typeof track.duration === 'number' && isFinite(track.duration) && track.duration > 0
+    ? formatTime(track.duration)
+    : '';
+
+  item.innerHTML = `
+    <div class="queue-item-art-wrap">
+      <div class="queue-item-art placeholder">
+        <span class="material-icons">music_note</span>
+      </div>
+      ${isCurrent ? '<div class="queue-item-playing-indicator"><span class="material-icons">equalizer</span></div>' : ''}
+    </div>
+    <div class="queue-item-info">
+      <div class="queue-item-title">${esc(title)}</div>
+      <div class="queue-item-artist">${esc(artist)}${album ? ' - ' + esc(album) : ''}</div>
+    </div>
+    <div class="queue-item-duration">${durationStr}</div>
+    <button class="queue-item-remove icon-btn" title="Remove">
+      <span class="material-icons">close</span>
+    </button>
+  `;
+
+  // Load cover art asynchronously without blocking render
+  const artEl = item.querySelector('.queue-item-art');
+  const cover = track.cover_path || track.coverPath;
+  if (cover) {
+    if (cover.startsWith('http') || cover.startsWith('data:')) {
+      artEl.style.backgroundImage = `url('${cover}')`;
+      artEl.classList.remove('placeholder');
+      artEl.innerHTML = '';
+    } else if (electron && electron.getCoverImage) {
+      electron.getCoverImage(cover).then((url) => {
+        if (url) {
+          artEl.style.backgroundImage = `url('${url}')`;
+          artEl.classList.remove('placeholder');
+          artEl.innerHTML = '';
+        }
+      }).catch(() => {});
+    }
+  }
+
+  // Clicking a queue row plays that track. Keep the current playback context
+  // (the queue itself) — don't reset it.
+  item.addEventListener('click', async (e) => {
+    if (e.target.closest('.queue-item-remove')) return;
+    await startPlayback(track, playbackQueue, {
+      type: playbackContext.type || 'queue',
+      key: playbackContext.key || null,
+    });
+    await renderQueue();
+  });
+
+  const removeBtn = item.querySelector('.queue-item-remove');
+  removeBtn.addEventListener('click', async (e) => {
+    e.stopPropagation();
+    await electron.removeFromQueue(index);
+    await renderQueue();
+  });
+
+  return item;
+}
+
+// Helper function to render queue in a Spotify-like grouped layout:
+// "Now Playing" on top, then "Next Up" with remaining tracks.
 async function renderQueue() {
   const queueList = document.getElementById('queue-list');
   if (!queueList) return;
@@ -706,51 +897,59 @@ async function renderQueue() {
   try {
     const queue = await electron.getQueue();
     playbackQueue = queue.queue || [];
-    queueIndex = queue.index || -1;
+    queueIndex = typeof queue.index === 'number' ? queue.index : -1;
 
     if (playbackQueue.length === 0) {
       queueList.innerHTML = `
         <div class="queue-empty">
           <span class="material-icons">queue_music</span>
           <p>Queue is empty</p>
+          <p class="queue-empty-hint">Play something from your library and it'll appear here.</p>
         </div>
       `;
       return;
     }
 
     queueList.innerHTML = '';
-    playbackQueue.forEach((track, index) => {
-      const item = document.createElement('div');
-      item.className = 'queue-item';
-      if (index === queueIndex) item.classList.add('current');
 
-      item.innerHTML = `
-        <div class="queue-item-index">${index + 1}</div>
-        <div class="queue-item-info">
-          <div class="queue-item-title">${track.title || 'Unknown Title'}</div>
-          <div class="queue-item-artist">${track.artist || 'Unknown Artist'}</div>
-        </div>
-        <button class="queue-item-remove icon-btn">
-          <span class="material-icons">close</span>
-        </button>
-      `;
+    // Resolve "current" for the queue header — prefer queueIndex, else match currentTrack
+    let currentIdx = queueIndex;
+    if ((currentIdx < 0 || currentIdx >= playbackQueue.length) && currentTrack) {
+      currentIdx = playbackQueue.findIndex((t) =>
+        (t.id && currentTrack.id && t.id === currentTrack.id) ||
+        (t.path && currentTrack.path && t.path === currentTrack.path)
+      );
+    }
 
-      // Click to play
-      item.addEventListener('click', async (e) => {
-        if (e.target.closest('.queue-item-remove')) return;
-        await playTrack(track);
-      });
+    // Now Playing section
+    if (currentIdx >= 0 && currentIdx < playbackQueue.length) {
+      const sectionNow = document.createElement('div');
+      sectionNow.className = 'queue-section';
+      sectionNow.innerHTML = '<div class="queue-section-title">Now Playing</div>';
+      sectionNow.appendChild(buildQueueItem(playbackQueue[currentIdx], currentIdx, { isCurrent: true }));
+      queueList.appendChild(sectionNow);
+    }
 
-      // Remove button
-      const removeBtn = item.querySelector('.queue-item-remove');
-      removeBtn.addEventListener('click', async (e) => {
-        e.stopPropagation();
-        await electron.removeFromQueue(index);
-        await renderQueue();
-      });
+    // Next Up section
+    const upcoming = [];
+    for (let i = 0; i < playbackQueue.length; i++) {
+      if (i === currentIdx) continue;
+      if (currentIdx >= 0 && i < currentIdx) continue; // only show forward queue
+      upcoming.push({ track: playbackQueue[i], index: i });
+    }
 
-      queueList.appendChild(item);
-    });
+    if (upcoming.length) {
+      const sectionNext = document.createElement('div');
+      sectionNext.className = 'queue-section';
+      const contextLabel = playbackContext.key
+        ? ` - From ${esc(String(playbackContext.key))}`
+        : '';
+      sectionNext.innerHTML = `<div class="queue-section-title">Next Up${contextLabel}</div>`;
+      for (const { track, index } of upcoming) {
+        sectionNext.appendChild(buildQueueItem(track, index));
+      }
+      queueList.appendChild(sectionNext);
+    }
   } catch (err) {
     console.error('Failed to render queue:', err);
     queueList.innerHTML = '<div class="queue-empty"><p>Error loading queue</p></div>';
@@ -803,8 +1002,8 @@ function renderPlaylistEditorTracks() {
     item.innerHTML = `
       <span class="material-icons playlist-track-drag-handle">drag_indicator</span>
       <div class="playlist-track-info">
-        <div class="playlist-track-title">${track.title || 'Unknown Title'}</div>
-        <div class="playlist-track-artist">${track.artist || 'Unknown Artist'}</div>
+        <div class="playlist-track-title">${esc(track.title || 'Unknown Title')}</div>
+        <div class="playlist-track-artist">${esc(getDisplayArtistName(track))}</div>
       </div>
       <button class="playlist-track-remove icon-btn">
         <span class="material-icons">close</span>
@@ -852,13 +1051,58 @@ function renderPlaylistEditorTracks() {
 }
 
 // Load Settings
+const savedSampleRate = localStorage.getItem('spectra_sampleRate') || '';
 let settings = {
   deviceId: localStorage.getItem('spectra_deviceId') || '',
   mode: localStorage.getItem('spectra_mode') || 'shared',
+  dsdTransport: localStorage.getItem('spectra_dsdTransport') || 'pcm',
   bitPerfect: localStorage.getItem('spectra_bitPerfect') === 'true',
   strictBitPerfect: localStorage.getItem('spectra_strictBitPerfect') === 'true',
   remoteEnabled: localStorage.getItem('spectra_remoteEnabled') === 'true',
-  sampleRate: localStorage.getItem('spectra_sampleRate') || ''
+  sampleRateMode: localStorage.getItem('spectra_sampleRateMode') || (savedSampleRate ? 'fixed' : 'source'),
+  sampleRate: savedSampleRate,
+  bufferMs: localStorage.getItem('spectra_bufferMs') || '100',
+  bufferFrames: localStorage.getItem('spectra_bufferFrames') || ''
+};
+
+
+const getSelectedOutputDevice = () => {
+  const deviceId = deviceSelect ? deviceSelect.value : settings.deviceId;
+  return outputDevices.find(d => d.id === deviceId) || null;
+};
+const formatHzList = (rates = []) => {
+  const nums = Array.from(new Set((rates || []).map(Number).filter(Number.isFinite))).sort((a, b) => a - b);
+  return nums.length ? nums.join(', ') : 'Unknown';
+};
+const updateAsioControlPanelState = () => {
+  if (!asioControlPanelButton) return;
+  const deviceId = deviceSelect ? deviceSelect.value : settings.deviceId;
+  const dev = outputDevices.find(d => d.id === deviceId);
+  const isAsio = !!(deviceId && deviceId.startsWith('asio:')) || dev?.api === 'asio' || (modeSelect && modeSelect.value === 'asio');
+  asioControlPanelButton.disabled = !isAsio;
+};
+const renderAudioOutputStatus = (status = null) => {
+  const dev = getSelectedOutputDevice();
+  const byId = (id) => document.getElementById(id);
+  const output = status?.output || null;
+  const source = status?.source || null;
+  const deviceName = dev?.name || (settings.deviceId ? settings.deviceId : 'Default');
+  const rates = dev ? formatHzList(dev.sampleRates) : 'Default device';
+  const backend = output?.requestedBackend === 'dop'
+    ? 'DoP over WASAPI Exclusive'
+    : (output?.requestedBackend === 'native-dsd' ? 'Native DSD over ASIO' : (output?.backend || (status?.playing ? 'Opening...' : 'Not playing')));
+  const sourceText = source?.sampleRate ? 'source ' + source.sampleRate + ' Hz' + (source.bitDepth ? ' / ' + source.bitDepth + '-bit' : '') : 'source idle';
+  const format = output?.sampleRate ? output.sampleRate + ' Hz / ' + (output.sampleFormat || ((output.bitDepth || '?') + '-bit')) + ' / ' + (output.channels || '?') + 'ch (' + sourceText + ')' : 'Not playing';
+  const buffer = output?.bufferFrames ? Math.round(output.bufferFrames) + ' samples' + (output.bufferMs ? ' / ' + Number(output.bufferMs).toFixed(2) + ' ms' : '') : 'Not playing';
+  const fallback = output?.fallback ? (output.fallbackReason || 'Yes') : 'No';
+  const dsp = output?.dsp === 'bypassed' ? 'Bypassed for bit-perfect/DSD' : (output?.dsp === 'eq' ? 'Equalizer active' : 'None');
+  if (byId('audio-status-device')) byId('audio-status-device').textContent = deviceName;
+  if (byId('audio-status-rates')) byId('audio-status-rates').textContent = rates;
+  if (byId('audio-status-backend')) byId('audio-status-backend').textContent = backend;
+  if (byId('audio-status-format')) byId('audio-status-format').textContent = format;
+  if (byId('audio-status-buffer')) byId('audio-status-buffer').textContent = buffer;
+  if (byId('audio-status-fallback')) byId('audio-status-fallback').textContent = fallback;
+  if (byId('audio-status-dsp')) byId('audio-status-dsp').textContent = dsp;
 };
 
 // Add minimize-to-tray preference (persisted in localStorage and informed to main)
@@ -868,12 +1112,14 @@ settings.minimizeToTray = localStorage.getItem('spectra_minimizeToTray') === 'tr
 const loadSettingsUI = async () => {
   // Load devices
   const devices = await electron.getDevices();
+  outputDevices = Array.isArray(devices) ? devices : [];
   deviceSelect.innerHTML = '<option value="">Default</option>';
   if (Array.isArray(devices)) {
     devices.forEach(d => {
       const opt = document.createElement('option');
       opt.value = d.id;
-      opt.textContent = d.name;
+        const apiLabel = d.api === 'asio' ? 'ASIO' : (d.api === 'wasapi' ? 'WASAPI' : 'Audio');
+        opt.textContent = d.name.includes('[') ? d.name : `[${apiLabel}] ${d.name}`;
       if (d.id === settings.deviceId) opt.selected = true;
       deviceSelect.appendChild(opt);
     });
@@ -886,10 +1132,10 @@ const loadSettingsUI = async () => {
         rates = dev.sampleRates.map(r => String(r));
       }
       // common rates to always offer
-      const common = ['44100','48000','88200','96000','176400','192000'];
+      const common = ['44100','48000','88200','96000','176400','192000','352800','705600'];
       const combined = [];
       // Auto option
-      combined.push({ v: '', label: 'Auto (Default)' });
+      combined.push({ v: '', label: 'Source native / no resampling' });
       // add device-supported rates first
       for (const r of rates) {
         combined.push({ v: r, label: r });
@@ -899,7 +1145,7 @@ const loadSettingsUI = async () => {
         if (!rates.includes(r)) combined.push({ v: r, label: r });
       }
       // custom option at end
-      combined.push({ v: 'custom', label: 'Custom…' });
+      combined.push({ v: 'custom', label: 'Custom...' });
 
       // Rebuild select options
       if (!sampleRateSelect) return;
@@ -932,18 +1178,29 @@ const loadSettingsUI = async () => {
     // update options when device changes
     deviceSelect.addEventListener('change', () => {
       updateSampleRateOptions(deviceSelect.value);
+      if (deviceSelect.value.startsWith('asio:') && modeSelect) {
+        modeSelect.value = 'asio';
+      }
+      updateAsioControlPanelState();
+      renderAudioOutputStatus();
     });
   }
 
   modeSelect.value = settings.mode;
+  if (sampleRateModeSelect) sampleRateModeSelect.value = settings.sampleRateMode || 'source';
+  if (dsdTransportSelect) dsdTransportSelect.value = settings.dsdTransport;
   bitPerfectCheckbox.checked = settings.bitPerfect;
   strictBitPerfectCheckbox.checked = settings.strictBitPerfect;
+  if (bufferMsSelect) bufferMsSelect.value = settings.bufferMs || '100';
+  if (bufferFramesInput) bufferFramesInput.value = settings.bufferFrames || '';
+  updateAsioControlPanelState();
+  renderAudioOutputStatus();
   // Initialize sample rate UI: select + optional custom input
   if (sampleRateSelect) {
     if (!settings.sampleRate) {
       sampleRateSelect.value = '';
       if (sampleRateCustomInput) sampleRateCustomInput.style.display = 'none';
-    } else if (['44100','48000','88200','96000','176400','192000'].includes(String(settings.sampleRate))) {
+    } else if (['44100','48000','88200','96000','176400','192000','352800','705600'].includes(String(settings.sampleRate))) {
       sampleRateSelect.value = String(settings.sampleRate);
       if (sampleRateCustomInput) sampleRateCustomInput.style.display = 'none';
     } else {
@@ -982,12 +1239,72 @@ const loadSettingsUI = async () => {
   }
 };
 
+const didOutputSettingsChange = (prev, next) => (
+  String(prev?.deviceId || '') !== String(next?.deviceId || '') ||
+  String(prev?.mode || '') !== String(next?.mode || '') ||
+  String(prev?.dsdTransport || '') !== String(next?.dsdTransport || '') ||
+  Boolean(prev?.bitPerfect) !== Boolean(next?.bitPerfect) ||
+  Boolean(prev?.strictBitPerfect) !== Boolean(next?.strictBitPerfect) ||
+  String(prev?.sampleRateMode || '') !== String(next?.sampleRateMode || '') ||
+  String(prev?.sampleRate || '') !== String(next?.sampleRate || '') ||
+  String(prev?.bufferMs || '') !== String(next?.bufferMs || '') ||
+  String(prev?.bufferFrames || '') !== String(next?.bufferFrames || '')
+);
+
+let outputSwitchInFlight = false;
+let outputSwitchPending = false;
+
+const applyOutputSettingsToActivePlayback = async () => {
+  if (outputSwitchInFlight) {
+    outputSwitchPending = true;
+    return;
+  }
+  if (!currentTrack) return;
+
+  const status = await electron.getAudioStatus().catch(() => null);
+  if (!status || !status.playing) return;
+
+  outputSwitchInFlight = true;
+  try {
+    const currentTime = Number.isFinite(status.currentTime) ? status.currentTime : (lastKnownPosition || 0);
+    // Ensure startTime is non-zero so audioEngine dedup logic never swallows
+    // a same-track re-open intended to switch output device.
+    const restartAt = currentTime > 0.01 ? currentTime : 0.06;
+    await playTrack(currentTrack, { startTime: restartAt, forceRestart: true });
+
+    // Preserve paused state after reconfigure.
+    if (status.paused) {
+      await electron.pause();
+      isPlaying = false;
+      updatePlayButton();
+    }
+  } catch (err) {
+    console.error('Failed to apply output device/settings live:', err);
+    notify('Failed to switch audio output', 'error', { autoClose: 2600 });
+  } finally {
+    outputSwitchInFlight = false;
+    if (outputSwitchPending) {
+      outputSwitchPending = false;
+      await applyOutputSettingsToActivePlayback();
+    }
+  }
+};
+
 // Save Settings
-const saveSettings = () => {
+const saveSettings = async () => {
+  const prevSettings = { ...settings };
   settings.deviceId = deviceSelect.value;
   settings.mode = modeSelect.value;
+  if (settings.deviceId.startsWith('asio:')) {
+    settings.mode = 'asio';
+    if (modeSelect) modeSelect.value = 'asio';
+  }
+  settings.dsdTransport = dsdTransportSelect ? dsdTransportSelect.value : 'pcm';
+  settings.sampleRateMode = sampleRateModeSelect ? (sampleRateModeSelect.value || 'source') : 'source';
   settings.bitPerfect = bitPerfectCheckbox.checked;
   settings.strictBitPerfect = strictBitPerfectCheckbox.checked;
+  settings.bufferMs = bufferMsSelect ? (bufferMsSelect.value || '100') : '100';
+  settings.bufferFrames = bufferFramesInput ? String(bufferFramesInput.value || '').trim() : '';
   if (sampleRateSelect) {
     if (sampleRateSelect.value === 'custom' && sampleRateCustomInput) {
       settings.sampleRate = sampleRateCustomInput.value ? String(sampleRateCustomInput.value).trim() : '';
@@ -1016,10 +1333,21 @@ const saveSettings = () => {
 
   localStorage.setItem('spectra_deviceId', settings.deviceId);
   localStorage.setItem('spectra_mode', settings.mode);
+  localStorage.setItem('spectra_dsdTransport', settings.dsdTransport);
   localStorage.setItem('spectra_bitPerfect', settings.bitPerfect);
   localStorage.setItem('spectra_strictBitPerfect', settings.strictBitPerfect);
+  localStorage.setItem('spectra_sampleRateMode', settings.sampleRateMode || 'source');
   if (settings.sampleRate) localStorage.setItem('spectra_sampleRate', settings.sampleRate);
   else localStorage.removeItem('spectra_sampleRate');
+  localStorage.setItem('spectra_bufferMs', settings.bufferMs || '100');
+  if (settings.bufferFrames) localStorage.setItem('spectra_bufferFrames', settings.bufferFrames);
+  else localStorage.removeItem('spectra_bufferFrames');
+  updateAsioControlPanelState();
+  renderAudioOutputStatus();
+
+  if (didOutputSettingsChange(prevSettings, settings)) {
+    await applyOutputSettingsToActivePlayback();
+  }
 };
 
 // Settings Event Listeners
@@ -1052,6 +1380,8 @@ const switchView = (viewId, preserveLibrary = false) => {
       void renderArtists({ forceReload: !artistsCache.length });
     } else if (viewId === 'settings') {
       loadSettingsUI();
+      initEqualizerControls();
+      void syncEqualizerControls();
     }
 
     updateSearchPlaceholder();
@@ -1089,6 +1419,8 @@ const switchView = (viewId, preserveLibrary = false) => {
     if (viewSettings) viewSettings.style.display = 'block';
     if (navSettings) navSettings.classList.add('active');
     loadSettingsUI();
+    initEqualizerControls();
+    void syncEqualizerControls();
   }
 
   updateSearchPlaceholder();
@@ -1137,9 +1469,15 @@ async function renderPlaylists({ data, forceReload = false } = {}) {
         switchView('library', true);
         await handleSearchInput(currentQuery);
         if (autoplay) {
-          const target = tracks.length > 0 ? tracks[0] : null;
-          if (target) await playTrack(target);
-          else notify('Playlist is empty', 'warning', { autoClose: 2200 });
+          // Play from the playlist's own track list — NOT the global `tracks`
+          // array, which may have been filtered by search, losing tracks.
+          const source = currentPlaylistTracks.length ? currentPlaylistTracks : tracks;
+          const target = source.length > 0 ? source[0] : null;
+          if (target) {
+            await startPlayback(target, source, { type: 'playlist', key: playlist.name || playlist.id });
+          } else {
+            notify('Playlist is empty', 'warning', { autoClose: 2200 });
+          }
         }
       } catch (err) {
         console.error('Failed to open playlist', err);
@@ -1199,14 +1537,19 @@ async function renderPlaylists({ data, forceReload = false } = {}) {
 
       const count = document.createElement('div');
       count.className = 'album-count';
-      if (typeof p._trackCount === 'number') {
-        count.textContent = `${p._trackCount} tracks`;
+      // Prefer the track_count returned by getAllPlaylists (single SQL query).
+      // Fall back to cached _trackCount or a one-off fetch for older backends.
+      const directCount = Number.isFinite(p.track_count) ? p.track_count : null;
+      if (directCount !== null) {
+        count.textContent = `${directCount} track${directCount === 1 ? '' : 's'}`;
+      } else if (typeof p._trackCount === 'number') {
+        count.textContent = `${p._trackCount} track${p._trackCount === 1 ? '' : 's'}`;
       } else {
         try {
           const tlist = await electron.getPlaylistTracks(p.id);
           const trackCount = Array.isArray(tlist) ? tlist.length : 0;
           p._trackCount = trackCount;
-          count.textContent = `${trackCount} tracks`;
+          count.textContent = `${trackCount} track${trackCount === 1 ? '' : 's'}`;
         } catch {
           count.textContent = '';
         }
@@ -1543,8 +1886,8 @@ const renderLibrary = () => {
               <span class="back-to-library" title="Back to Library"><span class="material-icons">arrow_back</span></span>
               <div class="album-type">Album</div>
             </div>
-            <div class="album-title-large">${libraryContext.name || ''}</div>
-            <div class="album-artist-meta">${artistMeta} · ${tracks.length} songs</div>
+            <div class="album-title-large">${esc(libraryContext.name || '')}</div>
+            <div class="album-artist-meta">${esc(artistMeta)} - ${tracks.length} ${tracks.length === 1 ? 'song' : 'songs'}</div>
             <div class="album-actions">
               <button class="btn-play btn-primary">Play</button>
               <button class="btn-secondary btn-shuffle">Shuffle</button>
@@ -1590,7 +1933,10 @@ const renderLibrary = () => {
         if (playBtn) playBtn.addEventListener('click', async (e) => {
           e.preventDefault();
           if (tracks && tracks.length) {
-            await playTrack(tracks[0]);
+            await startPlayback(tracks[0], tracks, {
+              type: 'album',
+              key: libraryContext.name || null,
+            });
           }
         });
 
@@ -1602,7 +1948,10 @@ const renderLibrary = () => {
           const copy = [...tracks].sort(() => Math.random() - 0.5);
           tracks = copy;
           renderLibrary();
-          await playTrack(tracks[0]);
+          await startPlayback(tracks[0], tracks, {
+            type: 'album',
+            key: libraryContext.name || null,
+          });
         });
 
         // Back button in the album header should restore library view
@@ -1635,9 +1984,9 @@ const renderLibrary = () => {
     const displayTitle = track.title || (track.path ? track.path.split(/[/\\]/).pop() : 'Unknown Title');
     
     el.innerHTML = `
-      <div class="col-title">${displayTitle}</div>
-      <div class="col-artist clickable-filter">${track.artist || 'Unknown Artist'}</div>
-      <div class="col-album clickable-filter">${track.album || 'Unknown Album'}</div>
+      <div class="col-title">${esc(displayTitle)}</div>
+      <div class="col-artist clickable-filter">${esc(getDisplayArtistName(track))}</div>
+      <div class="col-album clickable-filter">${esc(track.album || 'Unknown Album')}</div>
       <div class="col-duration">${formatTime(track.duration)}</div>
     `;
     
@@ -1645,7 +1994,7 @@ const renderLibrary = () => {
     const artistCell = el.querySelector('.col-artist');
     artistCell.addEventListener('click', async (e) => {
       e.stopPropagation();
-      const artistName = track.artist || '';
+      const artistName = getTrackArtistNames(track)[0] || '';
       if (!artistName || artistName === 'Unknown Artist') return;
       
       const artistToMatch = normalizeForCompare(artistName);
@@ -1668,7 +2017,8 @@ const renderLibrary = () => {
       if (!albumName || albumName === 'Unknown Album') return;
       
       const nameToMatch = normalizeForCompare(albumName);
-      currentAlbumFilter = { album: nameToMatch };
+      const artistToMatch = normalizeAlbumArtistKey(artistName);
+      currentAlbumFilter = { album: nameToMatch, artist: artistToMatch || null };
       currentArtistFilter = null;
       currentPlaylistFilter = null;
       currentPlaylistTracks = [];
@@ -1699,7 +2049,16 @@ const renderLibrary = () => {
         (track.id && currentTrack.id && track.id === currentTrack.id) ||
         (!track.id && currentTrack.path && track.path && currentTrack.path === track.path)
       );
-      playTrack(track, { forceRestart: Boolean(sameTrack) });
+      // Establish playback context = the list currently shown so Next/Prev
+      // traverse the list the user just picked from.
+      if (sameTrack) {
+        playTrack(track, { forceRestart: true });
+      } else {
+        startPlayback(track, tracks, {
+          type: libraryContext.type || 'library',
+          key: libraryContext.name || libraryContext.id || null,
+        });
+      }
     });
     
     // Context Menu
@@ -1813,6 +2172,7 @@ const handleAlbumDeleteConfirm = async (albumInfo) => {
         // Refresh library and albums view
         await loadLibrary();
         albumsCache = [];
+        artistsCache = [];
         await renderAlbums({ forceReload: true });
       }
     } catch (err) {
@@ -1827,8 +2187,9 @@ const handleAlbumView = async (albumInfo) => {
   const { albumName, artistName } = albumInfo;
   const nameToMatch = normalizeForCompare(albumName);
   if (!nameToMatch) return;
+  const artistToMatch = normalizeAlbumArtistKey(artistName || '');
 
-  currentAlbumFilter = { album: nameToMatch };
+  currentAlbumFilter = { album: nameToMatch, artist: artistToMatch || null };
   currentArtistFilter = null;
   currentPlaylistFilter = null;
   currentPlaylistTracks = [];
@@ -1911,7 +2272,8 @@ async function renderAlbums({ data, forceReload = false } = {}) {
 
     const count = document.createElement('div');
     count.className = 'album-count';
-    count.textContent = `${album.track_count || album.trackCount || 0} tracks`;
+    const trackCount = Number(album.track_count ?? album.trackCount ?? 0) || 0;
+    count.textContent = `${trackCount} ${trackCount === 1 ? 'track' : 'tracks'}`;
 
     card.appendChild(img);
     card.appendChild(title);
@@ -1929,7 +2291,8 @@ async function renderAlbums({ data, forceReload = false } = {}) {
           return;
         }
 
-        currentAlbumFilter = { album: nameToMatch };
+        const artistToMatch = normalizeAlbumArtistKey(artistNameRaw || '');
+        currentAlbumFilter = { album: nameToMatch, artist: artistToMatch || null };
         currentArtistFilter = null;
         currentPlaylistFilter = null;
         currentPlaylistTracks = [];
@@ -1999,19 +2362,23 @@ async function renderArtists({ data, forceReload = false } = {}) {
     
     const title = document.createElement('div');
     title.className = 'album-title';
-    const artistName = (artist.name || '').toString();
+    const artistName = canonicalArtistDisplayName((artist.name || '').toString());
     title.textContent = artistName || 'Unknown Artist';
 
     const count = document.createElement('div');
     count.className = 'album-artist';
-    count.textContent = `${artist.album_count || 0} albums, ${artist.track_count || 0} tracks`;
+    const albCount = Number(artist.album_count ?? 0) || 0;
+    const trkCount = Number(artist.track_count ?? 0) || 0;
+    const albLabel = `${albCount} ${albCount === 1 ? 'album' : 'albums'}`;
+    const trkLabel = `${trkCount} ${trkCount === 1 ? 'track' : 'tracks'}`;
+    count.textContent = `${albLabel} - ${trkLabel}`;
 
     card.appendChild(img);
     card.appendChild(title);
     card.appendChild(count);
 
     card.onclick = (() => {
-      const artistToMatch = normalizeForCompare(artistName);
+      const artistToMatch = normalizeAlbumArtistKey(artistName);
       return async () => {
         currentArtistFilter = artistToMatch;
         currentAlbumFilter = null;
@@ -2029,13 +2396,51 @@ async function renderArtists({ data, forceReload = false } = {}) {
   }
 }
 
+// Begin playing a track AND establish a new playback context (the list that
+// Next/Previous/auto-advance should traverse). Call this from UI entry points
+// where the user picked a track out of a specific list (library, album,
+// playlist). playTrack() without a contextList is used for Next/Prev inside
+// the existing context — it preserves playbackContext as-is.
+const startPlayback = async (track, list, meta = {}) => {
+  if (Array.isArray(list) && list.length) {
+    playbackContext = {
+      list: [...list],
+      type: meta.type || 'library',
+      key: meta.key || null,
+    };
+    // Mirror into main-process queue so media keys / remote / Next/Prev
+    // handlers on main also have the right list.
+    try {
+      const seed = list.map((t) => ({
+        id: t.id,
+        path: t.path,
+        title: t.title,
+        artist: t.artist,
+        album: t.album,
+        album_artist: t.album_artist,
+        duration: t.duration,
+        cover_path: t.cover_path || t.coverPath || null,
+      }));
+      const currentIndex = Math.max(0, seed.findIndex((t) =>
+        (track?.id != null && t.id != null && t.id === track.id) ||
+        (track?.path && t.path && t.path === track.path)
+      ));
+      await electron.setQueue(seed, currentIndex);
+    } catch (err) {
+      console.warn('setQueue failed:', err);
+    }
+  }
+  return playTrack(track, { ...meta, forceRestart: true });
+};
+
+const getAutoSampleRateForOutput = () => undefined;
 // Play Track
 const playTrack = async (track, opts = {}) => {
   const { startTime, forceRestart = true } = opts || {};
-  
+
   // Check if same track BEFORE updating currentTrack
   const isSameTrack = currentTrack && track && currentTrack.id === track.id;
-  
+
   currentTrack = track;
   // Show UI animation for now playing
   showNowPlaying();
@@ -2044,18 +2449,22 @@ const playTrack = async (track, opts = {}) => {
   saveLastPlayed(currentTrack, startPos);
   // Normalize sample rate: parse to integer and validate reasonable range
   let sr;
-  if (settings.sampleRate) {
+  if (settings.sampleRateMode !== 'source' && settings.sampleRate) {
     const parsed = Number.parseInt(String(settings.sampleRate).trim(), 10);
     if (!Number.isNaN(parsed) && parsed > 8000 && parsed < 1000000) sr = parsed;
     else sr = undefined;
-  } else sr = undefined;
+  } else sr = getAutoSampleRateForOutput();
 
   const playbackOptions = {
     deviceId: settings.deviceId,
     mode: settings.mode,
+    dsdTransport: settings.dsdTransport,
     bitPerfect: settings.bitPerfect,
     strictBitPerfect: settings.strictBitPerfect,
+    sampleRatePolicy: settings.sampleRateMode || 'source',
     sampleRate: sr,
+    bufferMs: Number.parseInt(String(settings.bufferMs || '100'), 10) || 100,
+    bufferFrames: Number.parseInt(String(settings.bufferFrames || '0'), 10) || 0,
     volume: Number(volumeSlider.value), // Pass current volume as number
     track: track
   };
@@ -2067,11 +2476,22 @@ const playTrack = async (track, opts = {}) => {
     await electron.playTrack(track.path, playbackOptions);
   }
 
+  // Keep main-process queue index in sync when tracks change from renderer
+  // controls (Prev/Next/click), so media keys continue from the correct slot.
+  try {
+    if (electron.setQueueCurrent && track) {
+      await electron.setQueueCurrent({ id: track.id, path: track.path });
+    }
+  } catch {}
+
   isPlaying = true;
   lastKnownPosition = startPos;
   updateNowPlaying();
   renderLibrary(); // Update active state
   updatePlayButton();
+  if (isFullscreenVisible()) {
+    showFullscreen();
+  }
 };
 
 // Show a simple playback error notification with option to relink file
@@ -2099,6 +2519,15 @@ electron.on('audio:error', (errInfo) => {
   showPlaybackError(errInfo);
 });
 
+// Main process emits this when FFmpeg reaches natural end-of-stream.
+// Use it as the primary auto-advance trigger so pause state never skips tracks.
+electron.on('audio:ended', () => {
+  if (!currentTrack) return;
+  if (lastAutoAdvancedTrackId === (currentTrack && currentTrack.id)) return;
+  lastAutoAdvancedTrackId = currentTrack && currentTrack.id;
+  void advanceToNext();
+});
+
 // Update the remote URL display in settings
 const updateRemoteUrlDisplay = (info) => {
   try {
@@ -2122,7 +2551,7 @@ electron.on('remote:info', (info) => {
 const updateNowPlaying = async () => {
   if (!currentTrack) return;
   npTitle.textContent = currentTrack.title || 'Unknown Title';
-  npArtist.textContent = currentTrack.artist || 'Unknown Artist';
+  npArtist.textContent = getDisplayArtistName(currentTrack);
   
   if (currentTrack.cover_path) {
     if (currentTrack.cover_path.startsWith('http') || currentTrack.cover_path.startsWith('data:')) {
@@ -2159,22 +2588,40 @@ const updateNowPlaying = async () => {
 
 // Fullscreen view handlers
 let currentSyncedLyrics = null; // Array of { time: number, text: string }
+let fullscreenLyricsToken = 0;
+
+const getTrackIdentityKey = (track) => {
+  if (!track) return '';
+  if (track.id != null) return `id:${track.id}`;
+  return `path:${track.path || ''}`;
+};
+
+const isFullscreenVisible = () => {
+  const overlay = document.getElementById('fullscreen-player');
+  return !!(overlay && !overlay.classList.contains('hidden'));
+};
 
 function parseSyncedLyrics(lrc) {
-  const lines = lrc.split('\n');
+  if (typeof lrc !== 'string' || !lrc.trim()) return [];
+  const lines = lrc.split(/\r?\n/);
   const result = [];
-  const timeReg = /\[(\d{2}):(\d{2})\.(\d{2,3})\]/;
+  const timeReg = /\[(\d{1,2}):(\d{2})(?:[.,:](\d{1,3}))?\]/g;
   for (const line of lines) {
-    const match = timeReg.exec(line);
-    if (match) {
-      const min = parseInt(match[1], 10);
-      const sec = parseInt(match[2], 10);
-      const ms = parseInt(match[3].padEnd(3, '0'), 10);
-      const time = min * 60 + sec + ms / 1000;
-      const text = line.replace(timeReg, '').trim();
-      if (text) result.push({ time, text });
+    timeReg.lastIndex = 0;
+    const tags = [...line.matchAll(timeReg)];
+    if (!tags.length) continue;
+    timeReg.lastIndex = 0;
+    const text = line.replace(timeReg, '').trim();
+    if (!text) continue;
+    for (const tag of tags) {
+      const min = parseInt(tag[1], 10) || 0;
+      const sec = parseInt(tag[2], 10) || 0;
+      const frac = String(tag[3] || '0');
+      const ms = parseInt(frac.padEnd(3, '0').slice(0, 3), 10) || 0;
+      result.push({ time: min * 60 + sec + ms / 1000, text });
     }
   }
+  result.sort((a, b) => a.time - b.time);
   return result;
 }
 
@@ -2201,7 +2648,69 @@ function renderSyncedLyrics(lyricsData) {
   });
 }
 
+let eqControlsInitialized = false;
+
+async function syncEqualizerControls() {
+  const eqEnabled = document.getElementById('eq-enabled');
+  const eqPreset = document.getElementById('eq-preset');
+  const eqSliders = document.querySelectorAll('.eq-slider');
+
+  try {
+    const eq = await electron.getEQ();
+    if (!eq) return;
+    if (eqEnabled) eqEnabled.checked = !!eq.enabled;
+    if (eqPreset) eqPreset.value = eq.preset || 'flat';
+    if (eq.bands && eqSliders.length === eq.bands.length) {
+      eqSliders.forEach((slider, i) => {
+        slider.value = eq.bands[i];
+      });
+    }
+  } catch (err) {
+    console.error('Failed to load EQ state:', err);
+  }
+}
+
+function initEqualizerControls() {
+  if (eqControlsInitialized) return;
+
+  const eqEnabled = document.getElementById('eq-enabled');
+  const eqPreset = document.getElementById('eq-preset');
+  const eqSliders = document.querySelectorAll('.eq-slider');
+
+  if (eqEnabled) {
+    eqEnabled.onchange = async () => {
+      await electron.setEQEnabled(eqEnabled.checked);
+      await syncEqualizerControls();
+    };
+  }
+
+  if (eqPreset) {
+    eqPreset.onchange = async () => {
+      await electron.setEQPreset(eqPreset.value);
+      await syncEqualizerControls();
+    };
+  }
+
+  if (eqSliders.length > 0) {
+    eqSliders.forEach((slider, index) => {
+      slider.oninput = async () => {
+        const eq = await electron.getEQ();
+        if (eq && eq.bands) {
+          const newBands = [...eq.bands];
+          newBands[index] = parseFloat(slider.value);
+          await electron.setEQBands(newBands);
+          if (eqPreset) eqPreset.value = 'custom';
+        }
+      };
+    });
+  }
+
+  eqControlsInitialized = true;
+  void syncEqualizerControls();
+}
+
 function showFullscreen() {
+  const activeTrack = currentTrack;
   const overlay = document.getElementById('fullscreen-player');
   const fsArt = document.getElementById('fs-art');
   const fsBgArt = document.getElementById('fs-bg-art');
@@ -2219,14 +2728,17 @@ function showFullscreen() {
   const btnFsShuffle = document.getElementById('fs-btn-shuffle');
   const btnFsRepeat = document.getElementById('fs-btn-repeat');
 
-  if (!overlay || !currentTrack) return;
+  if (!overlay || !activeTrack) return;
+
+  const trackKeyAtOpen = getTrackIdentityKey(activeTrack);
+  const token = ++fullscreenLyricsToken;
   
   // Enter actual fullscreen
-  electron.setFullscreen(true);
+  try { electron.setFullscreen(true); } catch {}
 
   // Populate
-  fsTitle.textContent = currentTrack.title || 'Unknown Title';
-  fsArtist.textContent = currentTrack.artist || 'Unknown Artist';
+  fsTitle.textContent = activeTrack.title || 'Unknown Title';
+  fsArtist.textContent = getDisplayArtistName(activeTrack);
   // Provide full text in title attribute so users can see the full name on hover
   try {
     fsTitle.title = fsTitle.textContent || '';
@@ -2236,7 +2748,7 @@ function showFullscreen() {
   }
   
   // Update time immediately
-  if (fsTotalTime) fsTotalTime.textContent = formatTime(currentTrack.duration);
+  if (fsTotalTime) fsTotalTime.textContent = formatTime(activeTrack.duration);
   
   // Wire up controls
   if (btnFsPlay) {
@@ -2271,21 +2783,23 @@ function showFullscreen() {
   
   if (btnFsPrev) {
     btnFsPrev.onclick = () => {
-      if (!currentTrack || tracks.length === 0) return;
-      const idx = tracks.findIndex(t => t.id === currentTrack.id);
-      if (idx > 0) {
-        playTrack(tracks[idx - 1]);
-      }
+      if (!currentTrack) return;
+      const list = playbackContext.list.length ? playbackContext.list : tracks;
+      if (!list.length) return;
+      const idx = list.findIndex(t => t.id === currentTrack.id);
+      if (idx > 0) playTrack(list[idx - 1]);
+      else if (repeatMode === 'all') playTrack(list[list.length - 1]);
     };
   }
 
   if (btnFsNext) {
     btnFsNext.onclick = () => {
-      if (!currentTrack || tracks.length === 0) return;
-      const idx = tracks.findIndex(t => t.id === currentTrack.id);
-      if (idx >= 0 && idx < tracks.length - 1) {
-        playTrack(tracks[idx + 1]);
-      }
+      if (!currentTrack) return;
+      const list = playbackContext.list.length ? playbackContext.list : tracks;
+      if (!list.length) return;
+      const idx = list.findIndex(t => t.id === currentTrack.id);
+      if (idx >= 0 && idx < list.length - 1) playTrack(list[idx + 1]);
+      else if (repeatMode === 'all' && list.length) playTrack(list[0]);
     };
   }
 
@@ -2398,12 +2912,14 @@ function showFullscreen() {
     // store observer so we can disconnect on hideFullscreen if desired
     fsBgArt._fsObserver = obs;
   }
-  if (currentTrack.cover_path) {
-    if (currentTrack.cover_path.startsWith('http') || currentTrack.cover_path.startsWith('data:')) {
-      setArt(currentTrack.cover_path);
+  if (activeTrack.cover_path) {
+    if (activeTrack.cover_path.startsWith('http') || activeTrack.cover_path.startsWith('data:')) {
+      setArt(activeTrack.cover_path);
     } else {
       // Local file, try to get it via IPC
-      electron.getCoverImage(currentTrack.cover_path).then(dataUrl => {
+      electron.getCoverImage(activeTrack.cover_path).then(dataUrl => {
+        if (token !== fullscreenLyricsToken) return;
+        if (getTrackIdentityKey(currentTrack) !== trackKeyAtOpen) return;
         setArt(dataUrl);
       }).catch(() => setArt(''));
     }
@@ -2417,8 +2933,10 @@ function showFullscreen() {
 
   (async () => {
     try {
+      if (token !== fullscreenLyricsToken) return;
+      if (getTrackIdentityKey(currentTrack) !== trackKeyAtOpen) return;
       // Check if we already have lyrics in memory
-      let lyricsText = currentTrack.lyrics;
+      let lyricsText = activeTrack.lyrics;
       // Filter out bad data
       if (lyricsText === '[object Object]') lyricsText = null;
       
@@ -2426,7 +2944,9 @@ function showFullscreen() {
 
       // If not in memory, fetch
       if (!lyricsText) {
-        const res = await electron.getLyrics({ filePath: currentTrack.path, external: true, artist: currentTrack.artist, title: currentTrack.title });
+        const res = await electron.getLyrics({ filePath: activeTrack.path, external: true, artist: activeTrack.artist, title: activeTrack.title });
+        if (token !== fullscreenLyricsToken) return;
+        if (getTrackIdentityKey(currentTrack) !== trackKeyAtOpen) return;
         if (res && res.lyrics && res.lyrics !== '[object Object]') {
           lyricsText = res.lyrics;
           isSynced = res.isSynced; // Flag from main process
@@ -2434,10 +2954,12 @@ function showFullscreen() {
           // Persist fetched lyrics into DB
           if (res.source === 'online' || res.source === 'embedded') {
             try {
-              if (currentTrack && currentTrack.id) {
-                const saveRes = await electron.saveLyrics({ trackId: currentTrack.id, lyrics: res.lyrics });
+              if (activeTrack && activeTrack.id) {
+                const saveRes = await electron.saveLyrics({ trackId: activeTrack.id, lyrics: res.lyrics });
                 if (saveRes && saveRes.success) {
-                  currentTrack.lyrics = res.lyrics;
+                  if (getTrackIdentityKey(currentTrack) === trackKeyAtOpen) {
+                    currentTrack.lyrics = res.lyrics;
+                  }
                 }
               }
             } catch (saveErr) {
@@ -2447,7 +2969,7 @@ function showFullscreen() {
         }
       } else {
         // Check if stored lyrics look like LRC
-        if (lyricsText.includes('[00:')) isSynced = true;
+        if (/\[\d{1,2}:\d{2}(?:[.,:]\d{1,3})?\]/.test(lyricsText)) isSynced = true;
       }
 
       if (lyricsText) {
@@ -2461,7 +2983,7 @@ function showFullscreen() {
         fsLyrics.textContent = 'Lyrics not available for this track.';
       }
     } catch (e) {
-      if (currentTrack && currentTrack.lyrics) fsLyrics.textContent = currentTrack.lyrics;
+      if (activeTrack && activeTrack.lyrics) fsLyrics.textContent = activeTrack.lyrics;
       else fsLyrics.textContent = 'Lyrics not available for this track.';
     }
   })();
@@ -2470,6 +2992,11 @@ function showFullscreen() {
 
   // Close handlers
   const closeBtn = document.getElementById('fs-close');
+  const prevHandler = overlay._escHandler;
+  if (prevHandler) {
+    document.removeEventListener('keydown', prevHandler);
+    overlay._escHandler = null;
+  }
   function escHandler(e) { if (e.key === 'Escape') hideFullscreen(); }
   closeBtn.onclick = hideFullscreen;
   document.addEventListener('keydown', escHandler);
@@ -2488,14 +3015,17 @@ function startFullscreenProgressLoop() {
   const btnFsPlay = document.getElementById('fs-btn-play');
   
   fsProgressInterval = setInterval(async () => {
+    const status = await electron.getAudioStatus().catch(() => null);
+    const playingNow = status ? (Boolean(status.playing) && !Boolean(status.paused)) : isPlaying;
+    const time = (status && typeof status.currentTime === 'number') ? status.currentTime : 0;
+
     // Update Play/Pause Icon
     if (btnFsPlay) {
       const icon = btnFsPlay.querySelector('.material-icons');
-      if (icon) icon.textContent = isPlaying ? 'pause_circle_filled' : 'play_circle_filled';
+      if (icon) icon.textContent = playingNow ? 'pause_circle_filled' : 'play_circle_filled';
     }
 
-    if (!isPlaying) return;
-    const time = await electron.getAudioStatus().then(s => s.currentTime).catch(() => 0);
+    if (!playingNow) return;
     if (fsCurrentTime) fsCurrentTime.textContent = formatTime(time);
     if (fsProgressFill && currentTrack && currentTrack.duration) {
       const pct = (time / currentTrack.duration) * 100;
@@ -2537,7 +3067,8 @@ function hideFullscreen() {
   if (!overlay) return;
   
   // Exit actual fullscreen
-  electron.setFullscreen(false);
+  try { electron.setFullscreen(false); } catch {}
+  fullscreenLyricsToken++;
   
   overlay.classList.add('hidden');
   const handler = overlay._escHandler;
@@ -2679,6 +3210,7 @@ const syncState = (state) => {
       // reset auto-advance marker when track changes
       lastAutoAdvancedTrackId = null;
       updateNowPlaying();
+      if (isFullscreenVisible()) showFullscreen();
       showNowPlaying();
       renderLibrary();
   } else if (state.track && currentTrack) {
@@ -2694,7 +3226,9 @@ const syncState = (state) => {
   }
 };
 
-// Advance playback to the next track based on current context (playlist vs library)
+// Advance playback to the next track based on the active PLAYBACK context,
+// not the currently-viewed list. That way browsing a different album while
+// music plays doesn't redirect Next/auto-advance to that album.
 async function advanceToNext() {
   if (!currentTrack) return;
   // If repeat one, restart same track
@@ -2703,14 +3237,16 @@ async function advanceToNext() {
     return;
   }
 
-  // Determine source list
-  let sourceList = [];
-  if (libraryContext.type === 'playlist' && Array.isArray(currentPlaylistTracks) && currentPlaylistTracks.length) {
-    sourceList = currentPlaylistTracks;
-  } else if (Array.isArray(tracks) && tracks.length) {
-    sourceList = tracks;
-  } else if (Array.isArray(libraryCache) && libraryCache.length) {
-    sourceList = libraryCache;
+  // Prefer the playbackContext captured when playback started.
+  let sourceList = Array.isArray(playbackContext.list) && playbackContext.list.length
+    ? playbackContext.list
+    : [];
+
+  // Fallbacks for sessions that started before playbackContext was introduced
+  // (e.g. if main process triggered playback via media keys).
+  if (sourceList.length === 0) {
+    if (Array.isArray(tracks) && tracks.length) sourceList = tracks;
+    else if (Array.isArray(libraryCache) && libraryCache.length) sourceList = libraryCache;
   }
 
   if (!sourceList || sourceList.length === 0) return;
@@ -3451,11 +3987,16 @@ async function init() {
 
   deviceSelect = document.getElementById('device-select');
   modeSelect = document.getElementById('mode-select');
+  dsdTransportSelect = document.getElementById('dsd-transport-select');
   bitPerfectCheckbox = document.getElementById('bitperfect-checkbox');
   strictBitPerfectCheckbox = document.getElementById('strict-bitperfect-checkbox');
   remoteEnableCheckbox = document.getElementById('remote-enable-checkbox');
   sampleRateSelect = document.getElementById('samplerate-select');
+  sampleRateModeSelect = document.getElementById('samplerate-mode-select');
   sampleRateCustomInput = document.getElementById('samplerate-custom');
+  bufferMsSelect = document.getElementById('buffer-ms-select');
+  bufferFramesInput = document.getElementById('buffer-frames-input');
+  asioControlPanelButton = document.getElementById('btn-asio-control-panel');
 
   // Plugins reload button
   const btnReloadPlugins = document.getElementById('btn-reload-plugins');
@@ -3500,6 +4041,7 @@ async function init() {
   editTitle = document.getElementById('edit-title');
   editArtist = document.getElementById('edit-artist');
   editAlbum = document.getElementById('edit-album');
+  editAlbumArtist = document.getElementById('edit-album-artist');
   btnSaveEdit = document.getElementById('btn-save-edit');
   btnCancelEdit = document.getElementById('btn-cancel-edit');
 
@@ -3512,11 +4054,31 @@ async function init() {
   notificationTrack = document.querySelector('#notification-bar .progress-track');
 
   // Settings event listeners
-  if (deviceSelect) deviceSelect.onchange = saveSettings;
-  if (modeSelect) modeSelect.onchange = saveSettings;
-  if (bitPerfectCheckbox) bitPerfectCheckbox.onchange = saveSettings;
-  if (strictBitPerfectCheckbox) strictBitPerfectCheckbox.onchange = saveSettings;
-  if (remoteEnableCheckbox) remoteEnableCheckbox.onchange = saveSettings;
+  if (deviceSelect) deviceSelect.onchange = () => { void saveSettings(); };
+  if (modeSelect) modeSelect.onchange = () => { updateAsioControlPanelState(); void saveSettings(); };
+  if (dsdTransportSelect) dsdTransportSelect.onchange = () => { void saveSettings(); };
+  if (bitPerfectCheckbox) bitPerfectCheckbox.onchange = () => { void saveSettings(); };
+  if (strictBitPerfectCheckbox) strictBitPerfectCheckbox.onchange = () => { void saveSettings(); };
+  if (bufferMsSelect) bufferMsSelect.onchange = () => { void saveSettings(); };
+  if (bufferFramesInput) bufferFramesInput.onchange = () => { void saveSettings(); };
+  if (remoteEnableCheckbox) remoteEnableCheckbox.onchange = () => { void saveSettings(); };
+  if (sampleRateModeSelect) sampleRateModeSelect.onchange = () => { void saveSettings(); };
+  if (sampleRateSelect) sampleRateSelect.onchange = () => { void saveSettings(); };
+  if (sampleRateCustomInput) sampleRateCustomInput.onchange = () => { void saveSettings(); };
+  if (asioControlPanelButton) {
+    asioControlPanelButton.onclick = async () => {
+      try {
+        asioControlPanelButton.disabled = true;
+        await electron.openAsioControlPanel(settings.deviceId);
+      } catch (err) {
+        console.error('Failed to open ASIO control panel:', err);
+        NotificationCenter.show({ message: 'Failed to open ASIO control panel', detail: String(err?.message || err), type: 'error', autoClose: 3600 });
+      } finally {
+        updateAsioControlPanelState();
+      }
+    };
+  }
+  initEqualizerControls();
 
   // Queue panel handlers
   if (btnQueue) {
@@ -3692,27 +4254,34 @@ async function init() {
           await playTrack(currentTrack);
         }
       } else if (tracks.length > 0) {
-        await playTrack(tracks[0]);
+        await startPlayback(tracks[0], tracks, {
+          type: libraryContext.type || 'library',
+          key: libraryContext.name || libraryContext.id || null,
+        });
       }
     }
     updatePlayButton();
   };
 
-  // Prev/Next buttons
+  // Prev/Next buttons — use the saved playback context, not the currently
+  // visible list, so viewing a different album while music plays doesn't
+  // hijack the next-track target.
   if (btnPrev) btnPrev.onclick = () => {
-    if (!currentTrack || tracks.length === 0) return;
-    const idx = tracks.findIndex(t => t.id === currentTrack.id);
-    if (idx > 0) {
-      playTrack(tracks[idx - 1]);
-    }
+    if (!currentTrack) return;
+    const list = playbackContext.list.length ? playbackContext.list : tracks;
+    if (!list.length) return;
+    const idx = list.findIndex(t => t.id === currentTrack.id);
+    if (idx > 0) playTrack(list[idx - 1]);
+    else if (repeatMode === 'all') playTrack(list[list.length - 1]);
   };
 
   if (btnNext) btnNext.onclick = () => {
-    if (!currentTrack || tracks.length === 0) return;
-    const idx = tracks.findIndex(t => t.id === currentTrack.id);
-    if (idx >= 0 && idx < tracks.length - 1) {
-      playTrack(tracks[idx + 1]);
-    }
+    if (!currentTrack) return;
+    const list = playbackContext.list.length ? playbackContext.list : tracks;
+    if (!list.length) return;
+    const idx = list.findIndex(t => t.id === currentTrack.id);
+    if (idx >= 0 && idx < list.length - 1) playTrack(list[idx + 1]);
+    else if (repeatMode === 'all' && list.length) playTrack(list[0]);
   };
 
   // Volume/seek
@@ -3754,7 +4323,7 @@ async function init() {
   if (btnCancelEdit) btnCancelEdit.onclick = closeEditModal;
   if (btnSaveEdit) btnSaveEdit.onclick = async () => {
     if (!editingTrackId) return;
-    const data = { title: editTitle.value, artist: editArtist.value, album: editAlbum.value };
+    const data = { title: editTitle.value, artist: editArtist.value, album: editAlbum.value, album_artist: editAlbumArtist ? editAlbumArtist.value : null };
     await electron.updateTrack(editingTrackId, data);
     closeEditModal();
     loadLibrary();
@@ -3788,19 +4357,38 @@ async function init() {
           await electron.renamePlaylist(currentEditingPlaylist, newName);
         }
 
-        // Clear and re-add tracks in new order
-        const currentTracks = await electron.getPlaylistTracks(currentEditingPlaylist);
-        // Remove all tracks
-        for (const track of currentTracks) {
-          await electron.removeTrackFromPlaylist(currentEditingPlaylist, track.id);
+        // Reorder atomically instead of remove-all + re-add, which would drop
+        // the tracks entirely if the Add step fails partway through.
+        const orderedIds = playlistEditorTracks.map((t) => t.id).filter(Boolean);
+        if (electron.reorderPlaylist) {
+          await electron.reorderPlaylist(currentEditingPlaylist, orderedIds);
+        } else {
+          // Fallback for older preloads: remove-then-add (best-effort).
+          const currentTracks = await electron.getPlaylistTracks(currentEditingPlaylist);
+          for (const track of currentTracks) {
+            await electron.removeTrackFromPlaylist(currentEditingPlaylist, track.id);
+          }
+          for (const id of orderedIds) {
+            await electron.addTrackToPlaylist(currentEditingPlaylist, id);
+          }
         }
-        // Add tracks in new order
-        for (const track of playlistEditorTracks) {
-          await electron.addTrackToPlaylist(currentEditingPlaylist, track.id);
+
+        // If the edited playlist is the one currently opened in the library
+        // view, refresh its track list too.
+        if (libraryContext.type === 'playlist' && currentPlaylistFilter?.id === currentEditingPlaylist) {
+          try {
+            const refreshed = await electron.getPlaylistTracks(currentEditingPlaylist);
+            currentPlaylistTracks = Array.isArray(refreshed) ? refreshed : [];
+            tracks = [...currentPlaylistTracks];
+            renderLibrary();
+          } catch (err) {
+            console.warn('Failed to refresh current playlist tracks after save', err);
+          }
         }
 
         closePlaylistEditorModal();
-        await renderPlaylists();
+        playlistsCache = [];
+        await renderPlaylists({ forceReload: true });
       } catch (err) {
         console.error('Failed to save playlist edits:', err);
         alert('Failed to save changes');
@@ -3811,14 +4399,24 @@ async function init() {
   if (btnDeletePlaylist) {
     btnDeletePlaylist.onclick = async () => {
       if (!currentEditingPlaylist) return;
-      
+
       const confirmed = confirm('Are you sure you want to delete this playlist? This cannot be undone.');
       if (!confirmed) return;
 
       try {
-        await electron.deletePlaylist(currentEditingPlaylist);
+        const deletedId = currentEditingPlaylist;
+        await electron.deletePlaylist(deletedId);
+
+        // If the deleted playlist was open in the library view, fall back to
+        // the root library so the user isn't left staring at phantom tracks.
+        if (libraryContext.type === 'playlist' && currentPlaylistFilter?.id === deletedId) {
+          setLibraryContext('library');
+          await loadLibrary();
+        }
+
         closePlaylistEditorModal();
-        await renderPlaylists();
+        playlistsCache = [];
+        await renderPlaylists({ forceReload: true });
       } catch (err) {
         console.error('Failed to delete playlist:', err);
         alert('Failed to delete playlist');
@@ -3832,6 +4430,7 @@ async function init() {
     if (editTitle) editTitle.value = track.title || '';
     if (editArtist) editArtist.value = track.artist || '';
     if (editAlbum) editAlbum.value = track.album || '';
+    if (editAlbumArtist) editAlbumArtist.value = track.album_artist || '';
     if (editModal) editModal.style.display = 'flex';
   });
 
@@ -3948,6 +4547,7 @@ async function init() {
         else {
           try { time = await electron.getTime(); } catch {}
         }
+        renderAudioOutputStatus(status);
         if (time > 0) lastKnownPosition = time;
         if (currentTimeEl) currentTimeEl.textContent = formatTime(time);
         if (!isSeeking && currentTrack.duration > 0 && seekSlider) seekSlider.value = (time / currentTrack.duration) * 100;
@@ -3959,9 +4559,9 @@ async function init() {
         // Auto-advance detection: if player reports not playing/paused and time is at/after end
         try {
           const playingFlag = status ? Boolean(status.playing) : isPlaying;
-          const pausedFlag = status ? Boolean(status.paused) : !isPlaying;
           const nearEnd = currentTrack.duration > 0 && time >= Math.max(0, currentTrack.duration - AUTO_ADVANCE_EPS);
-          if (nearEnd && (!playingFlag || pausedFlag)) {
+          // Do not auto-skip while merely paused near the end.
+          if (nearEnd && !playingFlag) {
             if (lastAutoAdvancedTrackId !== (currentTrack && currentTrack.id)) {
               lastAutoAdvancedTrackId = currentTrack && currentTrack.id;
               void advanceToNext();
@@ -3989,7 +4589,7 @@ async function init() {
   initSearch();
   await loadSettingsUI();
   // Push current settings to main (ensure minimize-to-tray preference applied at startup)
-  try { saveSettings(); } catch (e) { console.warn('Initial saveSettings failed', e); }
+  try { void saveSettings(); } catch (e) { console.warn('Initial saveSettings failed', e); }
 
   // Init fullscreen cover click handler
   initFullscreenClick();
@@ -4033,3 +4633,4 @@ if (document.readyState === 'loading') {
 } else {
   init();
 }
+

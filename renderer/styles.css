@@ -675,7 +675,7 @@
       position: fixed;
       right: 0;
       top: 0;
-      width: 350px;
+      width: 380px;
       height: 100vh;
       background: var(--bg-sidebar);
       border-left: 1px solid rgba(255,255,255,0.1);
@@ -730,39 +730,108 @@
       padding: 12px;
     }
 
+    .queue-section {
+      margin-bottom: 20px;
+    }
+
+    .queue-section-title {
+      color: var(--text-primary);
+      font-size: 13px;
+      font-weight: 700;
+      text-transform: uppercase;
+      letter-spacing: 0.06em;
+      padding: 4px 12px 8px;
+      opacity: 0.9;
+    }
+
     .queue-item {
       display: flex;
       align-items: center;
       gap: 12px;
-      padding: 10px 12px;
+      padding: 8px 12px;
       border-radius: 6px;
       cursor: pointer;
-      transition: background 0.2s;
+      transition: background 0.15s ease;
       position: relative;
     }
 
     .queue-item:hover {
-      background: rgba(255,255,255,0.05);
+      background: rgba(255,255,255,0.06);
     }
 
     .queue-item.current {
-    background: rgba(var(--accent-rgb), 0.12); /* was green rgba */
-    border-left: 3px solid var(--accent);      /* was #1db954; */
+      background: rgba(var(--accent-rgb), 0.14);
     }
 
-    .queue-item-index {
+    .queue-item-art-wrap {
+      position: relative;
+      width: 44px;
+      height: 44px;
+      flex-shrink: 0;
+    }
+
+    .queue-item-art {
+      width: 44px;
+      height: 44px;
+      border-radius: 4px;
+      background-size: cover;
+      background-position: center;
+      background-color: rgba(255,255,255,0.06);
+      display: flex;
+      align-items: center;
+      justify-content: center;
       color: var(--text-secondary);
-      font-size: 14px;
-      min-width: 24px;
-      text-align: center;
     }
 
-    .queue-item.current .queue-item-index 
-    { color: var(--accent); }
+    .queue-item-art.placeholder .material-icons {
+      font-size: 22px;
+      opacity: 0.5;
+    }
+
+    .queue-item-playing-indicator {
+      position: absolute;
+      inset: 0;
+      background: rgba(0, 0, 0, 0.5);
+      border-radius: 4px;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      color: var(--accent);
+    }
+
+    .queue-item-playing-indicator .material-icons {
+      font-size: 22px;
+      animation: queue-playing-pulse 1.2s ease-in-out infinite;
+    }
+
+    @keyframes queue-playing-pulse {
+      0%, 100% { transform: scaleY(1); opacity: 1; }
+      50% { transform: scaleY(0.85); opacity: 0.85; }
+    }
+
+    .queue-item.current .queue-item-title {
+      color: var(--accent);
+    }
 
     .queue-item-info {
       flex: 1;
       min-width: 0;
+    }
+
+    .queue-item-duration {
+      color: var(--text-secondary);
+      font-size: 12px;
+      min-width: 40px;
+      text-align: right;
+      font-variant-numeric: tabular-nums;
+    }
+
+    .queue-empty-hint {
+      font-size: 12px;
+      opacity: 0.7;
+      text-align: center;
+      max-width: 240px;
+      line-height: 1.4;
     }
 
     .queue-item-title {
@@ -2021,4 +2090,61 @@
   .themes-actions {
     padding: 10px;
   }
+}
+
+
+.settings-actions {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin: 12px 0 18px;
+}
+
+.setting-item input[type="number"] {
+  width: 100%;
+  min-height: 38px;
+  padding: 8px 12px;
+  color: var(--text-primary);
+  background: var(--bg-control);
+  border: 1px solid var(--divider);
+  border-radius: 6px;
+  outline: none;
+}
+
+.setting-item input[type="number"]:focus {
+  border-color: var(--accent);
+  background: var(--bg-control-hover);
+}
+
+.audio-output-status {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+  gap: 8px;
+  margin-top: 16px;
+  padding: 14px;
+  border: 1px solid var(--divider);
+  border-radius: 8px;
+  background: rgba(255,255,255,0.04);
+}
+
+.audio-output-status div {
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.audio-output-status span {
+  color: var(--text-secondary);
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+
+.audio-output-status strong {
+  color: var(--text-primary);
+  font-size: 13px;
+  font-weight: 700;
+  line-height: 1.35;
+  overflow-wrap: anywhere;
 }

@@ -25,20 +25,27 @@ try {
       path.join(process.cwd(), 'build', 'Release', 'exclusive_audio.node'),
     ];
 
-    // Expand candidates by searching any .node under bin directories
+    // Expand candidates by searching any .node under known bin directories
     const tryCandidates = [];
     for (const c of candidates) tryCandidates.push(c);
-    const binDir = path.join(resourcesPath, 'app.asar.unpacked', 'bin');
-    if (fs.existsSync(binDir) && fs.statSync(binDir).isDirectory()) {
-      const walk = (dir) => {
+
+    const walkNodeFiles = (dir, out) => {
+      try {
+        if (!fs.existsSync(dir) || !fs.statSync(dir).isDirectory()) return;
         for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
           const p = path.join(dir, entry.name);
-          if (entry.isDirectory()) walk(p);
-          else if (entry.isFile() && p.endsWith('.node')) tryCandidates.push(p);
+          if (entry.isDirectory()) walkNodeFiles(p, out);
+          else if (entry.isFile() && p.endsWith('.node')) out.push(p);
         }
-      };
-      try { walk(binDir); } catch (_) {}
-    }
+      } catch (walkErr) {
+        console.warn('[exclusiveAudio] bin walk error:', walkErr?.message ?? walkErr);
+      }
+    };
+
+    // Packaged path
+    walkNodeFiles(path.join(resourcesPath, 'app.asar.unpacked', 'bin'), tryCandidates);
+    // Development path (bin/win32-x64-NNN/spectra.node etc.)
+    walkNodeFiles(path.join(process.cwd(), 'bin'), tryCandidates);
 
     for (const cand of tryCandidates) {
       try {
@@ -51,9 +58,9 @@ try {
         // ignore and try next
       }
     }
-  } catch (err) {
+  } catch (fallbackErr) {
     // final fallback: leave native null and allow consumer to handle unsupported platform
-    console.warn('[exclusiveAudio] native addon load failed:', (err && err.message) || (e && e.message));
+    console.warn('[exclusiveAudio] native addon load failed:', fallbackErr?.message ?? e?.message ?? String(fallbackErr));
   }
 }
 
@@ -81,13 +88,17 @@ class ExclusiveStream extends Writable {
     }
 
     this.deviceId = opts.deviceId || null;
-      this.sampleRate = opts.sampleRate || 44100;
+    this.sampleRate = opts.sampleRate || 44100;
     this.channels = opts.channels || 2;
     this.bitDepth = opts.bitDepth || 32;
     this.mode = opts.mode || 'shared';
-    this.bufferMs = opts.bufferMs || 250;
+    const parsedBufferMs = Number(opts.bufferMs);
+    this.bufferMs = Number.isFinite(parsedBufferMs) && parsedBufferMs > 0 ? parsedBufferMs : 0;
+    this.bufferFrames = Number.isFinite(Number(opts.bufferFrames)) ? Number(opts.bufferFrames) : 0;
     this.bitPerfect = !!opts.bitPerfect;
     this.strictBitPerfect = !!opts.strictBitPerfect;
+    this.dsdNative = !!opts.dsdNative;
+    this.windowHandle = opts.windowHandle || null;
 
     const result = native.openOutput({
       deviceId: this.deviceId,
@@ -96,17 +107,28 @@ class ExclusiveStream extends Writable {
       bitDepth: this.bitDepth,
       mode: this.mode,
       bufferMs: this.bufferMs,
+      bufferFrames: this.bufferFrames,
       bitPerfect: this.bitPerfect,
       strictBitPerfect: this.strictBitPerfect,
+      dsdNative: this.dsdNative,
+      windowHandle: this.windowHandle,
     });
 
     this.handle = result.handle;
     this.actualSampleRate = result.sampleRate;
     this.actualChannels = result.channels;
     this.actualBitDepth = result.bitDepth;
+    this.actualSampleFormat = result.sampleFormat || (
+      this.actualBitDepth === 32 ? 'f32le' : `s${this.actualBitDepth}le`
+    );
+    this.actualBufferFrames = result.bufferFrames || 0;
+    this.actualBufferMs = result.bufferMs || 0;
+    this.actualBackend = result.backend || this.mode;
+    this.fallback = !!result.fallback;
+    this.fallbackReason = result.fallbackReason || '';
     this.totalBytesWritten = 0;
     
-    console.log(`[ExclusiveStream] Opened: handle=${this.handle}, rate=${this.actualSampleRate}, ch=${this.actualChannels}, depth=${this.actualBitDepth}`);
+    console.log(`[ExclusiveStream] Opened: handle=${this.handle}, backend=${this.actualBackend}, rate=${this.actualSampleRate}, ch=${this.actualChannels}, format=${this.actualSampleFormat}, buffer=${this.actualBufferFrames || 0} frames`);
   }
 
   getElapsedTime() {
@@ -115,42 +137,91 @@ class ExclusiveStream extends Writable {
     const bytesPerFrame = this.actualChannels * bytesPerSample;
     const bytesPerSecond = this.actualSampleRate * bytesPerFrame;
     if (bytesPerSecond === 0) return 0;
-    return this.totalBytesWritten / bytesPerSecond;
+    const queuedSeconds = this.totalBytesWritten / bytesPerSecond;
+    // Subtract buffered-but-not-yet-played latency so the reported position
+    // tracks actual playback rather than bytes enqueued.
+    try {
+      const stats = native.getStats(this.handle);
+      if (stats) {
+        const latencySec = ((stats.ringLatencyMs || 0) + (stats.hardwareLatencyMs || 0)) / 1000;
+        return Math.max(0, queuedSeconds - latencySec);
+      }
+    } catch (statsErr) {
+      // Non-fatal: fall back to queued-bytes estimate
+      console.warn('[ExclusiveStream] getStats failed in getElapsedTime:', statsErr?.message ?? statsErr);
+    }
+    return queuedSeconds;
   }
 _write(chunk, encoding, callback) {
   if (this._closed) return callback();
 
-  // IMPORTANT: prevent "callback called multiple times"
   let doneCalled = false;
+  const zeroWriteStartedAt = Date.now();
+  let zeroWriteCount = 0;
   const done = (err) => {
     if (doneCalled) return;
     doneCalled = true;
     callback(err);
   };
 
-  try {
-    native.writeAsync(this.handle, chunk, (err, written) => {
-      // If we were closed while the async write was in-flight, just finish quietly.
-      if (this._closed) return done();
+  // Retry until all bytes are written or stream closes.
+  const writeFrom = (offset) => {
+    if (this._closed) return done();
+    const slice = offset === 0 ? chunk : chunk.slice(offset);
+    try {
+      native.writeAsync(this.handle, slice, (err, written) => {
+        if (this._closed) return done();
+        if (err) {
+          this._closeNative();
+          return done(new Error(err));
+        }
+        if (written < 0) {
+          this._closeNative();
+          return done(new Error('exclusive audio write failed (device lost?)'));
+        }
+        if (written === 0) {
+          // If output is paused, zero-byte writes are expected while the ring
+          // is intentionally not draining.
+          try {
+            const stats = native.getStats ? native.getStats(this.handle) : null;
+            if (stats && stats.paused) {
+              setTimeout(() => writeFrom(offset), 20);
+              return;
+            }
+          } catch {}
 
-      if (err) {
-        this._closeNative();
-        return done(new Error(err));
-      }
+          zeroWriteCount += 1;
+          const stalledMs = Date.now() - zeroWriteStartedAt;
+          if (stalledMs > 2500 || zeroWriteCount > 400) {
+            let stallStats = null;
+            try {
+              stallStats = native.getStats ? native.getStats(this.handle) : null;
+            } catch {}
+            const detail = stallStats ? `; stats=${JSON.stringify(stallStats)}` : '';
+            this._closeNative();
+            return done(new Error(`exclusive audio write stalled (device not consuming audio)${detail}`));
+          }
+          // Ring is full for now, retry same offset shortly.
+          setTimeout(() => writeFrom(offset), 5);
+          return;
+        }
+        zeroWriteCount = 0;
+        this.totalBytesWritten += written;
+        const next = offset + written;
+        if (next < chunk.length) {
+          // Partial write - retry remaining bytes.
+          writeFrom(next);
+        } else {
+          done();
+        }
+      }, true);
+    } catch (e) {
+      try { this._closeNative(); } catch {}
+      done(e instanceof Error ? e : new Error(String(e)));
+    }
+  };
 
-      if (written < 0) {
-        this._closeNative();
-        return done(new Error("exclusive audio write failed (device lost?)"));
-      }
-
-      this.totalBytesWritten += written;
-      return done();
-    }, true);
-  } catch (e) {
-    // If native.writeAsync itself throws synchronously
-    try { this._closeNative(); } catch {}
-    return done(e instanceof Error ? e : new Error(String(e)));
-  }
+  writeFrom(0);
 }
 
   _final(callback) {
@@ -249,6 +320,13 @@ function close(handle) {
 function getStats(handle) {
   return native.getStats(handle);
 }
+
+function openAsioControlPanel(options = {}) {
+  if (!native.openAsioControlPanel) {
+    throw new Error("ASIO control panel is not supported by this native addon");
+  }
+  return native.openAsioControlPanel(options);
+}
 export default {
   createExclusiveStream,
   getDevices,
@@ -258,4 +336,5 @@ export default {
   drain,
   close,
   getStats,
+  openAsioControlPanel,
 };

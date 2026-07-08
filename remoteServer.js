@@ -4,7 +4,10 @@ import http from 'http';
 import { Server } from 'socket.io';
 import path from 'path';
 import fs from 'fs';
-import { app } from 'electron';
+import { createRequire } from 'node:module';
+
+const require = createRequire(import.meta.url);
+const { app } = require('electron');
 
 class RemoteServer {
   constructor(rendererPath, invokeHandler, options = {}) {

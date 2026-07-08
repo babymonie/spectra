@@ -1,5 +1,4 @@
-
-import { app, BrowserWindow, ipcMain, dialog, Menu, protocol, globalShortcut, Tray, nativeImage, shell } from 'electron';
+import { createRequire } from 'node:module';
 import path from 'path';
 import net from 'net';
 import { fileURLToPath } from 'url';
@@ -8,8 +7,13 @@ import audioEngine from './audioEngine.js';
 import initSqlJs from 'sql.js';
 import { extractMetadata, extractMetadataFromBuffer } from './metadataLookup.js';
 import { extractLyrics } from './metadataLookup.js';
+import { inferMetadataFromPath, isPlaceholderMetadataValue, isWeakTitleForPath } from './metadataFilename.js';
 import db from './database.js';
 import RemoteServer from './remoteServer.js';
+
+const require = createRequire(import.meta.url);
+const electron = require('electron');
+const { app, BrowserWindow, ipcMain, dialog, Menu, protocol, globalShortcut, Tray, nativeImage, shell } = electron;
 import  registerThemeIpc  from './themeManager.js';
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -222,25 +226,47 @@ let shuffleMode = false;
 let repeatMode = 'off'; // 'off', 'all', 'one'
 let originalQueue = []; // For when shuffle is toggled off
 
-// Equalizer state
-let eqEnabled = false;
-let eqPreset = 'flat';
-let eqBands = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0]; // 10-band EQ
+const eqPresets = {
+  flat: [0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+  rock: [5, 4, 3, 1, -1, -1, 1, 3, 4, 5],
+  pop: [2, 3, 4, 3, 0, -1, -1, 0, 2, 3],
+  jazz: [3, 2, 1, 1, -1, -1, 0, 1, 2, 3],
+  classical: [4, 3, 2, 0, -1, -1, 0, 2, 3, 4],
+  bass: [6, 5, 4, 2, 0, 0, 0, 0, 0, 0],
+  treble: [0, 0, 0, 0, 0, 2, 4, 5, 6, 6],
+  vocal: [0, 1, 3, 4, 3, 1, 0, 0, 0, 0],
+};
+
+function normalizeEqBands(bands) {
+  const source = Array.isArray(bands) ? bands : eqPresets.flat;
+  return eqPresets.flat.map((_, i) => Math.max(-12, Math.min(12, Number(source[i]) || 0)));
+}
+
+function persistEqState() {
+  appSettings.eq = audioEngine.getEQ();
+  saveAppSettings();
+  return appSettings.eq;
+}
 
 // Ensure single instance and handle files passed to second instance (Windows)
 const gotLock = app.requestSingleInstanceLock();
 if (!gotLock) {
+  console.log('[main] Another Spectra instance is already running; exiting this process.');
   app.quit();
 }
 app.on('second-instance', (event, argv) => {
   // argv may include file paths when a user double-clicks an associated file
   try {
+    if (mainWindow && mainWindow.webContents && !mainWindow.isDestroyed()) {
+      if (mainWindow.isMinimized()) mainWindow.restore();
+      mainWindow.show();
+      mainWindow.focus();
+    }
+
     const files = parseArgvFiles(argv || []);
     for (const f of files) {
       // if mainWindow ready, handle immediately; otherwise queue
       if (mainWindow && mainWindow.webContents && !mainWindow.isDestroyed()) {
-        if (mainWindow.isMinimized()) mainWindow.restore();
-        mainWindow.focus();
         handleOpenFile(f);
       } else {
         pendingOpenFiles.push(f);
@@ -625,7 +651,7 @@ const handlers = {
   'library:update-track': (id, data) => db.updateTrack(id, data),
   'library:get-albums': () => db.getAlbums(),
   'library:get-artists': () => db.getArtists(),
-  'library:get-album-tracks': (albumName) => db.getAlbumTracks(albumName),
+  'library:get-album-tracks': (albumName, artistName) => db.getAlbumTracks(albumName, artistName),
 
   'library:get-cover-image': async (coverPath) => {
     if (!coverPath || coverPath.startsWith('http')) return coverPath;
@@ -733,6 +759,14 @@ const handlers = {
       if (options.volume !== undefined) {
         options.volume = Number(options.volume);
       }
+
+      if (typeof options.deviceId === 'string' && options.deviceId.startsWith('asio:')) {
+        options.mode = 'asio';
+      }
+
+      if (options.mode === 'asio' && mainWindow && !mainWindow.isDestroyed()) {
+        options.windowHandle = mainWindow.getNativeWindowHandle();
+      }
       
       // Store track metadata if provided
       if (options.track) {
@@ -772,6 +806,13 @@ const handlers = {
     }
   },
   'audio:get-devices': () => audioEngine.getDevices(),
+  'audio:open-asio-control-panel': (deviceId) => {
+    const options = { deviceId };
+    if (mainWindow && !mainWindow.isDestroyed()) {
+      options.windowHandle = mainWindow.getNativeWindowHandle();
+    }
+    return audioEngine.openAsioControlPanel(options);
+  },
   'audio:get-status': () => {
     try {
       return audioEngine.getStatus();
@@ -784,26 +825,20 @@ const handlers = {
   'audio:set-eq-enabled': (enabled) => {
     const eq = audioEngine.getEQ();
     audioEngine.setEQ({ ...eq, enabled });
-    appSettings.eq = audioEngine.getEQ();
-    saveAppSettings();
+    return persistEqState();
   },
   'audio:set-eq-preset': (preset) => {
     const eq = audioEngine.getEQ();
-    let bands = [...eq.bands];
-    if (preset === 'flat') bands = [0,0,0,0,0,0,0,0,0,0];
-    else if (preset === 'bass') bands = [6,5,4,2,0,0,0,0,0,0];
-    else if (preset === 'treble') bands = [0,0,0,0,0,0,2,4,5,6];
-    else if (preset === 'vocal') bands = [-2,-2,-1,0,4,4,2,0,-1,-2];
+    const name = Object.hasOwn(eqPresets, preset) ? preset : 'flat';
+    const bands = eqPresets[name];
     
-    audioEngine.setEQ({ ...eq, preset, bands });
-    appSettings.eq = audioEngine.getEQ();
-    saveAppSettings();
+    audioEngine.setEQ({ ...eq, preset: name, bands });
+    return persistEqState();
   },
   'audio:set-eq-bands': (bands) => {
     const eq = audioEngine.getEQ();
-    audioEngine.setEQ({ ...eq, bands, preset: 'custom' });
-    appSettings.eq = audioEngine.getEQ();
-    saveAppSettings();
+    audioEngine.setEQ({ ...eq, bands: normalizeEqBands(bands), preset: 'custom' });
+    return persistEqState();
   },
   // Playlists
   'playlists:create': (name) => db.createPlaylist(name),
@@ -947,9 +982,26 @@ const handlers = {
   'playlists:reorder': (playlistId, orderedTrackIds) => db.reorderPlaylist(playlistId, orderedTrackIds),
   // Queue management
   'queue:get': () => ({ queue: playbackQueue, index: queueIndex }),
-  'queue:set': (tracks) => {
+  'queue:set': (tracks, current = null) => {
     playbackQueue = Array.isArray(tracks) ? tracks : [];
     queueIndex = playbackQueue.length > 0 ? 0 : -1;
+    if (playbackQueue.length > 0 && current != null) {
+      if (typeof current === 'number' && current >= 0 && current < playbackQueue.length) {
+        queueIndex = current;
+      } else if (typeof current === 'object') {
+        const byId = current.id != null
+          ? playbackQueue.findIndex((t) => t && t.id != null && t.id === current.id)
+          : -1;
+        if (byId !== -1) queueIndex = byId;
+        else if (current.path) {
+          const byPath = playbackQueue.findIndex((t) => t && t.path && t.path === current.path);
+          if (byPath !== -1) queueIndex = byPath;
+        }
+      } else if (typeof current === 'string') {
+        const byPath = playbackQueue.findIndex((t) => t && t.path && t.path === current);
+        if (byPath !== -1) queueIndex = byPath;
+      }
+    }
     originalQueue = [...playbackQueue];
     return { queue: playbackQueue, index: queueIndex };
   },
@@ -958,10 +1010,35 @@ const handlers = {
     if (queueIndex === -1) queueIndex = 0;
     return { queue: playbackQueue, index: queueIndex };
   },
+  'queue:set-current': (current) => {
+    if (!playbackQueue.length) {
+      queueIndex = -1;
+      return { queue: playbackQueue, index: queueIndex };
+    }
+    let idx = -1;
+    if (typeof current === 'number' && current >= 0 && current < playbackQueue.length) {
+      idx = current;
+    } else if (typeof current === 'object' && current) {
+      if (current.id != null) {
+        idx = playbackQueue.findIndex((t) => t && t.id != null && t.id === current.id);
+      }
+      if (idx === -1 && current.path) {
+        idx = playbackQueue.findIndex((t) => t && t.path && t.path === current.path);
+      }
+    } else if (typeof current === 'string') {
+      idx = playbackQueue.findIndex((t) => t && t.path && t.path === current);
+    }
+    if (idx >= 0) queueIndex = idx;
+    return { queue: playbackQueue, index: queueIndex };
+  },
   'queue:remove': (index) => {
     if (index >= 0 && index < playbackQueue.length) {
       playbackQueue.splice(index, 1);
-      if (queueIndex >= index && queueIndex > 0) queueIndex--;
+      // If a track before the current one was removed, shift index down.
+      // If the current track itself was removed, keep the index so the
+      // track that slid into its slot becomes the new current. Clamp.
+      if (index < queueIndex) queueIndex--;
+      if (queueIndex >= playbackQueue.length) queueIndex = playbackQueue.length - 1;
       if (playbackQueue.length === 0) queueIndex = -1;
     }
     return { queue: playbackQueue, index: queueIndex };
@@ -1026,34 +1103,22 @@ const handlers = {
   },
   'player:get-modes': () => ({ shuffle: shuffleMode, repeat: repeatMode }),
   // Equalizer
-  'eq:get': () => ({ enabled: eqEnabled, preset: eqPreset, bands: eqBands }),
+  'eq:get': () => audioEngine.getEQ(),
   'eq:set-enabled': (enabled) => {
-    eqEnabled = !!enabled;
-    return { enabled: eqEnabled, preset: eqPreset, bands: eqBands };
+    const eq = audioEngine.getEQ();
+    audioEngine.setEQ({ ...eq, enabled: !!enabled });
+    return persistEqState();
   },
   'eq:set-preset': (preset) => {
-    const presets = {
-      flat: [0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
-      rock: [5, 4, 3, 1, -1, -1, 1, 3, 4, 5],
-      pop: [2, 3, 4, 3, 0, -1, -1, 0, 2, 3],
-      jazz: [3, 2, 1, 1, -1, -1, 0, 1, 2, 3],
-      classical: [4, 3, 2, 0, -1, -1, 0, 2, 3, 4],
-      bass: [6, 5, 4, 2, 0, 0, 0, 0, 0, 0],
-      treble: [0, 0, 0, 0, 0, 2, 4, 5, 6, 6],
-      vocal: [0, 1, 3, 4, 3, 1, 0, 0, 0, 0]
-    };
-    if (presets[preset]) {
-      eqPreset = preset;
-      eqBands = presets[preset];
-    }
-    return { enabled: eqEnabled, preset: eqPreset, bands: eqBands };
+    const eq = audioEngine.getEQ();
+    const name = Object.hasOwn(eqPresets, preset) ? preset : 'flat';
+    audioEngine.setEQ({ ...eq, preset: name, bands: eqPresets[name] });
+    return persistEqState();
   },
   'eq:set-bands': (bands) => {
-    if (Array.isArray(bands) && bands.length === 10) {
-      eqBands = bands.map(v => Math.max(-12, Math.min(12, Number(v) || 0)));
-      eqPreset = 'custom';
-    }
-    return { enabled: eqEnabled, preset: eqPreset, bands: eqBands };
+    const eq = audioEngine.getEQ();
+    audioEngine.setEQ({ ...eq, bands: normalizeEqBands(bands), preset: 'custom' });
+    return persistEqState();
   },
   'player:get-state': () => getPlayerState(),
   'lyrics:get': async (opts = {}) => {
@@ -1531,6 +1596,7 @@ app.whenReady().then(async () => {
 
   // Load app settings so we can respect minimize-to-tray preference
   loadAppSettings();
+  repairExistingLibraryMetadataFromPaths();
   dedupeLibrary();
 
   if (!isServerMode) {
@@ -1898,6 +1964,10 @@ function normalizeAlbumValue(value) {
   return normalized;
 }
 
+function hasUsefulMetadataValue(value) {
+  return !isPlaceholderMetadataValue(value);
+}
+
 function durationsRoughlyEqual(a, b) {
   const aNum = typeof a === 'number' ? a : Number(a);
   const bNum = typeof b === 'number' ? b : Number(b);
@@ -1950,9 +2020,17 @@ function recordsLikelySameSong(a, b) {
 
 function collectMetadataImprovements(existing, incoming) {
   const updates = {};
+  const existingPath = existing.path || incoming.path || '';
+
+  if (hasUsefulMetadataValue(incoming.title) && isWeakTitleForPath(existing.title, existingPath)) {
+    updates.title = incoming.title;
+  }
+  if (hasUsefulMetadataValue(incoming.artist) && isPlaceholderMetadataValue(existing.artist)) {
+    updates.artist = incoming.artist;
+  }
   if (incoming.cover_path && !existing.cover_path) updates.cover_path = incoming.cover_path;
-  if (incoming.album && incoming.album !== 'Unknown Album' && (!existing.album || existing.album === 'Unknown Album')) updates.album = incoming.album;
-  if (incoming.album_artist && (!existing.album_artist || existing.album_artist === 'Unknown Artist')) updates.album_artist = incoming.album_artist;
+  if (hasUsefulMetadataValue(incoming.album) && isPlaceholderMetadataValue(existing.album)) updates.album = incoming.album;
+  if (hasUsefulMetadataValue(incoming.album_artist) && isPlaceholderMetadataValue(existing.album_artist)) updates.album_artist = incoming.album_artist;
   if (incoming.duration && (!existing.duration || existing.duration <= 0)) updates.duration = incoming.duration;
   if (incoming.format && (!existing.format || existing.format === 'remote')) updates.format = incoming.format;
   if (incoming.bitrate && !existing.bitrate) updates.bitrate = incoming.bitrate;
@@ -1971,6 +2049,32 @@ function collectMetadataImprovements(existing, incoming) {
   return updates;
 }
 
+function repairExistingLibraryMetadataFromPaths() {
+  try {
+    const tracks = db.getAllTracks();
+    let repaired = 0;
+    for (const track of tracks) {
+      if (!track?.id || !track.path || String(track.path).startsWith('http')) continue;
+      const inferred = inferMetadataFromPath(track.path);
+      const candidate = {
+        ...track,
+        title: inferred.title || track.title,
+        artist: inferred.artist || track.artist,
+        album: inferred.album || track.album,
+        album_artist: inferred.albumArtist || track.album_artist,
+      };
+      const updates = collectMetadataImprovements(track, candidate);
+      if (Object.keys(updates).length === 0) continue;
+      db.updateTrackFields(track.id, updates);
+      repaired++;
+    }
+    if (repaired > 0) {
+      console.log(`[main] Repaired filename metadata for ${repaired} track(s).`);
+    }
+  } catch (err) {
+    console.warn('[main] Unable to repair filename metadata', err);
+  }
+}
 function dedupeLibrary() {
   if (libraryDeduped) return;
   libraryDeduped = true;
@@ -2098,9 +2202,7 @@ async function processFileList(files) {
 }
 
 async function processAndAddTrack(filePath) {
-  // Skip if already in DB
   const existing = db.getTrackByPath(filePath);
-  if (existing) return existing;
 
   try {
     const meta = await extractMetadata(filePath);
@@ -2140,14 +2242,23 @@ async function processAndAddTrack(filePath) {
       }
     }
 
+    if (existing) {
+      const metadataUpdates = collectMetadataImprovements(existing, track);
+      if (Object.keys(metadataUpdates).length > 0) {
+        db.updateTrackFields(existing.id, metadataUpdates);
+        return db.getTrackById(existing.id) || { ...existing, ...metadataUpdates };
+      }
+      return existing;
+    }
+
     const stored = storeTrackWithDedup(track);
     return stored;
   } catch (e) {
+    if (existing) return existing;
     console.error('Failed to process track', filePath, e);
     throw e;
   }
 }
-
 async function handleAddFiles(filePaths = []) {
   if (!Array.isArray(filePaths)) {
     return { success: false, error: 'filePaths must be an array' };

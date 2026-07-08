@@ -1,8 +1,10 @@
 import initSqlJs from 'sql.js';
 import path from 'path';
-import { app } from 'electron';
+import { createRequire } from 'node:module';
 import fs from 'fs';
 
+const require = createRequire(import.meta.url);
+const { app } = require('electron');
 const userDataPath = app.getPath('userData');
 console.log('User Data Path:', userDataPath);
 const dbPath = path.join(userDataPath, 'spectra.db');
@@ -78,6 +80,36 @@ const TRACK_UPDATEABLE_COLUMNS = new Set([
 ]);
 
 const normalizeValue = (value) => (typeof value === 'string' ? value.trim() : value);
+const normalizeText = (value) => String(value || '').replace(/\s+/g, ' ').trim();
+const toKey = (value) => normalizeText(value).toLowerCase();
+const UNKNOWN_ARTIST_RE = /^(unknown|unknown artist|<unknown>|n\/?a|none|null|-|—)$/i;
+const isMeaningfulArtistName = (value) => {
+  const name = normalizeText(value);
+  return !!name && !UNKNOWN_ARTIST_RE.test(name);
+};
+const splitArtistNames = (value) => {
+  const raw = normalizeText(value);
+  if (!isMeaningfulArtistName(raw)) return [];
+  return raw
+    .replace(/\s+(feat\.?|ft\.?|featuring|with)\s+/gi, ';')
+    .split(/\s*(?:,|;|\/|\||&|\band\b)\s*/i)
+    .map(normalizeText)
+    .filter(isMeaningfulArtistName);
+};
+const canonicalArtistName = (value) => {
+  const cleaned = normalizeText(value);
+  return isMeaningfulArtistName(cleaned) ? cleaned : 'Unknown Artist';
+};
+const getTrackArtistNames = (row) => {
+  const artists = splitArtistNames(row?.artist);
+  if (artists.length) return artists;
+  return splitArtistNames(row?.album_artist);
+};
+const getAlbumArtistName = (row) => {
+  if (isMeaningfulArtistName(row?.album_artist)) return canonicalArtistName(row.album_artist);
+  const artists = splitArtistNames(row?.artist);
+  return artists[0] || 'Unknown Artist';
+};
 
 export const updateTrackFields = (id, updates = {}) => {
   if (!db) return { changes: 0 };
@@ -309,7 +341,16 @@ export const createPlaylist = (name) => {
 };
 
 export const getAllPlaylists = () => {
-  return all('SELECT * FROM playlists ORDER BY name ASC');
+  // Include per-playlist track count in a single query so the UI doesn't have
+  // to fan out one getPlaylistTracks call per playlist to render counts.
+  return all(`
+    SELECT p.*, COALESCE(c.cnt, 0) AS track_count
+    FROM playlists p
+    LEFT JOIN (
+      SELECT playlist_id, COUNT(*) AS cnt FROM playlist_tracks GROUP BY playlist_id
+    ) c ON c.playlist_id = p.id
+    ORDER BY p.name ASC
+  `);
 };
 
 export const addTrackToPlaylist = (playlistId, trackId) => {
@@ -351,9 +392,36 @@ export const removeTrackFromPlaylist = (playlistId, trackId) => {
 };
 
 export const reorderPlaylist = (playlistId, orderedTrackIds = []) => {
+  // Treat orderedTrackIds as the *complete* desired track set, not just a
+  // reordering of existing rows. This lets the playlist editor use one call
+  // for both removals and ordering, and keeps the operation atomic from the
+  // UI's perspective.
+  if (!db) return { ok: false };
+  const ids = [];
+  const seen = new Set();
+  for (const rawId of orderedTrackIds) {
+    if (rawId == null) continue;
+    const id = Number(rawId);
+    if (!Number.isFinite(id) || seen.has(id)) continue;
+    seen.add(id);
+    ids.push(id);
+  }
+  const existing = all('SELECT track_id FROM playlist_tracks WHERE playlist_id = ?', [playlistId]);
+  const keepSet = new Set(ids);
+  for (const row of existing) {
+    if (!keepSet.has(Number(row.track_id))) {
+      run('DELETE FROM playlist_tracks WHERE playlist_id = ? AND track_id = ?', [playlistId, row.track_id]);
+    }
+  }
   let i = 1;
-  for (const tid of orderedTrackIds) {
-    run('UPDATE playlist_tracks SET track_order = ? WHERE playlist_id = ? AND track_id = ?', [i++, playlistId, tid]);
+  for (const tid of ids) {
+    // Upsert: update if present, otherwise insert (covers the case where the
+    // editor added brand new tracks).
+    run(
+      'INSERT INTO playlist_tracks (playlist_id, track_id, track_order) VALUES (?, ?, ?) ON CONFLICT(playlist_id, track_id) DO UPDATE SET track_order = excluded.track_order',
+      [playlistId, tid, i]
+    );
+    i++;
   }
   run('UPDATE playlists SET updated_at = CURRENT_TIMESTAMP WHERE id = ?', [playlistId]);
   return { ok: true };
@@ -396,11 +464,9 @@ export const deleteAlbum = (albumName, artistName) => {
   return { deleted: count };
 };
 
-export const updateTrack = (id, { title, artist, album }) => {
-  run('UPDATE tracks SET title = ?, artist = ?, album = ? WHERE id = ?', [title, artist, album, id]);
-  return { changes: 1 };
+export const updateTrack = (id, updates = {}) => {
+  return updateTrackFields(id, updates);
 };
-
 export const updateTrackPath = (id, filePath) => {
   run('UPDATE tracks SET path = ? WHERE id = ?', [filePath, id]);
   return { changes: 1 };
@@ -449,11 +515,11 @@ export const getAlbumArtist = (album, artistFallback) => {
     return null;
   }
 };
-export const getAlbumTracks = (albumName) => {
+export const getAlbumTracks = (albumName, artistName = null) => {
   if (!db) return [];
   if (!albumName) return [];
 
-  return all(
+  const rows = all(
     `
     SELECT *
     FROM tracks
@@ -462,51 +528,104 @@ export const getAlbumTracks = (albumName) => {
       CASE WHEN title IS NULL OR title = '' THEN 1 ELSE 0 END,
       title ASC,
       path ASC
-    `,
+  `,
     [albumName]
   );
+
+  if (!artistName || !normalizeText(artistName)) {
+    return rows;
+  }
+
+  const targetKey = toKey(canonicalArtistName(artistName));
+  return rows.filter((t) => {
+    const albumArtist = getAlbumArtistName(t);
+    if (toKey(albumArtist) === targetKey) return true;
+    return getTrackArtistNames(t).some((name) => toKey(name) === targetKey);
+  });
 };
 
 export const getAlbums = () => {
-  return all(`
-    SELECT
-      album AS name,
-      COALESCE(cover_path, '') AS cover_path,
-      COUNT(*) AS track_count,
-      COALESCE(
-        (
-          SELECT album_artist FROM tracks t3 WHERE t3.album = tracks.album AND t3.album_artist IS NOT NULL AND t3.album_artist != '' LIMIT 1
-        ),
-        (
-          SELECT artist FROM (
-            SELECT artist, COUNT(*) as cnt
-            FROM tracks t2
-            WHERE t2.album = tracks.album AND t2.artist IS NOT NULL AND t2.artist != ''
-            GROUP BY artist
-            ORDER BY cnt DESC
-            LIMIT 1
-          )
-        )
-      ) AS artist
+  const rows = all(`
+    SELECT album, artist, album_artist, cover_path
     FROM tracks
-    WHERE album IS NOT NULL AND album != ''
-    GROUP BY album
-    ORDER BY artist ASC, album ASC
+    WHERE album IS NOT NULL AND TRIM(album) != ''
   `);
+
+  const groups = new Map();
+  for (const row of rows) {
+    const albumName = normalizeText(row?.album);
+    if (!albumName) continue;
+    const albumArtist = getAlbumArtistName(row);
+    const albumKey = `${toKey(albumArtist)}::${toKey(albumName)}`;
+    if (!groups.has(albumKey)) {
+      groups.set(albumKey, {
+        name: albumName,
+        artist: albumArtist,
+        track_count: 0,
+        cover_path: '',
+      });
+    }
+    const g = groups.get(albumKey);
+    g.track_count += 1;
+    if (!g.cover_path && normalizeText(row?.cover_path)) g.cover_path = row.cover_path;
+    if (g.artist === 'Unknown Artist' && isMeaningfulArtistName(albumArtist)) g.artist = albumArtist;
+  }
+
+  const out = Array.from(groups.values()).map((g) => ({
+    name: g.name,
+    cover_path: g.cover_path || '',
+    track_count: g.track_count || 0,
+    artist: g.artist || 'Unknown Artist',
+  }));
+
+  out.sort((a, b) =>
+    String(a.artist || '').localeCompare(String(b.artist || ''), undefined, { sensitivity: 'base' }) ||
+    String(a.name || '').localeCompare(String(b.name || ''), undefined, { sensitivity: 'base' })
+  );
+  return out;
 };
 
 export const getArtists = () => {
-  return all(`
-    SELECT
-      artist AS name,
-      COUNT(*) AS track_count,
-      COUNT(DISTINCT album) AS album_count,
-      (SELECT cover_path FROM tracks t2 WHERE t2.artist = tracks.artist AND cover_path IS NOT NULL LIMIT 1) as cover_path
+  const rows = all(`
+    SELECT artist, album_artist, album, cover_path
     FROM tracks
-    WHERE artist IS NOT NULL AND artist != ''
-    GROUP BY artist
-    ORDER BY artist ASC
+    WHERE (artist IS NOT NULL AND TRIM(artist) != '')
+       OR (album_artist IS NOT NULL AND TRIM(album_artist) != '')
   `);
+
+  const groups = new Map();
+  for (const row of rows) {
+    const names = getTrackArtistNames(row);
+    for (const name of names) {
+      const key = toKey(name);
+      if (!key) continue;
+      if (!groups.has(key)) {
+        groups.set(key, {
+          name,
+          trackIds: 0,
+          albumKeys: new Set(),
+          cover_path: '',
+        });
+      }
+      const g = groups.get(key);
+      g.trackIds += 1;
+      const albumKey = toKey(row?.album);
+      if (albumKey) g.albumKeys.add(albumKey);
+      if (!g.cover_path && normalizeText(row?.cover_path)) g.cover_path = row.cover_path;
+    }
+  }
+
+  const out = [];
+  for (const g of groups.values()) {
+    out.push({
+      name: g.name,
+      track_count: g.trackIds || 0,
+      album_count: g.albumKeys.size,
+      cover_path: g.cover_path || '',
+    });
+  }
+  out.sort((a, b) => String(a.name || '').localeCompare(String(b.name || ''), undefined, { sensitivity: 'base' }));
+  return out;
 };
 
 export const getAlbumCover = (album, artist) => {

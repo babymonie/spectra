@@ -3,7 +3,9 @@ param(
 )
 
 # Move to repo root (script lives in ./scripts)
-Push-Location -Path (Split-Path -Parent $MyInvocation.MyCommand.Definition)\.. | Out-Null
+$scriptDir = Split-Path -Parent $MyInvocation.MyCommand.Definition
+$repoRoot = Resolve-Path (Join-Path $scriptDir '..')
+Push-Location -Path $repoRoot | Out-Null
 
 Write-Host "[build] Starting native addon build (mode=$mode)"
 
@@ -28,14 +30,7 @@ if ($mode -eq 'electron' -or ($mode -eq 'auto' -and $hasElectron)) {
     }
     Write-Host "[build] electron-rebuild completed successfully"
 } else {
-    Write-Host "[build] Running node-gyp rebuild for addon 'exclusive_audio'"
-    npx node-gyp rebuild
-    if ($LASTEXITCODE -ne 0) {
-        Write-Error "node-gyp rebuild failed (exit $LASTEXITCODE)"
-        Pop-Location
-        exit $LASTEXITCODE
-    }
-    Write-Host "[build] node-gyp rebuild completed successfully"
+    Write-Host "[build] node-gyp rebuild completed during npm install"
 }
 
 Pop-Location

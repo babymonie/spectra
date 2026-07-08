@@ -4,10 +4,15 @@
 import fsp from 'node:fs/promises';
 import path from 'node:path';
 import crypto from 'node:crypto';
+import { createRequire } from 'node:module';
+import { spawnSync } from 'node:child_process';
 import * as mm from 'music-metadata';
 import fetch from 'node-fetch';
-import { app } from 'electron';
+import ffmpegPath from 'ffmpeg-static';
+import { inferMetadataFromPath, isPlaceholderMetadataValue, isWeakTitleForPath } from './metadataFilename.js';
 
+const require = createRequire(import.meta.url);
+const { app } = require('electron');
 const userDataPath = app.getPath('userData');
 const coversRoot = path.join(userDataPath, 'covers');
 
@@ -36,7 +41,7 @@ async function findExistingAlbumCoverOnDisk(albumKey) {
 	return null;
 }
 
-async function saveCoverForAlbum(picture, album, albumArtist) {
+async function saveCoverForAlbum(picture, album, albumArtist, options = {}) {
   if (!picture?.data) return null;
 
   await ensureDir(coversRoot);
@@ -44,13 +49,16 @@ async function saveCoverForAlbum(picture, album, albumArtist) {
   const albumKey = `${album || ''}::${albumArtist || ''}`.trim() || null;
   if (!albumKey) return null;
 
-  const cached = inMemoryAlbumCoverCache.get(albumKey);
-  if (cached) return cached;
+  const preferExisting = options.preferExisting !== false;
+  if (preferExisting) {
+    const cached = inMemoryAlbumCoverCache.get(albumKey);
+    if (cached) return cached;
 
-  const existing = await findExistingAlbumCoverOnDisk(albumKey).catch(() => null);
-  if (existing) {
-    inMemoryAlbumCoverCache.set(albumKey, existing);
-    return existing;
+    const existing = await findExistingAlbumCoverOnDisk(albumKey).catch(() => null);
+    if (existing) {
+      inMemoryAlbumCoverCache.set(albumKey, existing);
+      return existing;
+    }
   }
 
   const buf = Buffer.isBuffer(picture.data) ? picture.data : Buffer.from(picture.data);
@@ -106,11 +114,11 @@ async function findLocalCover(filePath) {
 		for (const cand of candidates) {
 			const candPath = path.join(dir, cand);
 			try {
-				await fs.access(candPath);
+				await fsp.access(candPath);
 				// Found one!
 				// We'll just return the path directly if we want to use it directly, 
 				// OR we can copy it to our cache. Let's copy to cache for consistency.
-				const buf = await fs.readFile(candPath);
+				const buf = await fsp.readFile(candPath);
 				// We don't know album/artist here easily without parsing, but we can return the buffer
 				return { data: buf, format: 'image/' + path.extname(cand).replace('.', '') };
 			} catch {
@@ -200,6 +208,26 @@ async function lookupTrackMetadata(artist, title) {
 	return null;
 }
 
+function applyFilenameFallback(current, sourceName) {
+	const inferred = inferMetadataFromPath(sourceName);
+	const next = { ...current };
+
+	if (isWeakTitleForPath(next.title, sourceName) && inferred.title) {
+		next.title = inferred.title;
+	}
+	if (isPlaceholderMetadataValue(next.artist) && inferred.artist) {
+		next.artist = inferred.artist;
+	}
+	if (isPlaceholderMetadataValue(next.album) && inferred.album) {
+		next.album = inferred.album;
+	}
+	if (isPlaceholderMetadataValue(next.albumArtist) && (inferred.albumArtist || next.artist)) {
+		next.albumArtist = inferred.albumArtist || next.artist;
+	}
+
+	return next;
+}
+
 export async function extractMetadata(filePath) {
 	let title = null;
 	let artist = null;
@@ -224,6 +252,7 @@ export async function extractMetadata(filePath) {
 		artist = (common.artist || null) ?? null;
 		album = (common.album || null) ?? null;
 		albumArtist = (common.albumartist || common['album artist'] || artist || null) ?? null;
+		({ title, artist, album, albumArtist } = applyFilenameFallback({ title, artist, album, albumArtist }, filePath));
 		duration = typeof metadata.format.duration === 'number'
 			? metadata.format.duration
 			: null;
@@ -236,14 +265,14 @@ export async function extractMetadata(filePath) {
 
 		// 1. Try embedded picture
 		if (Array.isArray(common.picture) && common.picture.length > 0) {
-			coverPath = await saveCoverForAlbum(common.picture[0], album, albumArtist || artist);
+			coverPath = await saveCoverForAlbum(common.picture[0], album, albumArtist || artist, { preferExisting: false });
 		}
 
 		// 2. Try local file (cover.jpg, etc)
 		if (!coverPath) {
 			const localPic = await findLocalCover(filePath);
 			if (localPic) {
-				coverPath = await saveCoverForAlbum(localPic, album, albumArtist || artist);
+				coverPath = await saveCoverForAlbum(localPic, album, albumArtist || artist, { preferExisting: false });
 			}
 		}
 
@@ -278,6 +307,8 @@ export async function extractMetadata(filePath) {
 			title = path.basename(filePath);
 		}
 	}
+
+	({ title, artist, album, albumArtist } = applyFilenameFallback({ title, artist, album, albumArtist }, filePath));
 
 	return {
 		title,
@@ -336,6 +367,7 @@ export async function extractMetadataFromBuffer(buf, sourceName = 'remote') {
         artist = (common.artist || null) ?? null;
         album = (common.album || null) ?? null;
         albumArtist = (common.albumartist || common['album artist'] || artist || null) ?? null;
+        ({ title, artist, album, albumArtist } = applyFilenameFallback({ title, artist, album, albumArtist }, sourceName));
         duration = typeof metadata.format.duration === 'number' ? metadata.format.duration : null;
         bitrate = typeof fmt.bitrate === 'number' ? Math.round(fmt.bitrate) : null;
         sampleRate = typeof fmt.sampleRate === 'number' ? Math.round(fmt.sampleRate) : null;
@@ -345,7 +377,7 @@ export async function extractMetadataFromBuffer(buf, sourceName = 'remote') {
         codec = fmt.codec || fmt.container || format || null;
 
         if (Array.isArray(common.picture) && common.picture.length > 0) {
-            coverPath = await saveCoverForAlbum(common.picture[0], album, albumArtist || artist);
+            coverPath = await saveCoverForAlbum(common.picture[0], album, albumArtist || artist, { preferExisting: false });
         }
 
         // Online recovery if metadata is sparse
@@ -375,6 +407,8 @@ export async function extractMetadataFromBuffer(buf, sourceName = 'remote') {
         console.error('extractMetadataFromBuffer failed for', sourceName, err);
         title = title || sourceName;
     }
+
+    ({ title, artist, album, albumArtist } = applyFilenameFallback({ title, artist, album, albumArtist }, sourceName));
 
     return {
         title, artist, album, albumArtist, duration, format,
