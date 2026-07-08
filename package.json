@@ -33,7 +33,6 @@
     "node-addon-api": "^8.5.0",
     "node-fetch": "^3.3.2",
     "socket.io": "^4.8.1",
-    "speaker": "^0.5.5",
     "sql.js": "^1.10.3"
   },
   "build": {
