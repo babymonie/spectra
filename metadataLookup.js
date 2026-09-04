@@ -110,13 +110,13 @@ async function findLocalCover(filePath) {
 	try {
 		const dir = path.dirname(filePath);
 		const candidates = ['cover.jpg', 'cover.jpeg', 'cover.png', 'folder.jpg', 'folder.jpeg', 'folder.png', 'album.jpg', 'album.png'];
-		
+
 		for (const cand of candidates) {
 			const candPath = path.join(dir, cand);
 			try {
 				await fsp.access(candPath);
 				// Found one!
-				// We'll just return the path directly if we want to use it directly, 
+				// We'll just return the path directly if we want to use it directly,
 				// OR we can copy it to our cache. Let's copy to cache for consistency.
 				const buf = await fsp.readFile(candPath);
 				// We don't know album/artist here easily without parsing, but we can return the buffer
@@ -133,20 +133,20 @@ async function findLocalCover(filePath) {
 
 async function lookupOnlineCover(artist, album) {
 	if (!artist || !album) return null;
-	
+
 	// Try iTunes Search API - it's generally more reliable for pop music covers
 	try {
 		const query = `${artist} ${album}`;
 		const url = `https://itunes.apple.com/search?term=${encodeURIComponent(query)}&media=music&entity=album&limit=1`;
-		
+
 		const res = await fetch(url, { timeout: 5000 }).catch(() => null);
 		if (!res?.ok) throw new Error('iTunes lookup failed');
-		
+
 		const data = await res.json();
 		if (data.resultCount > 0 && data.results[0].artworkUrl100) {
 			// Get the high res version (600x600 usually available by replacing 100x100)
 			const artworkUrl = data.results[0].artworkUrl100.replace('100x100', '600x600');
-			
+
 			const imgRes = await fetch(artworkUrl, { timeout: 5000 }).catch(() => null);
 			if (imgRes?.ok) {
 				const buf = Buffer.from(await imgRes.arrayBuffer());
@@ -190,10 +190,10 @@ async function lookupTrackMetadata(artist, title) {
 	try {
 		const query = `${artist} ${title}`;
 		const url = `https://itunes.apple.com/search?term=${encodeURIComponent(query)}&media=music&entity=song&limit=1`;
-		
+
 		const res = await fetch(url, { timeout: 5000 }).catch(() => null);
 		if (!res?.ok) return null;
-		
+
 		const data = await res.json();
 		if (data.resultCount > 0) {
 			const track = data.results[0];
@@ -228,6 +228,35 @@ function applyFilenameFallback(current, sourceName) {
 	return next;
 }
 
+/** Extract numeric dB value from music-metadata ReplayGain object or raw number */
+function parseRgDb(v) {
+	if (v == null) return null;
+	if (typeof v === 'number') return v;
+	if (typeof v === 'object' && typeof v.dB === 'number') return v.dB;
+	const n = parseFloat(String(v));
+	return Number.isFinite(n) ? n : null;
+}
+
+/** Extract linear peak ratio from music-metadata ReplayGain peak object or raw number */
+function parseRgPeak(v) {
+	if (v == null) return null;
+	if (typeof v === 'number') return v;
+	if (typeof v === 'object' && typeof v.ratio === 'number') return v.ratio;
+	const n = parseFloat(String(v));
+	return Number.isFinite(n) ? n : null;
+}
+
+/** Parse iTunSMPB tag value → { encoderDelay, encoderPadding } in samples */
+function parseiTunSMPB(val) {
+	const s = String(val || '').trim();
+	const parts = s.split(/\s+/).filter(Boolean);
+	if (parts.length < 3) return null;
+	const delay = parseInt(parts[1], 16);
+	const padding = parseInt(parts[2], 16);
+	if (!Number.isFinite(delay) || !Number.isFinite(padding)) return null;
+	return { encoderDelay: delay, encoderPadding: padding };
+}
+
 export async function extractMetadata(filePath) {
 	let title = null;
 	let artist = null;
@@ -242,11 +271,14 @@ export async function extractMetadata(filePath) {
 	let channels = null;
 	let lossless = null;
 	let codec = null;
+	let replaygain = { trackGain: null, albumGain: null, trackPeak: null, albumPeak: null };
+	let gapless = { encoderDelay: null, encoderPadding: null };
 
 	try {
-		const metadata = await mm.parseFile(filePath, { duration: true });
+		const metadata = await mm.parseFile(filePath, { duration: true, native: true });
 		const common = metadata.common || {};
 		const fmt = metadata.format || {};
+		const native = metadata.native || {};
 
 		title = common.title || path.basename(filePath);
 		artist = (common.artist || null) ?? null;
@@ -262,6 +294,26 @@ export async function extractMetadata(filePath) {
 		channels = typeof fmt.numberOfChannels === 'number' ? Math.round(fmt.numberOfChannels) : null;
 		lossless = typeof fmt.lossless === 'boolean' ? (fmt.lossless ? 1 : 0) : null;
 		codec = fmt.codec || fmt.container || format || null;
+
+		// ReplayGain
+		replaygain.trackGain = parseRgDb(common.replaygain_track_gain);
+		replaygain.albumGain = parseRgDb(common.replaygain_album_gain);
+		replaygain.trackPeak = parseRgPeak(common.replaygain_track_peak);
+		replaygain.albumPeak = parseRgPeak(common.replaygain_album_peak);
+
+		// Gapless: iTunSMPB (iTunes/AAC/MP3), Vorbis ENCODER_DELAY/ENCODER_PADDING
+		for (const ns of Object.keys(native)) {
+			for (const entry of (native[ns] || [])) {
+				const id = String(entry.id || '').toUpperCase();
+				const val = entry.value;
+				if (id === 'ITUNSMPB' || id === '----:COM.APPLE.ITUNES:ITUNSMPB') {
+					const parsed = parseiTunSMPB(val);
+					if (parsed) { gapless.encoderDelay = parsed.encoderDelay; gapless.encoderPadding = parsed.encoderPadding; }
+				}
+				if (id === 'ENCODER_DELAY' && gapless.encoderDelay == null) gapless.encoderDelay = parseInt(val, 10) || 0;
+				if (id === 'ENCODER_PADDING' && gapless.encoderPadding == null) gapless.encoderPadding = parseInt(val, 10) || 0;
+			}
+		}
 
 		// 1. Try embedded picture
 		if (Array.isArray(common.picture) && common.picture.length > 0) {
@@ -324,6 +376,8 @@ export async function extractMetadata(filePath) {
 		channels,
 		lossless,
 		codec,
+		replaygain,
+		gapless,
 	};
 }
 
@@ -356,7 +410,7 @@ export async function extractMetadataFromBuffer(buf, sourceName = 'remote') {
 		else if (ext === '.mp3') mimeType = 'audio/mpeg';
 		else if (ext === '.m4a' || ext === '.mp4') mimeType = 'audio/mp4';
 		else if (ext === '.ogg' || ext === '.oga') mimeType = 'audio/ogg';
-		
+
 
         // Provide the mimeType hint as the second argument
         const metadata = await mm.parseBuffer(buf, mimeType, { duration: true });

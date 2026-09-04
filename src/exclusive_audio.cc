@@ -1552,11 +1552,11 @@ static void WasapiRenderThread(OutputStreamState *s)
 
     while (s->running.load() && s->open.load())
     {
-        // Shared mode uses the WASAPI event callback. Exclusive mode is
-        // timer/padding-polled because some drivers open exclusive event
-        // streams successfully but never signal/drain them.
+        // Event-driven: wait for hardware signal (shared always, exclusive when supported).
+        // Timer-driven exclusive: poll every 5ms for compatibility with stubborn drivers.
+        // Safety cap of 200ms ensures we never stall indefinitely even if event misfires.
         DWORD waitRes = s->eventDriven
-            ? WaitForSingleObject(s->hEvent, 20)
+            ? WaitForSingleObject(s->hEvent, 200)
             : WaitForSingleObject(s->hEvent, 5);
 
         if (!s->running.load())
@@ -1809,21 +1809,30 @@ static bool InitWasapi(OutputStreamState *s,
     s->bytesPerFrame = (s->bitDepth / 8) * s->channels;
 
     REFERENCE_TIME hnsBuffer = exclusive ? 0 : 1000000; // exclusive: endpoint minimum period
-    REFERENCE_TIME hnsPeriodicity = 0;
     HRESULT initHr;
+    bool exclusiveEventMode = false; // tracks whether exclusive event init succeeded
+
     if (exclusive)
     {
-        initHr = client->Initialize(
-            AUDCLNT_SHAREMODE_EXCLUSIVE,
-            0,
-            hnsBuffer,
-            hnsPeriodicity,
-            formatToUse,
-            NULL);
+        // Prefer event-driven exclusive (lower jitter) — fall back to timer if driver rejects it.
+        // For event mode: flags = EVENTCALLBACK, periodicity must equal buffer duration.
+        auto tryExclInit = [&](REFERENCE_TIME buf, REFERENCE_TIME period, DWORD flags) -> HRESULT {
+            return client->Initialize(AUDCLNT_SHAREMODE_EXCLUSIVE, flags, buf, period, formatToUse, NULL);
+        };
 
-        // Some devices require a buffer size aligned to the device period.
-        // Per MSDN: on AUDCLNT_E_BUFFER_SIZE_NOT_ALIGNED, call GetBufferSize,
-        // recompute hns from the returned frame count, release and re-Activate.
+        // First attempt: event mode
+        initHr = tryExclInit(hnsBuffer, hnsBuffer, AUDCLNT_STREAMFLAGS_EVENTCALLBACK);
+        if (SUCCEEDED(initHr))
+        {
+            exclusiveEventMode = true;
+        }
+        else if (initHr != AUDCLNT_E_BUFFER_SIZE_NOT_ALIGNED)
+        {
+            // Driver rejected event mode — retry with timer polling
+            initHr = tryExclInit(hnsBuffer, 0, 0);
+        }
+
+        // Some devices require buffer aligned to device period; handle for both modes.
         if (initHr == AUDCLNT_E_BUFFER_SIZE_NOT_ALIGNED)
         {
             UINT32 alignedFrames = 0;
@@ -1833,21 +1842,24 @@ static bool InitWasapi(OutputStreamState *s,
                     10000.0 * 1000.0 * alignedFrames / s->sampleRate + 0.5);
                 client->Release();
                 client = nullptr;
-                hr = device->Activate(__uuidof(IAudioClient), CLSCTX_ALL, nullptr,
-                                      (void **)&client);
+                hr = device->Activate(__uuidof(IAudioClient), CLSCTX_ALL, nullptr, (void **)&client);
                 if (SUCCEEDED(hr) && client)
                 {
-                    initHr = client->Initialize(
-                        AUDCLNT_SHAREMODE_EXCLUSIVE,
-                        0,
-                        hnsAligned,
-                        0,
-                        formatToUse,
-                        NULL);
+                    // Retry aligned — try event mode first
+                    initHr = tryExclInit(hnsAligned, hnsAligned, AUDCLNT_STREAMFLAGS_EVENTCALLBACK);
+                    if (SUCCEEDED(initHr))
+                    {
+                        exclusiveEventMode = true;
+                    }
+                    else
+                    {
+                        exclusiveEventMode = false;
+                        initHr = tryExclInit(hnsAligned, 0, 0);
+                    }
                 }
                 else
                 {
-                    initHr = hr; // propagate re-Activate failure
+                    initHr = hr;
                 }
             }
         }
@@ -1901,18 +1913,30 @@ static bool InitWasapi(OutputStreamState *s,
         return false;
     }
 
-    bool eventDriven = !exclusive;
+    // Event-driven: shared always; exclusive only when init succeeded with EVENTCALLBACK flag.
+    bool eventDriven = !exclusive || exclusiveEventMode;
     if (eventDriven)
     {
         hr = client->SetEventHandle(hEvent);
         if (FAILED(hr))
         {
-            CloseHandle(hEvent);
-            client->Release();
-            device->Release();
-            SetLastErrorHr("SetEventHandle failed", hr);
-            return false;
+            if (!exclusive)
+            {
+                // Shared mode must support event — hard failure
+                CloseHandle(hEvent);
+                client->Release();
+                device->Release();
+                SetLastErrorHr("SetEventHandle failed", hr);
+                return false;
+            }
+            // Exclusive: SetEventHandle failed despite event init — degrade to timer
+            eventDriven = false;
+            exclusiveEventMode = false;
         }
+    }
+    if (exclusive)
+    {
+        DBG(exclusiveEventMode ? "InitWasapi: exclusive event-driven mode" : "InitWasapi: exclusive timer-driven mode");
     }
 
     IAudioRenderClient *render = nullptr;

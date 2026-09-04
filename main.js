@@ -4,6 +4,8 @@ import net from 'net';
 import { fileURLToPath } from 'url';
 import fs from 'fs';
 import audioEngine from './audioEngine.js';
+import { DeviceMonitor } from './deviceMonitor.js';
+import { startUpdateChecker } from './updateChecker.js';
 import initSqlJs from 'sql.js';
 import { extractMetadata, extractMetadataFromBuffer } from './metadataLookup.js';
 import { extractLyrics } from './metadataLookup.js';
@@ -123,7 +125,7 @@ function loadAppSettings() {
       const j = JSON.parse(fs.readFileSync(appSettingsPath, 'utf8'));
       appSettings = Object.assign({}, appSettings, j || {});
       console.log('[settings] Loaded app settings:', appSettingsPath, appSettings);
-      
+
       // Restore EQ settings if available
       if (appSettings.eq) {
         audioEngine.setEQ(appSettings.eq);
@@ -595,7 +597,7 @@ function createWindow() {
     width: 1200,
     height: 800,
     icon: winIcon,
-    
+
     webPreferences: {
       preload: path.join(__dirname, 'preload.js'),
       contextIsolation: true,
@@ -764,7 +766,7 @@ const handlers = {
       if (options.mode === 'asio' && mainWindow && !mainWindow.isDestroyed()) {
         options.windowHandle = mainWindow.getNativeWindowHandle();
       }
-      
+
       // Store track metadata if provided
       if (options.track) {
         currentTrackMetadata = options.track;
@@ -774,7 +776,9 @@ const handlers = {
         currentTrackMetadata = track || { path: filePath, title: path.basename(filePath) };
       }
 
-      currentPlaybackOptions = { ...options, track: currentTrackMetadata };
+      // Propagate gapless intent from queue:next's __gapless flag or explicit options.gapless
+      const isGapless = !!(options.gapless || options.track?.__gapless);
+      currentPlaybackOptions = { ...options, track: currentTrackMetadata, gapless: isGapless };
       await audioEngine.playFile(playPath, () => {
         emitPluginEvent('track-stopped', currentTrackMetadata);
         broadcast('audio:ended');
@@ -789,10 +793,10 @@ const handlers = {
         });
         broadcastState();
       }, currentPlaybackOptions);
-      
+
       // Emit track started event to plugins
       emitPluginEvent('track-started', currentTrackMetadata);
-      
+
       broadcastState();
     } catch (e) {
       console.error('Play failed:', e);
@@ -829,7 +833,7 @@ const handlers = {
     const eq = audioEngine.getEQ();
     const name = Object.hasOwn(eqPresets, preset) ? preset : 'flat';
     const bands = eqPresets[name];
-    
+
     audioEngine.setEQ({ ...eq, preset: name, bands });
     return persistEqState();
   },
@@ -837,6 +841,42 @@ const handlers = {
     const eq = audioEngine.getEQ();
     audioEngine.setEQ({ ...eq, bands: normalizeEqBands(bands), preset: 'custom' });
     return persistEqState();
+  },
+  // Pre-amp
+  'audio:get-preamp': () => audioEngine.getPreamp(),
+  'audio:set-preamp': (db) => {
+    const result = audioEngine.setPreamp(db);
+    broadcastState();
+    return result;
+  },
+  // ReplayGain
+  'audio:get-replaygain-mode': () => audioEngine.getReplayGainMode(),
+  'audio:set-replaygain-mode': (mode) => {
+    const result = audioEngine.setReplayGainMode(mode);
+    broadcastState();
+    return result;
+  },
+  // Cue sheet import
+  'cue:import': async (cuePath) => {
+    try {
+      const { loadCueFile, encodeCueTrackPath } = await import('./cueParser.js');
+      const tracks = loadCueFile(cuePath);
+      return tracks.map((t, i) => ({
+        id: `cue-${cuePath}-${i}`,
+        path: encodeCueTrackPath(t.filePath, t.startSec, t.endSec),
+        title: t.title || `Track ${t.trackNumber}`,
+        artist: t.performer || '',
+        album: t.album || '',
+        genre: t.genre || '',
+        year: t.year || '',
+        trackNumber: t.trackNumber,
+        duration: t.endSec != null ? t.endSec - t.startSec : null,
+        format: path.extname(t.filePath).replace('.', '').toLowerCase(),
+      }));
+    } catch (e) {
+      console.error('[cue] import failed:', e);
+      throw e;
+    }
   },
   // Playlists
   'playlists:create': (name) => db.createPlaylist(name),
@@ -903,7 +943,7 @@ const handlers = {
       const SQL = await initSqlJs();
       const buffer = fs.readFileSync(impPath);
       const srcDb = new SQL.Database(buffer);
-      
+
       // Read playlists (take first)
       const stmt1 = srcDb.prepare('SELECT * FROM playlists ORDER BY id LIMIT 1');
       stmt1.step();
@@ -1049,13 +1089,14 @@ const handlers = {
   },
   'queue:next': () => {
     if (playbackQueue.length === 0) return null;
-    if (repeatMode === 'one') return playbackQueue[queueIndex];
+    if (repeatMode === 'one') return { ...playbackQueue[queueIndex], __gapless: true };
     queueIndex++;
     if (queueIndex >= playbackQueue.length) {
       if (repeatMode === 'all') queueIndex = 0;
       else return null;
     }
-    return playbackQueue[queueIndex];
+    // Signal gapless intent — renderer passes this as options.gapless to audio:play
+    return { ...playbackQueue[queueIndex], __gapless: true };
   },
   'queue:previous': () => {
     if (playbackQueue.length === 0) return null;
@@ -1143,7 +1184,7 @@ const handlers = {
             if (body.syncedLyrics) {
               return { source: 'online', lyrics: body.syncedLyrics, isSynced: true };
             }
-            const text = body.plainLyrics || body.lyrics; 
+            const text = body.plainLyrics || body.lyrics;
             if (text) {
               return { source: 'online', lyrics: text, isSynced: false };
             }
@@ -1166,20 +1207,20 @@ const handlers = {
       return { success: false, error: String(e) };
     }
   },
-  'audio:pause': () => { 
-    audioEngine.pause(); 
+  'audio:pause': () => {
+    audioEngine.pause();
     emitPluginEvent('track-paused', currentTrackMetadata);
-    broadcastState(); 
+    broadcastState();
   },
-  'audio:resume': () => { 
-    audioEngine.resume(); 
+  'audio:resume': () => {
+    audioEngine.resume();
     emitPluginEvent('track-resumed', currentTrackMetadata);
-    broadcastState(); 
+    broadcastState();
   },
-  'audio:stop': () => { 
-    audioEngine.stop(); 
+  'audio:stop': () => {
+    audioEngine.stop();
     emitPluginEvent('track-stopped', currentTrackMetadata);
-    broadcastState(); 
+    broadcastState();
   },
   'audio:set-volume': (val) => { audioEngine.setVolume(val); broadcastState(); },
   'audio:seek': (time) => { audioEngine.seek(time); broadcastState(); },
@@ -1220,26 +1261,26 @@ const handlers = {
   'plugins:list': async () => {
     const plugins = [];
     const cfg = loadPluginConfig();
-    
+
     const searchDirs = [repoPluginsDir, pluginsDir];
     const seen = new Set();
-    
+
     for (const searchDir of searchDirs) {
       if (!fs.existsSync(searchDir)) continue;
-      
+
       const dirs = fs.readdirSync(searchDir, { withFileTypes: true });
       for (const d of dirs) {
         if (!d.isDirectory()) continue;
         const manifestPath = path.join(searchDir, d.name, 'manifest.json');
         if (!fs.existsSync(manifestPath)) continue;
-        
+
         try {
           const manifest = JSON.parse(fs.readFileSync(manifestPath, 'utf8'));
           const pluginId = manifest.id || d.name;
-          
+
           if (seen.has(pluginId)) continue;
           seen.add(pluginId);
-          
+
           const enabled = cfg[pluginId]?.enabled !== false;
           const savedSettings = cfg[pluginId]?.settings || manifest.settings || {};
           plugins.push({
@@ -1376,7 +1417,7 @@ const handlers = {
     }
     loadedPlugins.clear();
     pluginEventHandlers.clear();
-    
+
     // Reload plugins
     await loadPlugins();
     try {
@@ -1385,6 +1426,9 @@ const handlers = {
       console.warn('Failed to notify renderer after plugin reload', notifyErr);
     }
     return { success: true, count: loadedPlugins.size };
+  },
+  'shell:open-external': (url) => {
+    if (typeof url === 'string' && /^https?:\/\//i.test(url)) shell.openExternal(url);
   },
   // Allow renderer/plugins to request saving/downloading a track file to disk
   // This starts the save task and returns immediately with a download id; progress
@@ -1524,7 +1568,7 @@ function createTray() {
 
   tray = new Tray(trayImage);
   tray.setToolTip('Spectra Music Player');
-  
+
   const contextMenu = Menu.buildFromTemplate([
     {
       label: 'Show Spectra',
@@ -1559,9 +1603,9 @@ function createTray() {
       }
     }
   ]);
-  
+
   tray.setContextMenu(contextMenu);
-  
+
   // Double-click to show window
   tray.on('double-click', () => {
     if (mainWindow) {
@@ -1574,21 +1618,21 @@ function createTray() {
 app.whenReady().then(async () => {
   protocol.registerFileProtocol('plugins', (request, callback) => {
     const url = request.url.slice('plugins://'.length);
-    
+
     // Check repo plugins first (source/dev)
     let p = path.join(repoPluginsDir, url);
     if (fs.existsSync(p)) {
       callback({ path: p });
       return;
     }
-    
+
     // Check user data plugins
     p = path.join(pluginsDir, url);
     if (fs.existsSync(p)) {
       callback({ path: p });
       return;
     }
-    
+
     callback({ error: -2 });
   });
 
@@ -1656,9 +1700,26 @@ app.whenReady().then(async () => {
   } catch (e) {
     console.error('[themes] Failed to register theme IPC handlers', e);
   }
-  
+
   // Load plugins after app is ready
   await loadPlugins();
+
+  // Start background update checker
+  startUpdateChecker(broadcast);
+
+  // Start PnP device monitor — polls for audio device add/remove
+  const deviceMonitor = new DeviceMonitor({ getDevices: () => audioEngine.getDevices() });
+  deviceMonitor.on('device-added', (d) => {
+    console.log('[devices] Device connected:', d.name || d.id);
+    broadcast('audio:device-added', d);
+    broadcast('audio:devices-changed', audioEngine.getDevices());
+  });
+  deviceMonitor.on('device-removed', (d) => {
+    console.log('[devices] Device disconnected:', d.name || d.id);
+    broadcast('audio:device-removed', d);
+    broadcast('audio:devices-changed', audioEngine.getDevices());
+  });
+  deviceMonitor.start();
 
   // Register global keyboard shortcuts
   const registerShortcuts = () => {
@@ -1681,7 +1742,7 @@ app.whenReady().then(async () => {
     globalShortcut.register('MediaStop', () => {
       handlers['audio:stop']();
     });
-    
+
     // Custom shortcuts
     globalShortcut.register('CommandOrControl+Shift+P', () => {
       const status = audioEngine.getStatus();
@@ -1700,7 +1761,7 @@ app.whenReady().then(async () => {
       if (prevTrack) handlers['audio:play'](prevTrack.path, { track: prevTrack });
     });
   };
-  
+
   if (!isServerMode) {
     registerShortcuts();
   } else {
@@ -1727,13 +1788,13 @@ app.on('before-quit', () => {
 app.on('will-quit', () => {
   // Unregister all shortcuts
   globalShortcut.unregisterAll();
-  
+
   // Clean up system tray
   if (tray) {
     tray.destroy();
     tray = null;
   }
-  
+
   // Deactivate all plugins on quit
   for (const [id, plugin] of loadedPlugins) {
     try {
@@ -2184,10 +2245,10 @@ async function processFileList(files) {
 
   for (let i = 0; i < total; i++) {
     await processAndAddTrack(files[i]);
-    broadcast('import:progress', { 
-      current: i + 1, 
-      total, 
-      filename: path.basename(files[i]) 
+    broadcast('import:progress', {
+      current: i + 1,
+      total,
+      filename: path.basename(files[i])
     });
   }
 
@@ -2370,25 +2431,25 @@ async function handleAddRemote(remoteInfo = {}) {
 // Plugin loading system
 async function checkPluginDependencies(pluginDir, pluginId) {
   const packageJsonPath = path.join(pluginDir, 'package.json');
-  
+
   // If no package.json, no dependencies to check
   if (!fs.existsSync(packageJsonPath)) {
     return;
   }
-  
+
   try {
     const packageJson = JSON.parse(fs.readFileSync(packageJsonPath, 'utf8'));
     const dependencies = packageJson.dependencies || {};
-    
+
     // If no dependencies defined, nothing to do
     if (Object.keys(dependencies).length === 0) {
       return;
     }
-    
+
     // Check if node_modules exists and has the required packages
     const nodeModulesPath = path.join(pluginDir, 'node_modules');
     let needsInstall = !fs.existsSync(nodeModulesPath);
-    
+
     if (!needsInstall) {
       // Check if all dependencies are installed
       for (const dep of Object.keys(dependencies)) {
@@ -2399,13 +2460,13 @@ async function checkPluginDependencies(pluginDir, pluginId) {
         }
       }
     }
-    
+
     if (needsInstall) {
       console.log(`[plugins] Installing dependencies for ${pluginId}...`);
-      
+
       // Run npm install in the plugin directory
       const { spawn } = await import('child_process');
-      
+
       await new Promise((resolve) => {
         const npmCmd = process.platform === 'win32' ? 'npm.cmd' : 'npm';
         const installProcess = spawn(npmCmd, ['install'], {
@@ -2413,7 +2474,7 @@ async function checkPluginDependencies(pluginDir, pluginId) {
           stdio: 'inherit',
           shell: true
         });
-        
+
         installProcess.on('close', (code) => {
           if (code === 0) {
             console.log(`[plugins] Dependencies installed for ${pluginId}`);
@@ -2423,7 +2484,7 @@ async function checkPluginDependencies(pluginDir, pluginId) {
             resolve(); // Don't reject, just continue
           }
         });
-        
+
         installProcess.on('error', (err) => {
           console.error(`[plugins] Error installing dependencies for ${pluginId}:`, err);
           resolve(); // Don't reject, just continue
@@ -2438,55 +2499,55 @@ async function checkPluginDependencies(pluginDir, pluginId) {
 async function loadPlugins() {
   console.log('[plugins] Loading plugins...');
   const cfg = loadPluginConfig();
-  
+
   // Check both user data plugins and repo plugins (prefer user plugins)
   const searchDirs = [pluginsDir, repoPluginsDir];
-  
+
   for (const searchDir of searchDirs) {
     if (!fs.existsSync(searchDir)) continue;
-    
+
     const dirs = fs.readdirSync(searchDir, { withFileTypes: true });
     for (const d of dirs) {
       if (!d.isDirectory()) continue;
-      
+
       const pluginDir = path.join(searchDir, d.name);
       const manifestPath = path.join(pluginDir, 'manifest.json');
-      
+
       if (!fs.existsSync(manifestPath)) continue;
-      
+
       try {
         const manifest = JSON.parse(fs.readFileSync(manifestPath, 'utf8'));
         const pluginId = manifest.id || d.name;
-        
+
         // Skip if already loaded from a different location
         if (loadedPlugins.has(pluginId)) continue;
-        
+
         // Check if plugin is enabled (default: true)
         const enabled = cfg[pluginId]?.enabled !== false;
         if (!enabled) {
           console.log(`[plugins] Skipping disabled plugin: ${pluginId}`);
           continue;
         }
-        
+
         // Check and install plugin dependencies if needed
         await checkPluginDependencies(pluginDir, pluginId);
-        
+
         // Load the plugin module
         const pluginMainPath = path.join(pluginDir, manifest.main || 'plugin.js');
         if (!fs.existsSync(pluginMainPath)) {
           console.error(`[plugins] Plugin main file not found: ${pluginMainPath}`);
           continue;
         }
-        
+
         // Import the plugin (ESM)
         const pluginUrl = new URL(`file:///${pluginMainPath.replace(/\\/g, '/')}`);
         const pluginModule = await import(pluginUrl.href);
-        
+
         if (!pluginModule.activate) {
           console.error(`[plugins] Plugin ${pluginId} missing activate function`);
           continue;
         }
-        
+
         // Create plugin context with settings from config (or defaults from manifest)
         const savedSettings = cfg[pluginId]?.settings || manifest.settings || {};
         const context = {
@@ -2510,25 +2571,25 @@ async function loadPlugins() {
             }
           }
         };
-        
+
         // Activate the plugin
         console.log(`[plugins] Activating plugin: ${pluginId}`);
         pluginModule.activate(context);
-        
+
         loadedPlugins.set(pluginId, {
           id: pluginId,
           module: pluginModule,
           manifest,
           context,
         });
-        
+
         console.log(`[plugins] OK Loaded plugin: ${pluginId}`);
       } catch (e) {
         console.error(`[plugins] Failed to load plugin ${d.name}:`, e);
       }
     }
   }
-  
+
   console.log(`[plugins] Loaded ${loadedPlugins.size} plugin(s)`);
 }
 
@@ -2538,7 +2599,7 @@ const pluginEventHandlers = new Map();
 function emitPluginEvent(eventName, data) {
   const handlers = pluginEventHandlers.get(eventName);
   if (!handlers || handlers.length === 0) return;
-  
+
   for (const handler of handlers) {
     try {
       handler(data);

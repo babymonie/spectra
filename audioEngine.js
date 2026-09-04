@@ -4,6 +4,7 @@ import ffmpegPath from 'ffmpeg-static';
 import { parseFile } from 'music-metadata';
 import { closeSync, createReadStream, existsSync, openSync, readSync } from 'node:fs';
 import path from 'node:path';
+import { FFmpegSupervisor } from './ffmpegSupervisor.js';
 
 let exclusiveAudio = null;
 let exclusiveLoadError = null;
@@ -62,6 +63,7 @@ try {
 }
 
 let ffmpegProc = null;
+let ffmpegSupervisor = null;
 let outputStream = null;
 let currentFile = null;
 let currentInputStream = null;
@@ -277,8 +279,40 @@ function createDsfNativeStream(filePath, dsf) {
 let eqState = {
   enabled: false,
   preset: 'flat',
-  bands: [0, 0, 0, 0, 0, 0, 0, 0, 0, 0] 
+  bands: [0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
 };
+
+// Pre-amp gain in dB (±12 dB), applied on top of volume and ReplayGain
+let preampDb = 0;
+
+// ReplayGain mode: 'track' | 'album' | 'off'
+let replayGainMode = 'track';
+
+// dB to linear conversion helper (clamped to prevent absurd values)
+function dbToLinear(db) {
+  return Math.pow(10, Math.max(-80, Math.min(24, db)) / 20);
+}
+
+/**
+ * Compute total linear gain for GainTransform from all gain stages.
+ * @param {number} volumePct  - user volume 0–100
+ * @param {object|null} rg    - replaygain object from metadata { trackGain, albumGain, trackPeak, albumPeak }
+ * @returns {number} linear gain to apply (pre-clipped to prevent hard distortion)
+ */
+function computeTotalGain(volumePct, rg) {
+  const vol = Math.min(1, Math.max(0, (Number.isFinite(volumePct) ? volumePct : 100) / 100));
+  let rgDb = 0;
+  let peak = 1;
+  if (rg && replayGainMode !== 'off') {
+    const gain = replayGainMode === 'album' && rg.albumGain != null ? rg.albumGain : rg.trackGain;
+    if (gain != null) rgDb = gain;
+    const p = replayGainMode === 'album' && rg.albumPeak != null ? rg.albumPeak : rg.trackPeak;
+    if (p != null && p > 0) peak = p;
+  }
+  const totalLinear = vol * dbToLinear(rgDb + preampDb);
+  // Hard-clip to 1/peak to prevent clipping (standard RG behavior)
+  return Math.min(totalLinear, 1.0 / peak);
+}
 
 function applyEqPlaybackCompatibility(options = {}) {
   const next = { ...(options || {}) };
@@ -311,7 +345,7 @@ function setEQ(state) {
   console.log('[audioEngine] setEQ:', state);
   const wasEnabled = eqState.enabled;
   const oldBands = [...eqState.bands];
-  
+
   if (state.enabled !== undefined) eqState.enabled = state.enabled;
   if (state.preset !== undefined) eqState.preset = state.preset;
   if (state.bands && Array.isArray(state.bands)) eqState.bands = [...state.bands];
@@ -333,12 +367,32 @@ function getEQ() {
 function setVolume(v) {
   const pct = Math.min(100, Math.max(0, Number.isFinite(v) ? Number(v) : 100));
   if (currentGainStream) {
-    currentGainStream.gain = pct / 100.0;
+    currentGainStream.gain = computeTotalGain(pct, currentGainStream._rgMeta ?? null);
     _updateLastOptionsVolume(pct);
     return true;
   }
   _updateLastOptionsVolume(pct);
   return false;
+}
+
+function setPreamp(db) {
+  preampDb = Math.min(12, Math.max(-12, Number.isFinite(Number(db)) ? Number(db) : 0));
+  // Re-apply gain to live stream
+  if (currentGainStream) {
+    const vol = lastOptions?.volume ?? 100;
+    currentGainStream.gain = computeTotalGain(vol, currentGainStream._rgMeta ?? null);
+  }
+  return preampDb;
+}
+
+function setReplayGainMode(mode) {
+  if (['track', 'album', 'off'].includes(mode)) replayGainMode = mode;
+  // Re-apply gain to live stream
+  if (currentGainStream) {
+    const vol = lastOptions?.volume ?? 100;
+    currentGainStream.gain = computeTotalGain(vol, currentGainStream._rgMeta ?? null);
+  }
+  return replayGainMode;
 }
 
 function _updateLastOptionsVolume(v) {
@@ -438,6 +492,19 @@ function createExclusiveStream({ sampleRate, channels, bitDepth, deviceId, mode,
 }
 
 async function playFile(filePath, onEnd, onError, options = {}) {
+  // Decode cue virtual track path: "audio.flac\x00cue\x00startSec\x00endSec"
+  if (filePath && filePath.includes('\x00cue\x00')) {
+    const parts = filePath.split('\x00cue\x00');
+    const [audioFile, rest] = [parts[0], parts[1] || ''];
+    const [startStr, endStr] = rest.split('\x00');
+    const cueSec = parseFloat(startStr);
+    const cueEnd = endStr && endStr !== '-' ? parseFloat(endStr) : null;
+    const cueOptions = { ...options };
+    if (Number.isFinite(cueSec)) cueOptions.startTime = cueSec;
+    if (Number.isFinite(cueEnd)) cueOptions.__cueEndSec = cueEnd;
+    return playFile(audioFile, onEnd, onError, cueOptions);
+  }
+
   options = applyEqPlaybackCompatibility(routePlaybackOptionsForBackendHealth(options));
   try {
     const startAt = Number(options?.startTime ?? 0);
@@ -453,9 +520,21 @@ async function playFile(filePath, onEnd, onError, options = {}) {
     }
   } catch {}
 
-  stop();
+  // Gapless mode: reuse existing outputStream if format will match, only kill decoder.
+  const wantGapless = options.gapless === true && outputStream && !outputStream._closed;
+  if (wantGapless) {
+    // Stop only the decoder, keep outputStream alive
+    if (ffmpegSupervisor) { try { ffmpegSupervisor.kill(); } catch {} ffmpegSupervisor = null; }
+    if (ffmpegProc) { try { ffmpegProc.kill('SIGTERM'); } catch {} ffmpegProc = null; }
+    if (currentGainStream) { try { currentGainStream.unpipe(); currentGainStream.destroy(); } catch {} currentGainStream = null; }
+    if (silenceInterval) { clearInterval(silenceInterval); silenceInterval = null; }
+    currentStartTime = 0;
+  } else {
+    stop();
+  }
+
   try {
-    console.log('[audioEngine] playFile called for', filePath);
+    console.log('[audioEngine] playFile called for', filePath, wantGapless ? '(gapless)' : '');
   } catch {}
   currentStartTime = options.startTime || 0;
 
@@ -467,10 +546,27 @@ async function playFile(filePath, onEnd, onError, options = {}) {
 
   let meta;
   try {
-    meta = await parseFile(filePath);
+    // Use native:true to get gapless + RG tags when available
+    meta = await parseFile(filePath, { native: true });
   } catch {
     meta = {};
   }
+
+  // Extract ReplayGain from parsed tags and store for gain computation
+  const metaCommon = meta?.common || {};
+  const metaNative = meta?.native || {};
+  const trackRgMeta = (() => {
+    let trackGain = null, albumGain = null, trackPeak = null, albumPeak = null;
+    const rg = (v) => { if (v == null) return null; if (typeof v === 'number') return v; if (typeof v?.dB === 'number') return v.dB; return parseFloat(String(v)) || null; };
+    const pk = (v) => { if (v == null) return null; if (typeof v === 'number') return v; if (typeof v?.ratio === 'number') return v.ratio; return parseFloat(String(v)) || null; };
+    trackGain = rg(metaCommon.replaygain_track_gain);
+    albumGain = rg(metaCommon.replaygain_album_gain);
+    trackPeak = pk(metaCommon.replaygain_track_peak);
+    albumPeak = pk(metaCommon.replaygain_album_peak);
+    return { trackGain, albumGain, trackPeak, albumPeak };
+  })();
+  // Pass RG into options so attachPipeline and computeTotalGain can use it
+  options = { ...options, __replaygain: trackRgMeta };
   const fmt = meta?.format || {};
   if (options.__backendHealthBypass) {
     console.warn('[audioEngine] bypassing unhealthy backend', options.__backendHealthBypass);
@@ -518,23 +614,43 @@ async function playFile(filePath, onEnd, onError, options = {}) {
     bitDepth = 24;
   }
 
-  try {
-    outputStream = createExclusiveStream({
-      sampleRate,
-      channels,
-      bitDepth,
-      deviceId: options.deviceId,
-      mode: useNativeDsd ? 'asio' : (useDop ? 'exclusive' : options.mode),
-      bufferMs: options.bufferMs,
-      bufferFrames: Number.isFinite(Number(options.bufferFrames)) ? Number(options.bufferFrames) : 0,
-      bitPerfect: (useDop || useNativeDsd) ? true : !!options.bitPerfect,
-      strictBitPerfect: useDop ? true : !!options.strictBitPerfect,
-      windowHandle: options.windowHandle,
-      dsdNative: useNativeDsd,
-    });
-  } catch (err) {
-    if (onError) onError(err);
-    return;
+  // For gapless: check if existing outputStream format matches next track.
+  // If it matches, reuse it; otherwise fall through to open a new one.
+  let gaplessReused = false;
+  if (wantGapless && outputStream && !outputStream._closed) {
+    const fmtOk =
+      (outputStream.actualSampleRate || 0) === sampleRate &&
+      (outputStream.actualChannels || 0) === channels &&
+      (outputStream.actualBitDepth || 0) === bitDepth;
+    if (fmtOk) {
+      gaplessReused = true;
+      console.log('[audioEngine] gapless: reusing outputStream (format match)');
+    } else {
+      console.log('[audioEngine] gapless: format mismatch, reopening outputStream');
+      try { outputStream.end(); if (typeof outputStream.destroy === 'function') outputStream.destroy(); } catch {}
+      outputStream = null;
+    }
+  }
+
+  if (!gaplessReused) {
+    try {
+      outputStream = createExclusiveStream({
+        sampleRate,
+        channels,
+        bitDepth,
+        deviceId: options.deviceId,
+        mode: useNativeDsd ? 'asio' : (useDop ? 'exclusive' : options.mode),
+        bufferMs: options.bufferMs,
+        bufferFrames: Number.isFinite(Number(options.bufferFrames)) ? Number(options.bufferFrames) : 0,
+        bitPerfect: (useDop || useNativeDsd) ? true : !!options.bitPerfect,
+        strictBitPerfect: useDop ? true : !!options.strictBitPerfect,
+        windowHandle: options.windowHandle,
+        dsdNative: useNativeDsd,
+      });
+    } catch (err) {
+      if (onError) onError(err);
+      return;
+    }
   }
 
   const actualSampleRate = outputStream.actualSampleRate || sampleRate;
@@ -668,61 +784,6 @@ async function playFile(filePath, onEnd, onError, options = {}) {
 
   console.log(`[audioEngine] Spawning FFmpeg with format=${ffmpegFormat}, rate=${actualSampleRate}, ch=${actualChannels}`);
 
-  const args = [
-    '-hide_banner',
-    '-loglevel', 'error',
-  ];
-
-  const isNetworkSource = typeof filePath === 'string' && /^https?:\/\//i.test(filePath);
-  if (isNetworkSource) {
-    // UPDATED: More robust network options for MinIO/S3
-    args.push(
-      '-reconnect', '1',
-      '-reconnect_streamed', '1',
-      '-reconnect_on_network_error', '1',
-      '-reconnect_on_http_error', '4xx,5xx',
-      '-reconnect_delay_max', '10',
-      '-rw_timeout', '15000000', // 15 seconds timeout
-      '-probesize', '10000000',  // More probe data for slow starts
-      '-analyzeduration', '20000000'
-    );
-  }
-
-  if (options.startTime) {
-    args.push('-ss', String(options.startTime));
-  }
-
-  args.push(
-    '-i', filePath,
-    '-vn'
-  );
-
-  if (eqState.enabled && !bitPerfectOutput) {
-    const freqs = [32, 64, 125, 250, 500, 1000, 2000, 4000, 8000, 16000];
-    let entries = '';
-    let maxBoost = 0;
-    for (let i = 0; i < freqs.length; i++) {
-      const gain = Number(eqState.bands[i] || 0);
-      if (gain > maxBoost) maxBoost = gain;
-      if (i > 0) entries += ';';
-      entries += `entry(${freqs[i]},${gain})`;
-    }
-    const filters = [];
-    if (maxBoost > 0) {
-      filters.push(`volume=${(-maxBoost).toFixed(1)}dB`);
-    }
-    filters.push(`firequalizer=gain_entry='${entries}'`);
-    args.push('-af', filters.join(','));
-  }
-
-  args.push(
-    '-f', ffmpegFormat,
-    '-acodec', ffmpegCodec,
-    '-ac', String(actualChannels),
-    '-ar', String(actualSampleRate),
-    'pipe:1'
-  );
-
   if (!resolvedFfmpegPath) {
     const err = new Error('FFmpeg binary path is not available');
     console.error('[audioEngine] Cannot start FFmpeg:', err.message);
@@ -730,76 +791,74 @@ async function playFile(filePath, onEnd, onError, options = {}) {
     return;
   }
 
-  ffmpegProc = spawn(resolvedFfmpegPath, args);
-  const thisProc = ffmpegProc;
-
-  if (thisProc.stderr) {
-    thisProc.stderr.on('data', (data) => {
-      // Normalize and inspect stderr output. Many FFmpeg "warnings"
-      // (especially about embedded album art / JPEGs) are benign for
-      // audio-only pipelines and should not be logged as errors.
-      const raw = String(data || '');
-      const lines = raw.split(/\r?\n/).map(l => l.trim()).filter(Boolean);
-      for (const msg of lines) {
-        // Common messages to downgrade to warning (or ignore)
-        const benignPatterns = [
-          /Stream ends prematurely/i,
-          /Invalid SOS parameters for sequential JPEG/i,
-          /premature end of image/i,
-          /premature end of data/i,
-          /Skipping unsupported/i,
-          /Invalid picture type/i,
-          /Could not read mimetype from an attached picture/i,
-        ];
-
-        const isBenign = benignPatterns.some((re) => re.test(msg));
-
-        if (isBenign) {
-          console.warn('[audioEngine] FFmpeg warning:', msg);
-          continue;
-        }
-
-        // Treat obvious error lines as errors, otherwise as warnings
-        if (/\berror\b/i.test(msg) || /failed/i.test(msg)) {
-          console.error('[audioEngine] FFmpeg stderr:', msg);
-        } else {
-          console.warn('[audioEngine] FFmpeg stderr:', msg);
-        }
-      }
-    });
-  }
-
-  thisProc.on('error', (err) => {
-    if (thisProc !== ffmpegProc) return;
-    console.error('[audioEngine] FFmpeg error:', err);
-    if (onError) onError(err);
-    stop();
-  });
-
-  thisProc.on('close', (code, signal) => {
-    if (thisProc !== ffmpegProc) return;
-    console.log('[audioEngine] FFmpeg exited with code:', code, 'signal:', signal);
-    const exitErr =
-      code && code !== 0 && code !== 255 // 255 is often SIGTERM/Kill
-        ? new Error('FFmpeg exited with code ' + code)
-        : null;
-
-    if (thisProc === ffmpegProc) ffmpegProc = null;
-
-    if (exitErr) {
-      console.error('[audioEngine] FFmpeg close error:', exitErr.message);
-      if (onError) onError(exitErr);
-    } else if (!isPaused && onEnd && code === 0) {
-      onEnd();
+  // Build FFmpeg args; called again on supervisor restarts with updated startAt
+  const buildArgs = (startAt) => {
+    const a = ['-hide_banner', '-loglevel', 'error'];
+    const isNetwork = typeof filePath === 'string' && /^https?:\/\//i.test(filePath);
+    if (isNetwork) {
+      a.push(
+        '-reconnect', '1',
+        '-reconnect_streamed', '1',
+        '-reconnect_on_network_error', '1',
+        '-reconnect_on_http_error', '4xx,5xx',
+        '-reconnect_delay_max', '10',
+        '-rw_timeout', '15000000',
+        '-probesize', '10000000',
+        '-analyzeduration', '20000000'
+      );
     }
-  });
+    if (startAt > 0) a.push('-ss', String(startAt));
+    a.push('-i', filePath, '-vn');
+    // Cue sheet end time: trim output at end of virtual track
+    if (Number.isFinite(options.__cueEndSec) && options.__cueEndSec > 0) {
+      const duration = options.__cueEndSec - startAt;
+      if (duration > 0) a.push('-t', String(duration));
+    }
+    if (!bitPerfectOutput) {
+      const filters = [];
+      if (eqState.enabled) {
+        const freqs = [32, 64, 125, 250, 500, 1000, 2000, 4000, 8000, 16000];
+        let entries = '';
+        let maxBoost = 0;
+        for (let i = 0; i < freqs.length; i++) {
+          const g = Number(eqState.bands[i] || 0);
+          if (g > maxBoost) maxBoost = g;
+          if (i > 0) entries += ';';
+          entries += `entry(${freqs[i]},${g})`;
+        }
+        if (maxBoost > 0) filters.push(`volume=${(-maxBoost).toFixed(1)}dB`);
+        filters.push(`firequalizer=gain_entry='${entries}'`);
+      }
+      // SoX resampler: high-quality SRC + dithering for bit-depth reduction.
+      // FFmpeg no-ops the resample step if rate already matches.
+      filters.push('aresample=resampler=soxr:precision=28:cutoff=0.96:dither_method=modified_e_weighted');
+      a.push('-af', filters.join(','));
+    }
 
+    a.push('-f', ffmpegFormat, '-acodec', ffmpegCodec, '-ac', String(actualChannels), '-ar', String(actualSampleRate), 'pipe:1');
+    return a;
+  };
+
+  // GainTransform: applies linear gain with TPDF dithering on integer formats.
+  // TPDF (Triangular Probability Density Function) masks quantization noise
+  // that appears when gain < 1.0 reduces effective bit depth.
   class GainTransform extends Transform {
-    constructor(format, channels, volumePercent) {
+    constructor(format, channels, linearGain, rgMeta) {
       super();
       this.format = format;
       this.channels = channels || 1;
-      this.gain = Math.min(100, Math.max(0, Number.isFinite(volumePercent) ? volumePercent : 100)) / 100.0;
+      this.gain = Number.isFinite(linearGain) ? Math.max(0, linearGain) : 1;
+      this._rgMeta = rgMeta || null;
+      // LCG state for fast TPDF random generation (two independent streams)
+      this._r1 = (Math.random() * 0xffffffff) >>> 0;
+      this._r2 = (Math.random() * 0xffffffff) >>> 0;
+    }
+
+    _tpdf() {
+      // Two independent LCG streams, subtracted → triangular [-1, 1] distribution
+      this._r1 = (this._r1 * 1664525 + 1013904223) >>> 0;
+      this._r2 = (this._r2 * 22695477 + 1) >>> 0;
+      return ((this._r1 >>> 16) - (this._r2 >>> 16)) / 65536.0; // [-1, 1]
     }
 
     _transform(chunk, encoding, callback) {
@@ -813,9 +872,9 @@ async function playFile(filePath, onEnd, onError, options = {}) {
           const out = Buffer.allocUnsafe(chunk.length);
           for (let i = 0; i + 1 < chunk.length; i += 2) {
             const s = chunk.readInt16LE(i);
-            let v = Math.round(s * this.gain);
-            if (v > 32767) v = 32767;
-            else if (v < -32768) v = -32768;
+            // TPDF dither: ±0.5 LSB triangular noise before quantization
+            let v = s * this.gain + this._tpdf() * 0.5;
+            v = v > 32767 ? 32767 : v < -32768 ? -32768 : Math.round(v);
             out.writeInt16LE(v, i);
           }
           this.push(out);
@@ -826,10 +885,8 @@ async function playFile(filePath, onEnd, onError, options = {}) {
           const view = new DataView(chunk.buffer, chunk.byteOffset, chunk.length);
           const out = Buffer.allocUnsafe(chunk.length);
           for (let i = 0; i + 3 < chunk.length; i += 4) {
-            const f = view.getFloat32(i, true);
-            let v = f * this.gain;
-            if (v > 1) v = 1;
-            else if (v < -1) v = -1;
+            let v = view.getFloat32(i, true) * this.gain;
+            v = v > 1 ? 1 : v < -1 ? -1 : v;
             out.writeFloatLE(v, i);
           }
           this.push(out);
@@ -840,9 +897,8 @@ async function playFile(filePath, onEnd, onError, options = {}) {
           const out = Buffer.allocUnsafe(chunk.length);
           for (let i = 0; i + 3 < chunk.length; i += 4) {
             const s = chunk.readInt32LE(i);
-            let v = Math.round(s * this.gain);
-            if (v > 2147483647) v = 2147483647;
-            else if (v < -2147483648) v = -2147483648;
+            let v = s * this.gain + this._tpdf() * 0.5;
+            v = v > 2147483647 ? 2147483647 : v < -2147483648 ? -2147483648 : Math.round(v);
             out.writeInt32LE(v, i);
           }
           this.push(out);
@@ -853,10 +909,9 @@ async function playFile(filePath, onEnd, onError, options = {}) {
           const out = Buffer.allocUnsafe(chunk.length);
           for (let i = 0; i + 2 < chunk.length; i += 3) {
             let s = chunk[i] | (chunk[i + 1] << 8) | (chunk[i + 2] << 16);
-            if (s & 0x800000) s |= 0xff000000;
-            let v = Math.round(s * this.gain);
-            if (v > 0x7fffff) v = 0x7fffff;
-            else if (v < -0x800000) v = -0x800000;
+            if (s & 0x800000) s |= 0xff000000; // sign-extend to int32
+            let v = s * this.gain + this._tpdf() * 0.5;
+            v = v > 0x7fffff ? 0x7fffff : v < -0x800000 ? -0x800000 : Math.round(v);
             out[i] = v & 0xff;
             out[i + 1] = (v >> 8) & 0xff;
             out[i + 2] = (v >> 16) & 0xff;
@@ -873,22 +928,96 @@ async function playFile(filePath, onEnd, onError, options = {}) {
     }
   }
 
-  if (thisProc.stdout) {
-    thisProc.stdout.on('error', (err) => {
-      if (thisProc !== ffmpegProc) return;
-      // Avoid spamming logs if error is just EPIPE from closing
-      if (err.code !== 'EPIPE') {
-          console.error('[audioEngine] stdout error:', err);
-          if (onError) onError(err);
-      }
-      stop();
+  // Resolve total linear gain: volume × ReplayGain × preamp
+  const volPct = bitPerfectOutput ? 100 : Number(options?.volume ?? 100);
+  const trackRg = options?.__replaygain ?? null;
+  const totalGain = bitPerfectOutput ? 1 : computeTotalGain(volPct, trackRg);
+
+  // Connect a newly spawned process stdout into the gain → output pipeline.
+  // Uses { end: false } so outputStream stays open across supervisor restarts.
+  const attachPipeline = (proc) => {
+    ffmpegProc = proc;
+
+    // Clean up previous gain stream without ending outputStream
+    if (currentGainStream) {
+      try { currentGainStream.unpipe(); currentGainStream.destroy(); } catch {}
+      currentGainStream = null;
+    }
+
+    if (!proc.stdout) return;
+
+    proc.stdout.on('error', (err) => {
+      if (err.code !== 'EPIPE') console.error('[audioEngine] stdout error:', err);
     });
 
-    const vol = bitPerfectOutput ? 100 : Number(options?.volume ?? 100);
-    const gainStream = new GainTransform(ffmpegFormat, actualChannels, vol);
-    currentGainStream = gainStream;
-    thisProc.stdout.pipe(gainStream).pipe(outputStream);
-  }
+    const gain = new GainTransform(ffmpegFormat, actualChannels, totalGain, trackRg);
+    currentGainStream = gain;
+    proc.stdout.pipe(gain).pipe(outputStream, { end: false });
+  };
+
+  // Stderr log handler shared across restarts
+  const handleStderr = (data) => {
+    const raw = String(data || '');
+    const benignPatterns = [
+      /Stream ends prematurely/i,
+      /Invalid SOS parameters for sequential JPEG/i,
+      /premature end of image/i,
+      /premature end of data/i,
+      /Skipping unsupported/i,
+      /Invalid picture type/i,
+      /Could not read mimetype from an attached picture/i,
+    ];
+    for (const msg of raw.split(/\r?\n/).map(l => l.trim()).filter(Boolean)) {
+      if (benignPatterns.some(re => re.test(msg))) {
+        console.warn('[audioEngine] FFmpeg warning:', msg);
+      } else if (/\berror\b/i.test(msg) || /failed/i.test(msg)) {
+        console.error('[audioEngine] FFmpeg stderr:', msg);
+      } else {
+        console.warn('[audioEngine] FFmpeg stderr:', msg);
+      }
+    }
+  };
+
+  const bytesPerSec = actualSampleRate * actualChannels * (actualBitDepth / 8);
+  const thisSupervisor = new FFmpegSupervisor({
+    ffmpegPath: resolvedFfmpegPath,
+    maxRestarts: 3,
+    restartWindowMs: 30_000,
+    watchdogMs: 20_000,
+  });
+  ffmpegSupervisor = thisSupervisor;
+
+  thisSupervisor.on('spawned', attachPipeline);
+  thisSupervisor.on('stderr', handleStderr);
+
+  thisSupervisor.on('restarting', (restartAt) => {
+    console.warn(`[audioEngine] FFmpeg restarting at ${restartAt.toFixed(2)}s after crash`);
+  });
+
+  thisSupervisor.on('crash', (code, signal) => {
+    console.error(`[audioEngine] FFmpeg crashed (code=${code} signal=${signal}) — supervisor will restart`);
+  });
+
+  thisSupervisor.on('close', (code, signal) => {
+    if (thisSupervisor !== ffmpegSupervisor) return;
+    console.log('[audioEngine] FFmpeg exited — code:', code, 'signal:', signal);
+    ffmpegProc = null;
+    if (!isPaused && onEnd && code === 0) onEnd();
+  });
+
+  thisSupervisor.on('error', (err) => {
+    if (thisSupervisor !== ffmpegSupervisor) return;
+    console.error('[audioEngine] FFmpeg supervisor gave up:', err.message);
+    ffmpegProc = null;
+    if (onError) onError(err);
+    stop();
+  });
+
+  thisSupervisor.start(buildArgs(options.startTime || 0), {
+    bytesPerSecond: bytesPerSec,
+    startTime: options.startTime || 0,
+    getArgs: buildArgs,
+  });
 
   if (outputStream && typeof outputStream.on === 'function') {
     outputStream.on('error', (err) => {
@@ -947,11 +1076,17 @@ function stop() {
     clearInterval(silenceInterval);
     silenceInterval = null;
   }
+  if (ffmpegSupervisor) {
+    try { ffmpegSupervisor.kill(); } catch {}
+    ffmpegSupervisor = null;
+  }
   if (ffmpegProc) {
-    try {
-      ffmpegProc.kill('SIGTERM');
-    } catch {}
+    try { ffmpegProc.kill('SIGTERM'); } catch {}
     ffmpegProc = null;
+  }
+  if (currentGainStream) {
+    try { currentGainStream.unpipe(); currentGainStream.destroy(); } catch {}
+    currentGainStream = null;
   }
 
   if (currentInputStream) {
@@ -976,16 +1111,20 @@ function stop() {
 
 function pause() {
   console.log('[audioEngine] pause called');
-  if (!ffmpegProc || isPaused) return;
+  if ((!ffmpegProc && !ffmpegSupervisor && !currentInputStream) || isPaused) return;
 
   try {
-    // 1) pause output first so it stops consuming ring
+    // 1) pause native output first so it stops consuming ring
     if (outputStream && typeof outputStream.pause === 'function') {
-      outputStream.pause(); // calls native.pause(handle)
+      outputStream.pause();
     }
 
-    // 2) then pause ffmpeg stdout so decoding blocks naturally
-    if (ffmpegProc.stdout) ffmpegProc.stdout.pause();
+    // 2) pause FFmpeg stdout so decoding blocks naturally
+    if (ffmpegSupervisor) {
+      ffmpegSupervisor.pauseOutput();
+    } else if (ffmpegProc?.stdout) {
+      ffmpegProc.stdout.pause();
+    }
   } catch (e) {
     console.error('[audioEngine] pause error:', e);
   }
@@ -1013,7 +1152,7 @@ function resume() {
 
   // If decoder died while paused/stalled, restart from current position so
   // resume doesn't unpause a drained ring with no producer.
-  if (!ffmpegProc && currentFile) {
+  if (!ffmpegProc && !ffmpegSupervisor && currentFile) {
     const restartAt = getTime();
     playFile(currentFile, lastOnEnd, lastOnError, {
       ...(lastOptions || {}),
@@ -1025,17 +1164,21 @@ function resume() {
   }
 
   // If we have no process AND native is not paused, nothing to do.
-  if (!ffmpegProc && !nativePaused) return;
+  if (!ffmpegProc && !ffmpegSupervisor && !nativePaused) return;
 
   try {
     // IMPORTANT ORDER:
     // 1) resume output first (so ring can drain again)
     if (outputStream && typeof outputStream.resume === 'function') {
-      outputStream.resume(); // calls native.resume(handle)
+      outputStream.resume();
     }
 
-    // 2) then resume ffmpeg stdout
-    if (ffmpegProc.stdout) ffmpegProc.stdout.resume();
+    // 2) then resume FFmpeg stdout
+    if (ffmpegSupervisor) {
+      ffmpegSupervisor.resumeOutput();
+    } else if (ffmpegProc?.stdout) {
+      ffmpegProc.stdout.resume();
+    }
   } catch (e) {
     console.error('[audioEngine] resume error:', e);
   }
@@ -1236,9 +1379,13 @@ const audioEngineApi = {
   openAsioControlPanel,
   getTime,
   setVolume,
+  setPreamp,
+  setReplayGainMode,
   seek,
   setEQ,
   getEQ,
+  getPreamp: () => preampDb,
+  getReplayGainMode: () => replayGainMode,
 };
 
 export default audioEngineApi;

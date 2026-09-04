@@ -36,6 +36,11 @@ contextBridge.exposeInMainWorld('electron', {
   seek: (time) => ipcRenderer.invoke('audio:seek', time),
   getTime: () => ipcRenderer.invoke('audio:get-time'),
   setVolume: (val) => ipcRenderer.invoke('audio:set-volume', val),
+  getPreamp: () => ipcRenderer.invoke('audio:get-preamp'),
+  setPreamp: (db) => ipcRenderer.invoke('audio:set-preamp', db),
+  getReplayGainMode: () => ipcRenderer.invoke('audio:get-replaygain-mode'),
+  setReplayGainMode: (mode) => ipcRenderer.invoke('audio:set-replaygain-mode', mode),
+  importCueSheet: (cuePath) => ipcRenderer.invoke('cue:import', cuePath),
   getDevices: () => ipcRenderer.invoke('audio:get-devices'),
   openAsioControlPanel: (deviceId) => ipcRenderer.invoke('audio:open-asio-control-panel', deviceId),
   getPlayerState: () => ipcRenderer.invoke('player:get-state'),
@@ -81,6 +86,7 @@ contextBridge.exposeInMainWorld('electron', {
   exportPlaylist: (playlistId) => ipcRenderer.invoke('playlists:export', playlistId),
   importPlaylist: () => ipcRenderer.invoke('playlists:import'),
   // Object storage upload from renderer -> plugin main
+  openExternal: (url) => ipcRenderer.invoke('shell:open-external', url),
   objectStorageUpload: (localPath, key) => ipcRenderer.invoke('object-storage:upload', localPath, key),
   // Request a presigned URL or cached path for an object-storage key
   objectStorageGetUrl: (key) => ipcRenderer.invoke('object-storage:get-url', key),
@@ -89,5 +95,5 @@ contextBridge.exposeInMainWorld('electron', {
   relinkTrack: (info) => ipcRenderer.invoke('track:relink', info),
   downloadTrack: (opts) => ipcRenderer.invoke('track:download', opts),
   on: (channel, callback) => ipcRenderer.on(channel, (event, ...args) => callback(...args)),
-  
+
 });

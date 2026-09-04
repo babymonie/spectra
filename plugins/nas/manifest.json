@@ -1,0 +1,11 @@
+{
+  "id": "nas",
+  "name": "NAS / Network Storage",
+  "version": "1.0.0",
+  "author": "Spectra",
+  "description": "Browse and play audio from NAS devices via WebDAV or UNC network paths (SMB/CIFS)",
+  "main": "plugin.js",
+  "settings": {
+    "shares": []
+  }
+}

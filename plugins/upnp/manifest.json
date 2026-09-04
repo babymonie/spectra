@@ -1,0 +1,12 @@
+{
+  "id": "upnp",
+  "name": "UPnP / DLNA",
+  "version": "1.0.0",
+  "author": "Spectra",
+  "description": "Discover and stream audio from UPnP/DLNA media servers on the local network",
+  "main": "plugin.js",
+  "settings": {
+    "scanIntervalMs": 30000,
+    "ssdpMx": 3
+  }
+}

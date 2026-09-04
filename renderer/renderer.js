@@ -1623,19 +1623,19 @@ function customPrompt(message, defaultValue = '') {
       </div>
     `;
     document.body.appendChild(modal);
-    
+
     const input = modal.querySelector('#custom-prompt-input');
     const btnOk = modal.querySelector('#custom-prompt-ok');
     const btnCancel = modal.querySelector('#custom-prompt-cancel');
-    
+
     input.focus();
     input.select();
-    
+
     const cleanup = (value) => {
       document.body.removeChild(modal);
       resolve(value);
     };
-    
+
     btnOk.onclick = () => cleanup(input.value);
     btnCancel.onclick = () => cleanup(null);
     input.onkeydown = (e) => {
@@ -1979,35 +1979,35 @@ const renderLibrary = () => {
     el.className = `track-item ${currentTrack && currentTrack.id === track.id ? 'active' : ''} ${isSelected ? 'selected' : ''}`;
     // Store path in dataset for right-click actions
     if (track.path) el.dataset.path = track.path;
-    
+
     // Fallback for title if missing, using simple string manipulation instead of path module
     const displayTitle = track.title || (track.path ? track.path.split(/[/\\]/).pop() : 'Unknown Title');
-    
+
     el.innerHTML = `
       <div class="col-title">${esc(displayTitle)}</div>
       <div class="col-artist clickable-filter">${esc(getDisplayArtistName(track))}</div>
       <div class="col-album clickable-filter">${esc(track.album || 'Unknown Album')}</div>
       <div class="col-duration">${formatTime(track.duration)}</div>
     `;
-    
+
     // Click on artist to filter by artist
     const artistCell = el.querySelector('.col-artist');
     artistCell.addEventListener('click', async (e) => {
       e.stopPropagation();
       const artistName = getTrackArtistNames(track)[0] || '';
       if (!artistName || artistName === 'Unknown Artist') return;
-      
+
       const artistToMatch = normalizeForCompare(artistName);
       currentArtistFilter = artistToMatch;
       currentAlbumFilter = null;
       currentPlaylistFilter = null;
       currentPlaylistTracks = [];
       setLibraryContext('artist', { name: artistName });
-      
+
       const currentQuery = searchInputEl ? searchInputEl.value : '';
       await handleSearchInput(currentQuery);
     });
-    
+
     // Click on album to filter by album
     const albumCell = el.querySelector('.col-album');
     albumCell.addEventListener('click', async (e) => {
@@ -2015,7 +2015,7 @@ const renderLibrary = () => {
       const albumName = track.album || '';
       const artistName = track.album_artist || track.artist || '';
       if (!albumName || albumName === 'Unknown Album') return;
-      
+
       const nameToMatch = normalizeForCompare(albumName);
       const artistToMatch = normalizeAlbumArtistKey(artistName);
       currentAlbumFilter = { album: nameToMatch, artist: artistToMatch || null };
@@ -2023,15 +2023,15 @@ const renderLibrary = () => {
       currentPlaylistFilter = null;
       currentPlaylistTracks = [];
       setLibraryContext('album', { name: albumName, artist: artistName });
-      
+
       const currentQuery = searchInputEl ? searchInputEl.value : '';
       await handleSearchInput(currentQuery);
     });
-    
+
     el.addEventListener('click', (e) => {
       // If clicked on artist/album filter cell, don't play
       if (e.target.classList.contains('clickable-filter')) return;
-      
+
       // Ctrl/Cmd-click toggles selection without playing
       if (e.ctrlKey || e.metaKey) {
         if (selectedTrackIds.has(track.id)) selectedTrackIds.delete(track.id);
@@ -2060,7 +2060,7 @@ const renderLibrary = () => {
         });
       }
     });
-    
+
     // Context Menu
     el.oncontextmenu = (e) => {
       e.preventDefault();
@@ -2074,7 +2074,7 @@ const renderLibrary = () => {
       const selected = tracks.filter(t => selectedTrackIds.has(t.id)).map(t => (typeof structuredClone === 'function' ? structuredClone(t) : JSON.parse(JSON.stringify(t))));
       electron.showTrackContextMenu(selected);
     };
-    
+
     trackList.appendChild(el);
   }
 };
@@ -2093,11 +2093,11 @@ const showAlbumContextMenu = async (event, albumInfo) => {
 // Fallback context menu for web UI
 const showWebAlbumContextMenu = (event, albumInfo) => {
   const { albumName, artistName, trackCount } = albumInfo;
-  
+
   // Remove any existing context menu
   const existing = document.querySelector('.album-context-menu');
   if (existing) existing.remove();
-  
+
   const menu = document.createElement('div');
   menu.className = 'album-context-menu';
   menu.style.cssText = `
@@ -2112,7 +2112,7 @@ const showWebAlbumContextMenu = (event, albumInfo) => {
     z-index: 10000;
     box-shadow: 0 4px 12px rgba(0,0,0,0.5);
   `;
-  
+
   const deleteItem = document.createElement('div');
   deleteItem.textContent = `Delete Album "${albumName}"`;
   deleteItem.style.cssText = `
@@ -2127,7 +2127,7 @@ const showWebAlbumContextMenu = (event, albumInfo) => {
     menu.remove();
     handleAlbumDeleteConfirm({ albumName, artistName, trackCount });
   };
-  
+
   const viewItem = document.createElement('div');
   viewItem.textContent = 'View Album';
   viewItem.style.cssText = `
@@ -2142,11 +2142,11 @@ const showWebAlbumContextMenu = (event, albumInfo) => {
     menu.remove();
     handleAlbumView({ albumName, artistName });
   };
-  
+
   menu.appendChild(deleteItem);
   menu.appendChild(viewItem);
   document.body.appendChild(menu);
-  
+
   // Close on click outside
   const closeMenu = (e) => {
     if (!menu.contains(e.target)) {
@@ -2160,11 +2160,11 @@ const showWebAlbumContextMenu = (event, albumInfo) => {
 // Handle album delete confirmation
 const handleAlbumDeleteConfirm = async (albumInfo) => {
   const { albumName, artistName, trackCount } = albumInfo;
-  
+
   const confirmed = window.confirm(
     `Delete album "${albumName}" by ${artistName || 'Unknown Artist'}?\n\nThis will remove all ${trackCount} track(s) from your library.\n\nThis cannot be undone.`
   );
-  
+
   if (confirmed) {
     try {
       const result = await electron.deleteAlbum(albumName, artistName);
@@ -2194,7 +2194,7 @@ const handleAlbumView = async (albumInfo) => {
   currentPlaylistFilter = null;
   currentPlaylistTracks = [];
   setLibraryContext('album', { name: albumName, artist: artistName });
-  
+
   const currentQuery = searchInputEl ? searchInputEl.value : '';
   switchView('library', true);
   await handleSearchInput(currentQuery);
@@ -2313,7 +2313,7 @@ async function renderAlbums({ data, forceReload = false } = {}) {
       const albumNameRaw = album.name || album.album || '';
       const artistNameRaw = album.artist || album.artist_name || '';
       const trackCount = album.track_count || album.trackCount || 0;
-      
+
       // Show a custom context menu
       showAlbumContextMenu(e, {
         albumName: albumNameRaw,
@@ -2359,7 +2359,7 @@ async function renderArtists({ data, forceReload = false } = {}) {
     } else {
       img.classList.add('placeholder');
     }
-    
+
     const title = document.createElement('div');
     title.className = 'album-title';
     const artistName = canonicalArtistDisplayName((artist.name || '').toString());
@@ -2552,7 +2552,7 @@ const updateNowPlaying = async () => {
   if (!currentTrack) return;
   npTitle.textContent = currentTrack.title || 'Unknown Title';
   npArtist.textContent = getDisplayArtistName(currentTrack);
-  
+
   if (currentTrack.cover_path) {
     if (currentTrack.cover_path.startsWith('http') || currentTrack.cover_path.startsWith('data:')) {
       npArt.src = currentTrack.cover_path;
@@ -2567,22 +2567,22 @@ const updateNowPlaying = async () => {
           npArt.classList.remove('placeholder');
           npArt.style.display = 'block';
         } else {
-          npArt.src = ''; 
+          npArt.src = '';
           npArt.classList.add('placeholder');
           npArt.style.display = 'flex';
         }
       } catch (err) {
-        npArt.src = ''; 
+        npArt.src = '';
         npArt.classList.add('placeholder');
         npArt.style.display = 'flex';
       }
     }
   } else {
-    npArt.src = ''; 
+    npArt.src = '';
     npArt.classList.add('placeholder');
     npArt.style.display = 'flex'; // Flex for centering icon
   }
-  
+
   totalTimeEl.textContent = formatTime(currentTrack.duration);
 };
 
@@ -2629,7 +2629,7 @@ function renderSyncedLyrics(lyricsData) {
   const fsLyrics = document.getElementById('fs-lyrics');
   if (!fsLyrics) return;
   fsLyrics.innerHTML = '';
-  
+
   if (!lyricsData || lyricsData.length === 0) {
     fsLyrics.textContent = 'No synced lyrics available.';
     return;
@@ -2732,7 +2732,7 @@ function showFullscreen() {
 
   const trackKeyAtOpen = getTrackIdentityKey(activeTrack);
   const token = ++fullscreenLyricsToken;
-  
+
   // Enter actual fullscreen
   try { electron.setFullscreen(true); } catch {}
 
@@ -2746,10 +2746,10 @@ function showFullscreen() {
   } catch (e) {
     // ignore if elements missing
   }
-  
+
   // Update time immediately
   if (fsTotalTime) fsTotalTime.textContent = formatTime(activeTrack.duration);
-  
+
   // Wire up controls
   if (btnFsPlay) {
     btnFsPlay.onclick = async () => {
@@ -2780,7 +2780,7 @@ function showFullscreen() {
       }
     };
   }
-  
+
   if (btnFsPrev) {
     btnFsPrev.onclick = () => {
       if (!currentTrack) return;
@@ -2813,7 +2813,7 @@ function showFullscreen() {
     // Set initial state
     btnFsShuffle.classList.toggle('active', shuffleEnabled);
   }
-  
+
   if (btnFsRepeat) {
     btnFsRepeat.onclick = async () => {
       // Cycle through: off -> all -> one -> off
@@ -2939,7 +2939,7 @@ function showFullscreen() {
       let lyricsText = activeTrack.lyrics;
       // Filter out bad data
       if (lyricsText === '[object Object]') lyricsText = null;
-      
+
       let isSynced = false;
 
       // If not in memory, fetch
@@ -2950,7 +2950,7 @@ function showFullscreen() {
         if (res && res.lyrics && res.lyrics !== '[object Object]') {
           lyricsText = res.lyrics;
           isSynced = res.isSynced; // Flag from main process
-          
+
           // Persist fetched lyrics into DB
           if (res.source === 'online' || res.source === 'embedded') {
             try {
@@ -3002,7 +3002,7 @@ function showFullscreen() {
   document.addEventListener('keydown', escHandler);
   // store handler reference on element so we can remove later
   overlay._escHandler = escHandler;
-  
+
   // Start updating progress bar in fullscreen
   startFullscreenProgressLoop();
 }
@@ -3013,7 +3013,7 @@ function startFullscreenProgressLoop() {
   const fsCurrentTime = document.getElementById('fs-current-time');
   const fsProgressFill = document.getElementById('fs-progress-fill');
   const btnFsPlay = document.getElementById('fs-btn-play');
-  
+
   fsProgressInterval = setInterval(async () => {
     const status = await electron.getAudioStatus().catch(() => null);
     const playingNow = status ? (Boolean(status.playing) && !Boolean(status.paused)) : isPlaying;
@@ -3065,11 +3065,11 @@ function startFullscreenProgressLoop() {
 function hideFullscreen() {
   const overlay = document.getElementById('fullscreen-player');
   if (!overlay) return;
-  
+
   // Exit actual fullscreen
   try { electron.setFullscreen(false); } catch {}
   fullscreenLyricsToken++;
-  
+
   overlay.classList.add('hidden');
   const handler = overlay._escHandler;
   if (handler) {
@@ -3110,7 +3110,7 @@ function initFullscreenClick() {
       const pct = Math.max(0, Math.min(1, x / rect.width));
       const time = pct * currentTrack.duration;
       electron.seek(time);
-      
+
       // Optimistic update
       const fsProgressFill = document.getElementById('fs-progress-fill');
       if (fsProgressFill) fsProgressFill.style.width = `${pct * 100}%`;
@@ -3199,7 +3199,7 @@ const initSearch = () => {
 // Sync state from server
 const syncState = (state) => {
   if (!state) return;
-  
+
   // Update isPlaying
   isPlaying = state.playing && !state.paused;
   updatePlayButton();
@@ -3841,10 +3841,10 @@ const loadPlugins = async () => {
             // Update status text
             const statusEl = card.querySelector('.plugin-status');
             if (statusEl) statusEl.textContent = newEnabledState ? 'Active - Reload to apply' : 'Disabled - Reload to apply';
-            
+
             // Update the local plugin object
             p.enabled = newEnabledState;
-            
+
             // If disabling, immediately clean up plugin DOM elements
             if (!newEnabledState) {
               const pid = p.id;
@@ -3893,11 +3893,11 @@ const loadPlugins = async () => {
             } else {
               settingValue = e.target.value;
             }
-            
+
             // Update the settings object
             const updatedSettings = { ...p.settings };
             updatedSettings[settingKey] = settingValue;
-            
+
             // Save to backend. Do NOT reload all plugins automatically —
             // let the user decide when to reload to avoid disruptive restarts.
             try {
@@ -3929,7 +3929,7 @@ const loadPlugins = async () => {
         console.log(`[renderer] Plugin ${p.id} has no entry point, skipping UI load`);
         continue;
       }
-      
+
       // Double-check plugin is still enabled before loading UI (prevents race conditions)
       try {
         const latestPlugins = await electron.getPlugins();
@@ -3941,7 +3941,7 @@ const loadPlugins = async () => {
       } catch (checkErr) {
         console.warn(`[renderer] Could not verify plugin ${p.id} state, proceeding with caution:`, checkErr);
       }
-      
+
       try {
         // Resolve plugin entry path. If the manifest provides a relative path
         // (e.g. "ui.js"), fetch it via the registered `plugins://` protocol
@@ -4190,7 +4190,7 @@ async function init() {
     try {
       const url = await customPrompt('Enter remote audio URL (http or https):');
       if (!url || !url.trim()) return;
-      
+
       const trimmedUrl = url.trim();
       if (!/^https?:\/\//i.test(trimmedUrl)) {
         alert('Please enter a valid http(s) URL');
@@ -4201,12 +4201,12 @@ async function init() {
       const title = await customPrompt('Optional: provide a title for this track (leave blank to use filename):');
       const artist = await customPrompt('Optional: provide an artist name (leave blank for Remote):');
 
-      const res = await electron.addRemote({ 
-        url: trimmedUrl, 
+      const res = await electron.addRemote({
+        url: trimmedUrl,
         title: title && title.trim() ? title.trim() : undefined,
         artist: artist && artist.trim() ? artist.trim() : undefined
       });
-      
+
       if (res && res.success) {
         await loadLibrary();
         const playNow = confirm('Track added to library. Play it now?');
@@ -4534,6 +4534,42 @@ async function init() {
   // Refresh playlists view when main notifies tracks were added
   electron.on('playlist:added', async () => {
     try { playlistsCache = []; await renderPlaylists({ forceReload: true }); } catch {}
+  });
+
+  // Update notifications
+  electron.on('update:available', ({ type, currentVersion, latestVersion, url }) => {
+    const isMajor = type === 'major';
+    const message = isMajor
+      ? `Major update available: v${latestVersion}`
+      : `Update available: v${latestVersion}`;
+    const detail = isMajor
+      ? `You're on v${currentVersion} — major release, click to download`
+      : `You're on v${currentVersion} — click to download`;
+
+    NotificationCenter.show({
+      message,
+      detail,
+      type: isMajor ? 'warning' : 'info',
+      sticky: isMajor,
+      autoClose: isMajor ? null : 12000,
+      dismissible: true,
+    });
+
+    // Make the bar clickable to open release page
+    try {
+      const { bar } = NotificationCenter.ensureDom();
+      if (bar) {
+        bar.style.cursor = 'pointer';
+        bar.onclick = (e) => {
+          if (e.target.closest('#notification-close')) return; // don't intercept close btn
+          if (typeof electron.openExternal === 'function') {
+            electron.openExternal(url);
+          } else {
+            window.open(url, '_blank');
+          }
+        };
+      }
+    } catch {}
   });
 
   // Periodic UI updates
