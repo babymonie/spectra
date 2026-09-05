@@ -62,6 +62,19 @@ try {
   console.warn('[audioEngine] failed to load exclusiveAudio addon:', exclusiveLoadError);
 }
 
+// Probe once whether the resolved FFmpeg binary has libsoxr compiled in.
+const hasSoxr = (() => {
+  try {
+    if (!resolvedFfmpegPath) return false;
+    const result = spawnSync(resolvedFfmpegPath, ['-version'], { encoding: 'utf8', timeout: 5000 });
+    const out = (result.stdout || '') + (result.stderr || '');
+    return out.includes('enable-libsoxr') || out.includes('--enable-libsoxr');
+  } catch {
+    return false;
+  }
+})();
+console.log(`[audioEngine] soxr resampler: ${hasSoxr ? 'available' : 'unavailable — using swr'}`)
+
 let ffmpegProc = null;
 let ffmpegSupervisor = null;
 let outputStream = null;
@@ -829,9 +842,13 @@ async function playFile(filePath, onEnd, onError, options = {}) {
         if (maxBoost > 0) filters.push(`volume=${(-maxBoost).toFixed(1)}dB`);
         filters.push(`firequalizer=gain_entry='${entries}'`);
       }
-      // SoX resampler: high-quality SRC + dithering for bit-depth reduction.
+      // SoX resampler preferred; fall back to swr when libsoxr not compiled in.
       // FFmpeg no-ops the resample step if rate already matches.
-      filters.push('aresample=resampler=soxr:precision=28:cutoff=0.96:dither_method=modified_e_weighted');
+      if (hasSoxr) {
+        filters.push('aresample=resampler=soxr:precision=28:cutoff=0.96:dither_method=modified_e_weighted');
+      } else {
+        filters.push('aresample=resampler=swr');
+      }
       a.push('-af', filters.join(','));
     }
 
