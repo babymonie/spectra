@@ -50,11 +50,23 @@ let navPlaylists;
 let navSettings;
 let navAlbums;
 let navArtists;
+let navUpnp;
+let navNas;
 let viewLibrary;
 let viewPlaylists;
 let viewSettings;
 let viewAlbums;
 let viewArtists;
+
+// UPnP state
+let upnpServers = [];
+let upnpSelectedUsn = null;
+let upnpBreadcrumb = [];
+
+// NAS state
+let nasShares = [];
+let nasSelectedShareId = null;
+let nasBreadcrumb = [];
 
 // Other DOM elements assigned in init
 let btnImportFile;
@@ -1382,6 +1394,10 @@ const switchView = (viewId, preserveLibrary = false) => {
       loadSettingsUI();
       initEqualizerControls();
       void syncEqualizerControls();
+    } else if (viewId === 'upnp') {
+      void loadUpnpView();
+    } else if (viewId === 'nas') {
+      void loadNasView();
     }
 
     updateSearchPlaceholder();
@@ -4025,6 +4041,8 @@ async function init() {
   navSettings = document.getElementById('nav-settings');
   navAlbums = document.getElementById('nav-albums');
   navArtists = document.getElementById('nav-artists');
+  navUpnp = document.getElementById('nav-upnp');
+  navNas = document.getElementById('nav-nas');
   viewLibrary = document.getElementById('view-library');
   viewPlaylists = document.getElementById('view-playlists');
   viewSettings = document.getElementById('view-settings');
@@ -4147,6 +4165,24 @@ async function init() {
   if (navSettings) navSettings.onclick = () => switchView('settings');
   if (navAlbums) navAlbums.onclick = () => switchView('albums');
   if (navArtists) navArtists.onclick = () => switchView('artists');
+  if (navUpnp) navUpnp.onclick = () => switchView('upnp');
+  if (navNas) navNas.onclick = () => switchView('nas');
+
+  // UPnP broadcast listeners
+  electron.on('upnp:servers-found', (data) => {
+    if (!data || !data.servers) return;
+    upnpServers = data.servers;
+    renderUpnpServers(upnpServers);
+    const statusEl = document.getElementById('upnp-status');
+    if (statusEl) statusEl.textContent = `${upnpServers.length} server${upnpServers.length !== 1 ? 's' : ''} found`;
+  });
+  electron.on('upnp:servers-updated', (data) => {
+    if (!data || !data.servers) return;
+    upnpServers = data.servers;
+    if (currentView === 'upnp') renderUpnpServers(upnpServers);
+  });
+
+  initNasModal();
 
   // Listen for library refresh requests (e.g., from plugins)
   window.addEventListener('spectra:refresh-library', async () => {
@@ -4661,6 +4697,496 @@ async function init() {
         showNowPlaying();
       }
     }
+  }
+}
+
+// ─── UPnP / DLNA Browser ──────────────────────────────────────────────────────
+
+function netFormatDuration(dur) {
+  if (!dur) return '';
+  const parts = String(dur).split(':');
+  if (parts.length === 3) {
+    const h = parseInt(parts[0], 10);
+    const m = parseInt(parts[1], 10);
+    const s = parseInt(parts[2], 10);
+    if (h > 0) return `${h}:${String(m).padStart(2,'0')}:${String(s).padStart(2,'0')}`;
+    return `${m}:${String(s).padStart(2,'0')}`;
+  }
+  return dur;
+}
+
+function netPlayTrack(track) {
+  return playTrack(track, { forceRestart: true });
+}
+
+function renderNetBreadcrumb(container, crumbs, onNavigate) {
+  container.innerHTML = '';
+  crumbs.forEach((crumb, i) => {
+    const span = document.createElement('span');
+    span.className = 'net-breadcrumb-item' + (i === crumbs.length - 1 ? ' current' : '');
+    span.textContent = crumb.name;
+    if (i < crumbs.length - 1) span.onclick = () => onNavigate(i);
+    container.appendChild(span);
+    if (i < crumbs.length - 1) {
+      const sep = document.createElement('span');
+      sep.className = 'net-breadcrumb-sep';
+      sep.textContent = '›';
+      container.appendChild(sep);
+    }
+  });
+}
+
+function renderUpnpServers(servers) {
+  const list = document.getElementById('upnp-servers-list');
+  if (!list) return;
+  if (!servers || !servers.length) {
+    list.innerHTML = '<div class="net-empty-hint">No servers found on network</div>';
+    return;
+  }
+  list.innerHTML = '';
+  servers.forEach(s => {
+    const item = document.createElement('div');
+    item.className = 'net-server-item' + (s.usn === upnpSelectedUsn ? ' active' : '');
+    item.dataset.usn = s.usn;
+    const icon = document.createElement('span');
+    icon.className = 'material-icons';
+    icon.textContent = 'dns';
+    const name = document.createElement('span');
+    name.textContent = s.friendlyName || s.usn;
+    name.style.overflow = 'hidden';
+    name.style.textOverflow = 'ellipsis';
+    name.style.whiteSpace = 'nowrap';
+    item.appendChild(icon);
+    item.appendChild(name);
+    item.onclick = () => {
+      upnpSelectedUsn = s.usn;
+      upnpBreadcrumb = [{ id: '0', name: s.friendlyName || 'Root' }];
+      renderUpnpServers(upnpServers);
+      browseUpnp(s.usn, '0');
+    };
+    list.appendChild(item);
+  });
+}
+
+async function browseUpnp(usn, objectId) {
+  const fb = document.getElementById('upnp-filebrowser');
+  if (!fb) return;
+  fb.innerHTML = '<div class="net-loading">Loading…</div>';
+  try {
+    const items = await electron.upnpBrowse({ usn, objectId });
+    renderUpnpItems(fb, usn, items);
+  } catch (err) {
+    fb.innerHTML = `<div class="net-empty-hint">Error: ${err && err.message ? err.message : err}</div>`;
+  }
+}
+
+function renderUpnpItems(fb, usn, items) {
+  fb.innerHTML = '';
+
+  const breadEl = document.createElement('div');
+  breadEl.className = 'net-breadcrumb';
+  renderNetBreadcrumb(breadEl, upnpBreadcrumb, (idx) => {
+    upnpBreadcrumb = upnpBreadcrumb.slice(0, idx + 1);
+    browseUpnp(usn, upnpBreadcrumb[upnpBreadcrumb.length - 1].id);
+  });
+  fb.appendChild(breadEl);
+
+  const fileList = document.createElement('div');
+  fileList.className = 'net-file-list';
+
+  if (!items || !items.length) {
+    fileList.innerHTML = '<div class="net-empty-hint">Empty folder</div>';
+    fb.appendChild(fileList);
+    return;
+  }
+
+  const trackItems = items.filter(it => it.type === 'track');
+
+  items.forEach(it => {
+    const row = document.createElement('div');
+    row.className = 'net-file-item ' + (it.type === 'container' ? 'is-folder' : 'is-track');
+
+    const icon = document.createElement('span');
+    icon.className = 'material-icons';
+    icon.textContent = it.type === 'container' ? 'folder' : 'audio_file';
+
+    const meta = document.createElement('div');
+    meta.className = 'net-file-item-meta';
+    const nameEl = document.createElement('div');
+    nameEl.className = 'net-file-item-name';
+    nameEl.textContent = it.title || it.name || '(untitled)';
+    meta.appendChild(nameEl);
+
+    if (it.type === 'track' && (it.artist || it.album)) {
+      const sub = document.createElement('div');
+      sub.className = 'net-file-item-sub';
+      sub.textContent = [it.artist, it.album].filter(Boolean).join(' · ');
+      meta.appendChild(sub);
+    }
+
+    row.appendChild(icon);
+    row.appendChild(meta);
+
+    if (it.type === 'track') {
+      if (it.duration) {
+        const dur = document.createElement('div');
+        dur.className = 'net-file-item-duration';
+        dur.textContent = netFormatDuration(it.duration);
+        row.appendChild(dur);
+      }
+
+      const actions = document.createElement('div');
+      actions.className = 'net-file-item-actions';
+      const playBtn = document.createElement('button');
+      playBtn.title = 'Play';
+      playBtn.innerHTML = '<span class="material-icons">play_circle</span>';
+      playBtn.onclick = (e) => {
+        e.stopPropagation();
+        const track = {
+          id: 'upnp:' + it.id,
+          path: it.url,
+          title: it.title || '',
+          artist: it.artist || '',
+          album: it.album || '',
+          duration: 0,
+        };
+        startPlayback(track, trackItems.map((t, idx) => ({
+          id: 'upnp:' + t.id,
+          path: t.url,
+          title: t.title || '',
+          artist: t.artist || '',
+          album: t.album || '',
+          duration: 0,
+        })), { type: 'upnp', key: usn });
+      };
+      actions.appendChild(playBtn);
+      row.appendChild(actions);
+
+      row.ondblclick = () => playBtn.onclick(new MouseEvent('click'));
+    } else {
+      row.onclick = () => {
+        upnpBreadcrumb = [...upnpBreadcrumb, { id: it.id, name: it.title || it.name }];
+        browseUpnp(usn, it.id);
+      };
+    }
+
+    fileList.appendChild(row);
+  });
+
+  fb.appendChild(fileList);
+}
+
+async function loadUpnpView() {
+  const statusEl = document.getElementById('upnp-status');
+  const scanBtn = document.getElementById('btn-upnp-scan');
+
+  if (scanBtn && !scanBtn._bound) {
+    scanBtn._bound = true;
+    scanBtn.onclick = async () => {
+      if (statusEl) statusEl.textContent = 'Scanning…';
+      scanBtn.disabled = true;
+      try {
+        const servers = await electron.upnpScan();
+        upnpServers = servers || [];
+        renderUpnpServers(upnpServers);
+        if (statusEl) statusEl.textContent = upnpServers.length
+          ? `${upnpServers.length} server${upnpServers.length !== 1 ? 's' : ''} found`
+          : 'No servers found';
+      } catch (err) {
+        if (statusEl) statusEl.textContent = 'Scan failed';
+        console.error('[upnp] scan error', err);
+      } finally {
+        scanBtn.disabled = false;
+      }
+    };
+  }
+
+  if (!upnpServers.length) {
+    try {
+      const cached = await electron.upnpGetServers();
+      if (cached && cached.length) {
+        upnpServers = cached;
+        renderUpnpServers(upnpServers);
+        if (statusEl) statusEl.textContent = `${upnpServers.length} server${upnpServers.length !== 1 ? 's' : ''} (cached)`;
+      }
+    } catch {}
+  } else {
+    renderUpnpServers(upnpServers);
+  }
+}
+
+// ─── NAS / Network Storage Browser ───────────────────────────────────────────
+
+function renderNasShares(shares) {
+  const list = document.getElementById('nas-shares-list');
+  if (!list) return;
+  if (!shares || !shares.length) {
+    list.innerHTML = '<div class="net-empty-hint">No shares configured</div>';
+    return;
+  }
+  list.innerHTML = '';
+  shares.forEach(s => {
+    const item = document.createElement('div');
+    item.className = 'net-server-item' + (s.id === nasSelectedShareId ? ' active' : '');
+
+    const icon = document.createElement('span');
+    icon.className = 'material-icons';
+    icon.textContent = s.type === 'webdav' ? 'cloud' : 'storage';
+
+    const name = document.createElement('span');
+    name.textContent = s.name;
+    name.style.flex = '1';
+    name.style.overflow = 'hidden';
+    name.style.textOverflow = 'ellipsis';
+    name.style.whiteSpace = 'nowrap';
+
+    const badge = document.createElement('span');
+    badge.className = 'net-share-type-badge';
+    badge.textContent = s.type;
+
+    const actions = document.createElement('div');
+    actions.className = 'net-server-item-actions';
+
+    const testBtn = document.createElement('button');
+    testBtn.title = 'Test connection';
+    testBtn.innerHTML = '<span class="material-icons" style="font-size:16px">wifi_tethering</span>';
+    testBtn.onclick = async (e) => {
+      e.stopPropagation();
+      try {
+        const res = await electron.nasTestShare({ shareId: s.id });
+        NotificationCenter.show({ message: res.message, type: res.ok ? 'success' : 'error', autoClose: 3000 });
+      } catch (err) {
+        NotificationCenter.show({ message: String(err && err.message ? err.message : err), type: 'error', autoClose: 3000 });
+      }
+    };
+
+    const removeBtn = document.createElement('button');
+    removeBtn.className = 'danger';
+    removeBtn.title = 'Remove share';
+    removeBtn.innerHTML = '<span class="material-icons" style="font-size:16px">delete</span>';
+    removeBtn.onclick = async (e) => {
+      e.stopPropagation();
+      if (!confirm(`Remove share "${s.name}"?`)) return;
+      try {
+        await electron.nasRemoveShare({ shareId: s.id });
+        if (nasSelectedShareId === s.id) {
+          nasSelectedShareId = null;
+          nasBreadcrumb = [];
+          const fb = document.getElementById('nas-filebrowser');
+          if (fb) fb.innerHTML = '<div class="net-empty-hint">Select a share to browse</div>';
+        }
+        await loadNasView();
+      } catch (err) {
+        NotificationCenter.show({ message: String(err && err.message ? err.message : err), type: 'error', autoClose: 3000 });
+      }
+    };
+
+    actions.appendChild(testBtn);
+    actions.appendChild(removeBtn);
+
+    item.appendChild(icon);
+    item.appendChild(name);
+    item.appendChild(badge);
+    item.appendChild(actions);
+
+    item.onclick = () => {
+      nasSelectedShareId = s.id;
+      nasBreadcrumb = [{ path: null, name: s.name }];
+      renderNasShares(nasShares);
+      browseNas(s.id, null);
+    };
+
+    list.appendChild(item);
+  });
+}
+
+async function browseNas(shareId, subPath) {
+  const fb = document.getElementById('nas-filebrowser');
+  if (!fb) return;
+  fb.innerHTML = '<div class="net-loading">Loading…</div>';
+  try {
+    const items = await electron.nasBrowse({ shareId, subPath });
+    renderNasItems(fb, shareId, subPath, items);
+  } catch (err) {
+    fb.innerHTML = `<div class="net-empty-hint">Error: ${err && err.message ? err.message : err}</div>`;
+  }
+}
+
+function renderNasItems(fb, shareId, currentPath, items) {
+  fb.innerHTML = '';
+
+  const breadEl = document.createElement('div');
+  breadEl.className = 'net-breadcrumb';
+  renderNetBreadcrumb(breadEl, nasBreadcrumb, (idx) => {
+    nasBreadcrumb = nasBreadcrumb.slice(0, idx + 1);
+    browseNas(shareId, nasBreadcrumb[nasBreadcrumb.length - 1].path);
+  });
+  fb.appendChild(breadEl);
+
+  const fileList = document.createElement('div');
+  fileList.className = 'net-file-list';
+
+  if (!items || !items.length) {
+    fileList.innerHTML = '<div class="net-empty-hint">Empty folder</div>';
+    fb.appendChild(fileList);
+    return;
+  }
+
+  const trackItems = items.filter(it => it.type === 'file');
+
+  items.forEach(it => {
+    const row = document.createElement('div');
+    row.className = 'net-file-item ' + (it.type === 'directory' ? 'is-folder' : 'is-track');
+
+    const icon = document.createElement('span');
+    icon.className = 'material-icons';
+    icon.textContent = it.type === 'directory' ? 'folder' : 'audio_file';
+
+    const meta = document.createElement('div');
+    meta.className = 'net-file-item-meta';
+    const nameEl = document.createElement('div');
+    nameEl.className = 'net-file-item-name';
+    nameEl.textContent = it.name;
+    meta.appendChild(nameEl);
+
+    row.appendChild(icon);
+    row.appendChild(meta);
+
+    if (it.type === 'file') {
+      const actions = document.createElement('div');
+      actions.className = 'net-file-item-actions';
+
+      const playBtn = document.createElement('button');
+      playBtn.title = 'Play';
+      playBtn.innerHTML = '<span class="material-icons">play_circle</span>';
+      playBtn.onclick = (e) => {
+        e.stopPropagation();
+        const track = {
+          id: 'nas:' + it.path,
+          path: it.path,
+          title: it.name.replace(/\.[^.]+$/, ''),
+          artist: '',
+          album: '',
+          duration: 0,
+        };
+        startPlayback(track, trackItems.map(t => ({
+          id: 'nas:' + t.path,
+          path: t.path,
+          title: t.name.replace(/\.[^.]+$/, ''),
+          artist: '',
+          album: '',
+          duration: 0,
+        })), { type: 'nas', key: shareId });
+      };
+
+      const addBtn = document.createElement('button');
+      addBtn.title = 'Add to library';
+      addBtn.innerHTML = '<span class="material-icons">library_add</span>';
+      addBtn.onclick = async (e) => {
+        e.stopPropagation();
+        try {
+          await electron.addFiles([it.path]);
+          NotificationCenter.show({ message: `Added "${it.name}" to library`, type: 'success', autoClose: 2500 });
+        } catch (err) {
+          NotificationCenter.show({ message: String(err && err.message ? err.message : err), type: 'error', autoClose: 3000 });
+        }
+      };
+
+      actions.appendChild(playBtn);
+      actions.appendChild(addBtn);
+      row.appendChild(actions);
+      row.ondblclick = () => playBtn.onclick(new MouseEvent('click'));
+    } else {
+      row.onclick = () => {
+        nasBreadcrumb = [...nasBreadcrumb, { path: it.path, name: it.name }];
+        browseNas(shareId, it.path);
+      };
+    }
+
+    fileList.appendChild(row);
+  });
+
+  fb.appendChild(fileList);
+}
+
+async function loadNasView() {
+  try {
+    nasShares = await electron.nasListShares() || [];
+  } catch {
+    nasShares = [];
+  }
+  renderNasShares(nasShares);
+}
+
+function initNasModal() {
+  const modal = document.getElementById('nas-share-modal');
+  const addBtn = document.getElementById('btn-nas-add');
+  const cancelBtn = document.getElementById('btn-nas-modal-cancel');
+  const saveBtn = document.getElementById('btn-nas-modal-save');
+  const typeSelect = document.getElementById('nas-share-type');
+  const urlGroup = document.getElementById('nas-url-group');
+  const pathGroup = document.getElementById('nas-path-group');
+  const credsGroup = document.getElementById('nas-creds-group');
+
+  if (!modal) return;
+
+  const showModal = () => {
+    document.getElementById('nas-share-name').value = '';
+    document.getElementById('nas-share-url').value = '';
+    document.getElementById('nas-share-path').value = '';
+    document.getElementById('nas-share-user').value = '';
+    document.getElementById('nas-share-pass').value = '';
+    typeSelect.value = 'webdav';
+    urlGroup.style.display = '';
+    pathGroup.style.display = 'none';
+    credsGroup.style.display = '';
+    modal.style.display = 'flex';
+  };
+
+  const hideModal = () => { modal.style.display = 'none'; };
+
+  if (addBtn) addBtn.onclick = showModal;
+  if (cancelBtn) cancelBtn.onclick = hideModal;
+  modal.onclick = (e) => { if (e.target === modal) hideModal(); };
+
+  if (typeSelect) {
+    typeSelect.onchange = () => {
+      const t = typeSelect.value;
+      urlGroup.style.display = t === 'webdav' ? '' : 'none';
+      pathGroup.style.display = t !== 'webdav' ? '' : 'none';
+      credsGroup.style.display = t === 'webdav' ? '' : 'none';
+    };
+  }
+
+  if (saveBtn) {
+    saveBtn.onclick = async () => {
+      const name = document.getElementById('nas-share-name').value.trim();
+      const type = typeSelect.value;
+      const url = document.getElementById('nas-share-url').value.trim();
+      const path = document.getElementById('nas-share-path').value.trim();
+      const user = document.getElementById('nas-share-user').value.trim();
+      const pass = document.getElementById('nas-share-pass').value;
+
+      if (!name) { alert('Name is required'); return; }
+      if (type === 'webdav' && !url) { alert('URL is required for WebDAV'); return; }
+      if (type !== 'webdav' && !path) { alert('Path is required'); return; }
+
+      const share = {
+        id: 'nas-' + Date.now(),
+        name,
+        type,
+        ...(type === 'webdav' ? { url } : { path }),
+        ...(type === 'webdav' && (user || pass) ? { credentials: { username: user, password: pass } } : {}),
+      };
+
+      try {
+        await electron.nasAddShare(share);
+        hideModal();
+        await loadNasView();
+      } catch (err) {
+        alert('Failed to add share: ' + (err && err.message ? err.message : err));
+      }
+    };
   }
 }
 

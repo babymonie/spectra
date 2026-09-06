@@ -56,6 +56,12 @@
             <li id="nav-playlists">
               <span class="material-icons">queue_music</span> Playlists
             </li>
+            <li id="nav-upnp">
+              <span class="material-icons">router</span> UPnP
+            </li>
+            <li id="nav-nas">
+              <span class="material-icons">storage</span> NAS
+            </li>
             <li id="nav-settings">
               <span class="material-icons">settings</span> Settings
             </li>
@@ -155,6 +161,53 @@
             </div>
           </div>
           <div id="playlists-container"></div>
+        </div>
+
+        <!-- UPnP / DLNA Browser -->
+        <div id="view-upnp" class="view" style="display: none">
+          <div class="net-browser-header">
+            <h2>UPnP / DLNA</h2>
+            <div style="display:flex;gap:8px;align-items:center">
+              <button id="btn-upnp-scan" class="btn-secondary">
+                <span class="material-icons" style="vertical-align:middle;font-size:18px;margin-right:4px">refresh</span>
+                Scan
+              </button>
+              <span id="upnp-status" class="net-status-text"></span>
+            </div>
+          </div>
+          <div class="net-browser-layout">
+            <div class="net-sidebar">
+              <div class="net-sidebar-label">Servers</div>
+              <div id="upnp-servers-list" class="net-server-list">
+                <div class="net-empty-hint">Click Scan to discover servers</div>
+              </div>
+            </div>
+            <div class="net-filebrowser" id="upnp-filebrowser">
+              <div class="net-empty-hint">Select a server to browse</div>
+            </div>
+          </div>
+        </div>
+
+        <!-- NAS / Network Storage Browser -->
+        <div id="view-nas" class="view" style="display: none">
+          <div class="net-browser-header">
+            <h2>Network Storage</h2>
+            <button id="btn-nas-add" class="btn-secondary">
+              <span class="material-icons" style="vertical-align:middle;font-size:18px;margin-right:4px">add</span>
+              Add Share
+            </button>
+          </div>
+          <div class="net-browser-layout">
+            <div class="net-sidebar">
+              <div class="net-sidebar-label">Shares</div>
+              <div id="nas-shares-list" class="net-server-list">
+                <div class="net-empty-hint">No shares configured</div>
+              </div>
+            </div>
+            <div class="net-filebrowser" id="nas-filebrowser">
+              <div class="net-empty-hint">Select a share to browse</div>
+            </div>
+          </div>
         </div>
 
         <div id="view-settings" class="view" style="display: none">
@@ -684,6 +737,47 @@
               <button id="fs-lyrics-cancel" class="btn-text">Cancel</button>
             </div>
           </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- NAS Add/Edit Share Modal -->
+    <div id="nas-share-modal" class="modal">
+      <div class="modal-content">
+        <h3 id="nas-modal-title">Add Share</h3>
+        <div class="form-group">
+          <label>Name</label>
+          <input type="text" id="nas-share-name" placeholder="My NAS" />
+        </div>
+        <div class="form-group">
+          <label>Type</label>
+          <select id="nas-share-type">
+            <option value="webdav">WebDAV (Synology, QNAP, etc.)</option>
+            <option value="local">Local / Mounted Path</option>
+            <option value="smb">SMB / UNC Path</option>
+          </select>
+        </div>
+        <div class="form-group" id="nas-url-group">
+          <label>URL</label>
+          <input type="text" id="nas-share-url" placeholder="http://192.168.1.x:5005" />
+        </div>
+        <div class="form-group" id="nas-path-group" style="display:none">
+          <label>Path</label>
+          <input type="text" id="nas-share-path" placeholder="\\server\share  or  /mnt/nas" />
+        </div>
+        <div id="nas-creds-group">
+          <div class="form-group">
+            <label>Username <span style="opacity:.6">(optional)</span></label>
+            <input type="text" id="nas-share-user" autocomplete="off" />
+          </div>
+          <div class="form-group">
+            <label>Password <span style="opacity:.6">(optional)</span></label>
+            <input type="password" id="nas-share-pass" autocomplete="off" />
+          </div>
+        </div>
+        <div class="modal-actions">
+          <button id="btn-nas-modal-cancel" class="btn-text">Cancel</button>
+          <button id="btn-nas-modal-save" class="btn-secondary">Save</button>
         </div>
       </div>
     </div>

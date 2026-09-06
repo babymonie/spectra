@@ -95,5 +95,14 @@ contextBridge.exposeInMainWorld('electron', {
   relinkTrack: (info) => ipcRenderer.invoke('track:relink', info),
   downloadTrack: (opts) => ipcRenderer.invoke('track:download', opts),
   on: (channel, callback) => ipcRenderer.on(channel, (event, ...args) => callback(...args)),
-
+  // UPnP/DLNA
+  upnpScan: () => ipcRenderer.invoke('upnp:scan'),
+  upnpBrowse: (params) => ipcRenderer.invoke('upnp:browse', params),
+  upnpGetServers: () => ipcRenderer.invoke('upnp:get-servers'),
+  // NAS / Network Storage
+  nasListShares: () => ipcRenderer.invoke('nas:list-shares'),
+  nasBrowse: (params) => ipcRenderer.invoke('nas:browse', params),
+  nasAddShare: (share) => ipcRenderer.invoke('nas:add-share', share),
+  nasRemoveShare: (params) => ipcRenderer.invoke('nas:remove-share', params),
+  nasTestShare: (params) => ipcRenderer.invoke('nas:test-share', params),
 });
