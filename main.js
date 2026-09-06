@@ -2562,6 +2562,7 @@ async function loadPlugins() {
           },
           registerRemoteHandler: (channel, handler) => {
             handlers[channel] = handler;
+            ipcMain.handle(channel, (event, ...args) => handler(...args));
           },
           broadcast: (channel, ...args) => {
             try {

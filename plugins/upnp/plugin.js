@@ -204,6 +204,8 @@ class UPnPScanner {
       });
 
       sock.bind(0, () => {
+        try { sock.setMulticastTTL(4); } catch (_) {}
+        try { sock.addMembership(SSDP_ADDR); } catch (_) {}
         for (const searchTarget of MEDIA_SERVER_ST) {
           const msg = Buffer.from(
             `M-SEARCH * HTTP/1.1\r\n` +
@@ -212,7 +214,9 @@ class UPnPScanner {
             `MX: ${this._mx}\r\n` +
             `ST: ${searchTarget}\r\n\r\n`
           );
-          sock.send(msg, SSDP_PORT, SSDP_ADDR);
+          sock.send(msg, SSDP_PORT, SSDP_ADDR, (err) => {
+            if (err) console.error('[upnp] SSDP send error:', err);
+          });
         }
       });
     });
@@ -255,10 +259,10 @@ export function activate(context) {
 
   // Auto-scan on startup
   scanner.scan().then(async (servers) => {
+    console.log(`[upnp] Scan complete. Found ${servers.length} server(s).`);
     await Promise.allSettled(servers.map(s => s.fetchDescription()));
     if (servers.length) {
-      console.log(`[upnp] Found ${servers.length} UPnP/DLNA server(s):`,
-        servers.map(s => s.friendlyName || s.usn));
+      console.log(`[upnp] UPnP/DLNA server(s):`, servers.map(s => s.friendlyName || s.usn));
       context.broadcast('upnp:servers-found', {
         servers: servers.map(s => ({
           usn: s.usn,
@@ -267,7 +271,7 @@ export function activate(context) {
         })),
       });
     }
-  }).catch(() => {});
+  }).catch((err) => console.error('[upnp] Auto-scan failed:', err));
 
   // Periodic rescan
   const scanIntervalMs = Math.max(10000, context.settings?.scanIntervalMs ?? 30000);
