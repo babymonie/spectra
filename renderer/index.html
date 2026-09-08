@@ -741,6 +741,20 @@
       </div>
     </div>
 
+    <!-- Playlist Picker Modal (for network sources) -->
+    <div id="playlist-picker-modal" class="modal">
+      <div class="modal-content">
+        <h3>Add to Playlist</h3>
+        <div id="playlist-picker-list" style="max-height:260px;overflow-y:auto;margin-bottom:8px"></div>
+        <button id="btn-playlist-picker-new" class="btn-secondary" style="width:100%">
+          <span class="material-icons" style="vertical-align:middle;font-size:16px;margin-right:4px">add</span>New Playlist…
+        </button>
+        <div class="modal-actions">
+          <button id="btn-playlist-picker-cancel" class="btn-text">Cancel</button>
+        </div>
+      </div>
+    </div>
+
     <!-- NAS Add/Edit Share Modal -->
     <div id="nas-share-modal" class="modal">
       <div class="modal-content">
@@ -753,8 +767,9 @@
           <label>Type</label>
           <select id="nas-share-type">
             <option value="webdav">WebDAV (Synology, QNAP, etc.)</option>
-            <option value="local">Local / Mounted Path</option>
-            <option value="smb">SMB / UNC Path</option>
+            <option value="smb">SMB / Windows Share</option>
+            <option value="nfs">NFS / Mounted Path</option>
+            <option value="local">Local / Drive Path</option>
           </select>
         </div>
         <div class="form-group" id="nas-url-group">

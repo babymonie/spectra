@@ -2401,6 +2401,13 @@
   font-variant-numeric: tabular-nums;
 }
 
+.net-folder-toolbar {
+  display: flex;
+  gap: 8px;
+  padding: 8px 12px;
+  border-bottom: 1px solid var(--border-subtle, rgba(255,255,255,.06));
+}
+
 .net-empty-hint {
   color: var(--text-secondary);
   font-size: 13px;

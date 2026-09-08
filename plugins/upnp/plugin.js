@@ -191,15 +191,20 @@ class UPnPScanner {
         const text = msg.toString('utf8');
         if (!/HTTP\/1\.[01]\s+200/i.test(text) && !/NOTIFY/i.test(text)) return;
         const location = text.match(/LOCATION:\s*(\S+)/i)?.[1];
-        const usn = text.match(/USN:\s*(\S+)/i)?.[1] || location;
+        const rawUsn = text.match(/USN:\s*(\S+)/i)?.[1] || location;
+        // Strip service suffix so the same physical device doesn't appear twice
+        // e.g. "uuid:abc::urn:schemas-upnp-org:service:ContentDirectory:1" → "uuid:abc"
+        const usn = rawUsn.split('::')[0] || rawUsn;
         const st = text.match(/\bST:\s*(\S+)/i)?.[1] || '';
         const nt = text.match(/\bNT:\s*(\S+)/i)?.[1] || '';
         const isMediaServer = [st, nt].some(v =>
           v.includes('MediaServer') || v.includes('ContentDirectory')
         );
-        if (location && isMediaServer && !found.has(usn)) {
-          found.set(usn, new UPnPServer(location, usn));
-          this._servers.set(usn, found.get(usn));
+        // Deduplicate by location URL — a device responds once per M-SEARCH target
+        if (location && isMediaServer && !found.has(location)) {
+          const server = new UPnPServer(location, usn);
+          found.set(location, server);
+          this._servers.set(location, server);
         }
       });
 

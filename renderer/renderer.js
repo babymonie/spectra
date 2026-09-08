@@ -67,6 +67,7 @@ let upnpBreadcrumb = [];
 let nasShares = [];
 let nasSelectedShareId = null;
 let nasBreadcrumb = [];
+let showNasModal = null; // set by initNasModal, called from renderNasShares
 
 // Other DOM elements assigned in init
 let btnImportFile;
@@ -4736,6 +4737,93 @@ function renderNetBreadcrumb(container, crumbs, onNavigate) {
   });
 }
 
+// ─── Network → Playlist / Library helpers ────────────────────────────────────
+
+function showPlaylistPicker() {
+  return new Promise(async (resolve) => {
+    const modal = document.getElementById('playlist-picker-modal');
+    const list = document.getElementById('playlist-picker-list');
+    const cancelBtn = document.getElementById('btn-playlist-picker-cancel');
+    const newBtn = document.getElementById('btn-playlist-picker-new');
+    if (!modal) { resolve(null); return; }
+
+    let playlists = [];
+    try { playlists = await electron.getPlaylists(); } catch {}
+
+    list.innerHTML = '';
+    if (!playlists.length) {
+      list.innerHTML = '<div style="opacity:.6;font-size:13px;padding:8px 0">No playlists yet — create one below</div>';
+    } else {
+      playlists.forEach(pl => {
+        const btn = document.createElement('button');
+        btn.className = 'btn-text';
+        btn.style.cssText = 'display:block;width:100%;text-align:left;padding:8px 4px;font-size:14px';
+        btn.textContent = pl.name;
+        btn.onclick = () => { close(); resolve(pl); };
+        list.appendChild(btn);
+      });
+    }
+
+    const close = () => {
+      modal.style.display = 'none';
+      if (cancelBtn) cancelBtn.onclick = null;
+      if (newBtn) newBtn.onclick = null;
+      modal.onclick = null;
+    };
+
+    if (cancelBtn) cancelBtn.onclick = () => { close(); resolve(null); };
+    if (newBtn) {
+      newBtn.onclick = async () => {
+        const name = prompt('New playlist name:');
+        if (!name || !name.trim()) return;
+        try {
+          const result = await electron.createPlaylist(name.trim());
+          close();
+          resolve({ id: result.lastInsertRowid, name: name.trim() });
+        } catch (err) {
+          alert('Failed to create playlist: ' + (err?.message || err));
+        }
+      };
+    }
+    modal.onclick = (e) => { if (e.target === modal) { close(); resolve(null); } };
+    modal.style.display = 'flex';
+  });
+}
+
+async function addNetworkTrackToPlaylist(trackInfo) {
+  const pl = await showPlaylistPicker();
+  if (!pl) return;
+  try {
+    const result = await electron.addRemote(trackInfo);
+    if (!result || !result.success) {
+      NotificationCenter.show({ message: 'Failed to register track', type: 'error', autoClose: 3000 });
+      return;
+    }
+    await electron.addTrackToPlaylist(pl.id, result.id);
+    NotificationCenter.show({ message: `Added to "${pl.name}"`, type: 'success', autoClose: 2500 });
+  } catch (err) {
+    NotificationCenter.show({ message: String(err?.message || err), type: 'error', autoClose: 3000 });
+  }
+}
+
+async function addNetworkTracksToPlaylist(trackInfoList) {
+  const pl = await showPlaylistPicker();
+  if (!pl) return;
+  let added = 0;
+  for (const trackInfo of trackInfoList) {
+    try {
+      const result = await electron.addRemote(trackInfo);
+      if (result?.success) {
+        await electron.addTrackToPlaylist(pl.id, result.id);
+        added++;
+      }
+    } catch {}
+  }
+  NotificationCenter.show({ message: `${added} track${added !== 1 ? 's' : ''} added to "${pl.name}"`, type: 'success', autoClose: 3000 });
+}
+
+// ─── UPnP / DLNA Browser ─────────────────────────────────────────────────────
+
 function renderUpnpServers(servers) {
   const list = document.getElementById('upnp-servers-list');
   if (!list) return;
@@ -4837,29 +4925,47 @@ function renderUpnpItems(fb, usn, items) {
 
       const actions = document.createElement('div');
       actions.className = 'net-file-item-actions';
+
       const playBtn = document.createElement('button');
       playBtn.title = 'Play';
       playBtn.innerHTML = '<span class="material-icons">play_circle</span>';
+      const makeUpnpTrack = (t) => ({
+        id: 'upnp:' + t.id, path: t.url,
+        title: t.title || '', artist: t.artist || '', album: t.album || '', duration: 0,
+      });
       playBtn.onclick = (e) => {
         e.stopPropagation();
-        const track = {
-          id: 'upnp:' + it.id,
-          path: it.url,
-          title: it.title || '',
-          artist: it.artist || '',
-          album: it.album || '',
-          duration: 0,
-        };
-        startPlayback(track, trackItems.map((t, idx) => ({
-          id: 'upnp:' + t.id,
-          path: t.url,
-          title: t.title || '',
-          artist: t.artist || '',
-          album: t.album || '',
-          duration: 0,
-        })), { type: 'upnp', key: usn });
+        startPlayback(makeUpnpTrack(it), trackItems.map(makeUpnpTrack), { type: 'upnp', key: usn });
       };
+
+      const libBtn = document.createElement('button');
+      libBtn.title = 'Add to library';
+      libBtn.innerHTML = '<span class="material-icons">library_add</span>';
+      libBtn.onclick = async (e) => {
+        e.stopPropagation();
+        try {
+          const result = await electron.addRemote({ url: it.url, title: it.title || '', artist: it.artist || '', album: it.album || '' });
+          if (result?.success) {
+            NotificationCenter.show({ message: `Added "${it.title || it.url}" to library`, type: 'success', autoClose: 2500 });
+          } else {
+            NotificationCenter.show({ message: 'Failed to add to library', type: 'error', autoClose: 3000 });
+          }
+        } catch (err) {
+          NotificationCenter.show({ message: String(err?.message || err), type: 'error', autoClose: 3000 });
+        }
+      };
+
+      const plBtn = document.createElement('button');
+      plBtn.title = 'Add to playlist';
+      plBtn.innerHTML = '<span class="material-icons">playlist_add</span>';
+      plBtn.onclick = (e) => {
+        e.stopPropagation();
+        addNetworkTrackToPlaylist({ url: it.url, title: it.title || '', artist: it.artist || '', album: it.album || '' });
+      };
+
       actions.appendChild(playBtn);
+      actions.appendChild(libBtn);
+      actions.appendChild(plBtn);
       row.appendChild(actions);
 
       row.ondblclick = () => playBtn.onclick(new MouseEvent('click'));
@@ -4872,6 +4978,22 @@ function renderUpnpItems(fb, usn, items) {
 
     fileList.appendChild(row);
   });
+
+  // Toolbar: add all tracks in this folder to playlist
+  if (trackItems.length > 0) {
+    const toolbar = document.createElement('div');
+    toolbar.className = 'net-folder-toolbar';
+    const addAllBtn = document.createElement('button');
+    addAllBtn.className = 'btn-secondary';
+    addAllBtn.innerHTML = '<span class="material-icons" style="font-size:16px;vertical-align:middle;margin-right:4px">playlist_add</span>Add all to playlist';
+    addAllBtn.onclick = () => {
+      addNetworkTracksToPlaylist(trackItems.map(t => ({
+        url: t.url, title: t.title || '', artist: t.artist || '', album: t.album || '',
+      })));
+    };
+    toolbar.appendChild(addAllBtn);
+    fb.appendChild(toolbar);
+  }
 
   fb.appendChild(fileList);
 }
@@ -4947,6 +5069,14 @@ function renderNasShares(shares) {
     const actions = document.createElement('div');
     actions.className = 'net-server-item-actions';
 
+    const editBtn = document.createElement('button');
+    editBtn.title = 'Edit share';
+    editBtn.innerHTML = '<span class="material-icons" style="font-size:16px">edit</span>';
+    editBtn.onclick = (e) => {
+      e.stopPropagation();
+      if (showNasModal) showNasModal(s);
+    };
+
     const testBtn = document.createElement('button');
     testBtn.title = 'Test connection';
     testBtn.innerHTML = '<span class="material-icons" style="font-size:16px">wifi_tethering</span>';
@@ -4981,6 +5111,7 @@ function renderNasShares(shares) {
       }
     };
 
+    actions.appendChild(editBtn);
     actions.appendChild(testBtn);
     actions.appendChild(removeBtn);
 
@@ -5079,21 +5210,39 @@ function renderNasItems(fb, shareId, currentPath, items) {
         })), { type: 'nas', key: shareId });
       };
 
-      const addBtn = document.createElement('button');
-      addBtn.title = 'Add to library';
-      addBtn.innerHTML = '<span class="material-icons">library_add</span>';
-      addBtn.onclick = async (e) => {
+      const share = nasShares.find(s => s.id === shareId);
+      const isWebDav = share?.type === 'webdav';
+      const trackTitle = it.name.replace(/\.[^.]+$/, '');
+
+      const addLibBtn = document.createElement('button');
+      addLibBtn.title = 'Add to library';
+      addLibBtn.innerHTML = '<span class="material-icons">library_add</span>';
+      addLibBtn.onclick = async (e) => {
         e.stopPropagation();
         try {
-          await electron.addFiles([it.path]);
+          if (isWebDav) {
+            const result = await electron.addRemote({ url: it.path, title: trackTitle });
+            if (!result?.success) throw new Error('Failed');
+          } else {
+            await electron.addFiles([it.path]);
+          }
           NotificationCenter.show({ message: `Added "${it.name}" to library`, type: 'success', autoClose: 2500 });
         } catch (err) {
-          NotificationCenter.show({ message: String(err && err.message ? err.message : err), type: 'error', autoClose: 3000 });
+          NotificationCenter.show({ message: String(err?.message || err), type: 'error', autoClose: 3000 });
         }
       };
 
+      const plBtn = document.createElement('button');
+      plBtn.title = 'Add to playlist';
+      plBtn.innerHTML = '<span class="material-icons">playlist_add</span>';
+      plBtn.onclick = (e) => {
+        e.stopPropagation();
+        addNetworkTrackToPlaylist({ url: it.path, title: trackTitle });
+      };
+
       actions.appendChild(playBtn);
-      actions.appendChild(addBtn);
+      actions.appendChild(addLibBtn);
+      actions.appendChild(plBtn);
       row.appendChild(actions);
       row.ondblclick = () => playBtn.onclick(new MouseEvent('click'));
     } else {
@@ -5105,6 +5254,22 @@ function renderNasItems(fb, shareId, currentPath, items) {
 
     fileList.appendChild(row);
   });
+
+  // Toolbar: add all tracks in this folder to playlist
+  if (trackItems.length > 0) {
+    const toolbar = document.createElement('div');
+    toolbar.className = 'net-folder-toolbar';
+    const addAllBtn = document.createElement('button');
+    addAllBtn.className = 'btn-secondary';
+    addAllBtn.innerHTML = '<span class="material-icons" style="font-size:16px;vertical-align:middle;margin-right:4px">playlist_add</span>Add all to playlist';
+    addAllBtn.onclick = () => {
+      addNetworkTracksToPlaylist(trackItems.map(t => ({
+        url: t.path, title: t.name.replace(/\.[^.]+$/, ''),
+      })));
+    };
+    toolbar.appendChild(addAllBtn);
+    fb.appendChild(toolbar);
+  }
 
   fb.appendChild(fileList);
 }
@@ -5123,6 +5288,7 @@ function initNasModal() {
   const addBtn = document.getElementById('btn-nas-add');
   const cancelBtn = document.getElementById('btn-nas-modal-cancel');
   const saveBtn = document.getElementById('btn-nas-modal-save');
+  const modalTitle = document.getElementById('nas-modal-title');
   const typeSelect = document.getElementById('nas-share-type');
   const urlGroup = document.getElementById('nas-url-group');
   const pathGroup = document.getElementById('nas-path-group');
@@ -5130,53 +5296,56 @@ function initNasModal() {
 
   if (!modal) return;
 
-  const showModal = () => {
-    document.getElementById('nas-share-name').value = '';
-    document.getElementById('nas-share-url').value = '';
-    document.getElementById('nas-share-path').value = '';
-    document.getElementById('nas-share-user').value = '';
-    document.getElementById('nas-share-pass').value = '';
-    typeSelect.value = 'webdav';
-    urlGroup.style.display = '';
-    pathGroup.style.display = 'none';
-    credsGroup.style.display = '';
+  let editShareId = null;
+
+  const updateTypeVisibility = () => {
+    const t = typeSelect.value;
+    urlGroup.style.display = t === 'webdav' ? '' : 'none';
+    pathGroup.style.display = t !== 'webdav' ? '' : 'none';
+    credsGroup.style.display = ''; // credentials available for all share types
+  };
+
+  // Exposed so renderNasShares can open modal in edit mode
+  showNasModal = (existingShare = null) => {
+    editShareId = existingShare?.id || null;
+    if (modalTitle) modalTitle.textContent = editShareId ? 'Edit Share' : 'Add Share';
+    document.getElementById('nas-share-name').value = existingShare?.name || '';
+    document.getElementById('nas-share-url').value = existingShare?.url || '';
+    document.getElementById('nas-share-path').value = existingShare?.path || '';
+    document.getElementById('nas-share-user').value = existingShare?.credentials?.username || '';
+    document.getElementById('nas-share-pass').value = existingShare?.credentials?.password || '';
+    typeSelect.value = existingShare?.type || 'webdav';
+    updateTypeVisibility();
     modal.style.display = 'flex';
   };
 
-  const hideModal = () => { modal.style.display = 'none'; };
+  const hideModal = () => { modal.style.display = 'none'; editShareId = null; };
 
-  if (addBtn) addBtn.onclick = showModal;
+  if (addBtn) addBtn.onclick = () => showNasModal(null);
   if (cancelBtn) cancelBtn.onclick = hideModal;
   modal.onclick = (e) => { if (e.target === modal) hideModal(); };
 
-  if (typeSelect) {
-    typeSelect.onchange = () => {
-      const t = typeSelect.value;
-      urlGroup.style.display = t === 'webdav' ? '' : 'none';
-      pathGroup.style.display = t !== 'webdav' ? '' : 'none';
-      credsGroup.style.display = t === 'webdav' ? '' : 'none';
-    };
-  }
+  if (typeSelect) typeSelect.onchange = updateTypeVisibility;
 
   if (saveBtn) {
     saveBtn.onclick = async () => {
       const name = document.getElementById('nas-share-name').value.trim();
       const type = typeSelect.value;
       const url = document.getElementById('nas-share-url').value.trim();
-      const path = document.getElementById('nas-share-path').value.trim();
+      const sharePath = document.getElementById('nas-share-path').value.trim();
       const user = document.getElementById('nas-share-user').value.trim();
       const pass = document.getElementById('nas-share-pass').value;
 
       if (!name) { alert('Name is required'); return; }
       if (type === 'webdav' && !url) { alert('URL is required for WebDAV'); return; }
-      if (type !== 'webdav' && !path) { alert('Path is required'); return; }
+      if (type !== 'webdav' && !sharePath) { alert('Path is required'); return; }
 
       const share = {
-        id: 'nas-' + Date.now(),
+        id: editShareId || ('nas-' + Date.now()),
         name,
         type,
-        ...(type === 'webdav' ? { url } : { path }),
-        ...(type === 'webdav' && (user || pass) ? { credentials: { username: user, password: pass } } : {}),
+        ...(type === 'webdav' ? { url } : { path: sharePath }),
+        ...((user || pass) ? { credentials: { username: user, password: pass } } : {}),
       };
 
       try {
@@ -5184,7 +5353,7 @@ function initNasModal() {
         hideModal();
         await loadNasView();
       } catch (err) {
-        alert('Failed to add share: ' + (err && err.message ? err.message : err));
+        alert('Failed to save share: ' + (err && err.message ? err.message : err));
       }
     };
   }

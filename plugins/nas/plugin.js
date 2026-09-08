@@ -14,6 +14,9 @@ import http from 'node:http';
 import https from 'node:https';
 import fs from 'node:fs';
 import path from 'node:path';
+import { execFile } from 'node:child_process';
+import { promisify } from 'node:util';
+const execFileAsync = promisify(execFile);
 
 const AUDIO_EXTS = new Set([
   '.flac', '.wav', '.mp3', '.aac', '.ogg', '.m4a', '.alac',
@@ -164,7 +167,12 @@ export function activate(context) {
     }
 
     if (share.type === 'local' || share.type === 'smb' || share.type === 'nfs') {
-      // SMB: use UNC path like \\server\share (Windows) or mounted path
+      if (share.type === 'smb' && share.credentials?.username && process.platform === 'win32') {
+        try {
+          const { username, password } = share.credentials;
+          await execFileAsync('net', ['use', share.path, password || '', `/user:${username}`], { timeout: 8000 });
+        } catch (_) { /* ignore — share may already be connected */ }
+      }
       const root = share.path || '';
       const fullPath = subPath ? path.join(root, subPath) : root;
       return localList(fullPath);
@@ -173,9 +181,18 @@ export function activate(context) {
     throw new Error(`Unknown NAS share type: ${share.type}`);
   });
 
-  // List configured shares
+  // List configured shares (full data except raw password — send username only for display)
   context.registerRemoteHandler('nas:list-shares', () => {
-    return shares.map(s => ({ id: s.id, name: s.name, type: s.type }));
+    return shares.map(s => ({
+      id: s.id,
+      name: s.name,
+      type: s.type,
+      url: s.url || null,
+      path: s.path || null,
+      credentials: s.credentials
+        ? { username: s.credentials.username || '', password: s.credentials.password || '' }
+        : null,
+    }));
   });
 
   // Add a share
@@ -207,6 +224,12 @@ export function activate(context) {
         return { ok: true, message: 'WebDAV connection successful' };
       }
       if (share.type === 'local' || share.type === 'smb' || share.type === 'nfs') {
+        if (share.type === 'smb' && share.credentials?.username && process.platform === 'win32') {
+          try {
+            const { username, password } = share.credentials;
+            await execFileAsync('net', ['use', share.path, password || '', `/user:${username}`], { timeout: 8000 });
+          } catch (_) { /* ignore — may already be connected */ }
+        }
         const stat = fs.statSync(share.path);
         return { ok: stat.isDirectory(), message: stat.isDirectory() ? 'Path accessible' : 'Path is not a directory' };
       }
