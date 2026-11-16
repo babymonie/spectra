@@ -290,6 +290,22 @@ globalThis.electron = {
   objectStorageUpload: (localPath, key) => invoke('object-storage:upload', localPath, key),
   objectStorageGetUrl: (key) => invoke('object-storage:get-url', key),
   objectStorageList: (prefix) => invoke('object-storage:list', prefix),
+  addRemoteMany: (list) => invoke('library:add-remote-many', list),
+  // UPnP/DLNA
+  upnpScan: () => invoke('upnp:scan'),
+  upnpBrowse: (params) => invoke('upnp:browse', params),
+  upnpGetServers: () => invoke('upnp:get-servers'),
+  upnpSearch: (params) => invoke('upnp:search', params),
+  upnpListRecursive: (params) => invoke('upnp:list-recursive', params),
+  upnpAddServer: (params) => invoke('upnp:add-server', params),
+  upnpRemoveServer: (params) => invoke('upnp:remove-server', params),
+  // NAS / Network Storage
+  nasListShares: () => invoke('nas:list-shares'),
+  nasBrowse: (params) => invoke('nas:browse', params),
+  nasListRecursive: (params) => invoke('nas:list-recursive', params),
+  nasAddShare: (share) => invoke('nas:add-share', share),
+  nasRemoveShare: (params) => invoke('nas:remove-share', params),
+  nasTestShare: (params) => invoke('nas:test-share', params),
   off: (channel) => {
     removeAllListenersForChannel(channel);
   },

@@ -28,6 +28,7 @@ export class FFmpegSupervisor extends EventEmitter {
     this._bytesPerSecond = 0;
     this._startTime = 0;
     this._getArgs = null;
+    this._paused = false;
   }
 
   get currentProc() { return this._proc; }
@@ -42,6 +43,7 @@ export class FFmpegSupervisor extends EventEmitter {
    */
   start(args, { bytesPerSecond = 0, startTime = 0, getArgs } = {}) {
     this._killed = false;
+    this._paused = false;
     this._bytesOutput = 0;
     this._bytesPerSecond = bytesPerSecond;
     this._startTime = startTime;
@@ -54,6 +56,7 @@ export class FFmpegSupervisor extends EventEmitter {
     if (this._killed) return;
     const proc = spawn(this._ffmpegPath, args);
     this._proc = proc;
+    this.spawnCount = (this.spawnCount || 0) + 1;
     this._resetWatchdog();
 
     proc.stdout?.on('data', (chunk) => {
@@ -105,7 +108,9 @@ export class FFmpegSupervisor extends EventEmitter {
 
   _resetWatchdog() {
     this._clearWatchdog();
-    if (this._watchdogMs <= 0) return;
+    // No watchdog while paused: stdout is deliberately not flowing, so silence
+    // from FFmpeg is expected and must not trigger a kill + restart.
+    if (this._watchdogMs <= 0 || this._paused) return;
     this._watchdogTimer = setTimeout(() => {
       if (this._killed || !this._proc) return;
       console.warn(`[FFmpegSupervisor] watchdog: no output for ${this._watchdogMs}ms, restarting`);
@@ -127,6 +132,15 @@ export class FFmpegSupervisor extends EventEmitter {
     }
   }
 
-  pauseOutput() { this._proc?.stdout?.pause(); }
-  resumeOutput() { this._proc?.stdout?.resume(); }
+  pauseOutput() {
+    this._paused = true;
+    this._clearWatchdog();
+    this._proc?.stdout?.pause();
+  }
+
+  resumeOutput() {
+    this._paused = false;
+    this._proc?.stdout?.resume();
+    if (this._proc && !this._killed) this._resetWatchdog();
+  }
 }

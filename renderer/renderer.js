@@ -106,6 +106,29 @@ let searchInputEl;
 let lastAutoAdvancedTrackId = null;
 const AUTO_ADVANCE_EPS = 0.9; // seconds before end to trigger advance
 let lastKnownPosition = 0; // seconds, updated from player state/time polls
+let lastStatusDuration = 0; // duration reported by the engine (network tracks have none in the DB)
+let engineActive = false; // engine has a track loaded (playing or paused)
+let stopAfterCurrent = false;
+let pendingResumePosition = null; // restored "last played" position, used by the first Play
+let playInstance = 0; // bumped on every playTrack(); guards against double auto-advance
+let advancedInstance = -1;
+let endedPolls = 0;
+let playRequestsInFlight = 0;
+let libraryRenderToken = 0;
+let librarySort = { key: null, dir: 1 };
+let playHistory = [];
+let shufflePlayed = new Set();
+let forcedNext = []; // "Play Next" items, honoured before list order / shuffle
+
+const trackKey = (t) => (t && t.id != null ? `id:${t.id}` : `path:${t?.path || ''}`);
+const tracksMatch = (a, b) => !!a && !!b && (
+  (a.id != null && b.id != null && String(a.id) === String(b.id)) ||
+  (!!a.path && !!b.path && a.path === b.path)
+);
+const effectiveDuration = () => {
+  const own = Number(currentTrack?.duration);
+  return own > 0 ? own : (lastStatusDuration || 0);
+};
 
 // Helper function to update repeat button visual state
 
@@ -484,35 +507,63 @@ function initThemesSettingsUI() {
 // Call this when your Settings page is mounted/created
 initThemesSettingsUI();
 
+// Query syntax (foobar-style, all terms must match):
+//   word            matches title / artist / album / album artist / file name
+//   "exact phrase"  quoted phrases stay together
+//   -word           excludes
+//   field:value     title: artist: album: albumartist: genre: year: format: codec: path:
+// Matching ignores case and accents ("beyonce" finds "Beyoncé").
+const SEARCH_FIELDS = {
+  title: ['title'],
+  artist: ['artist', 'album_artist'],
+  album: ['album'],
+  albumartist: ['album_artist'],
+  genre: ['genre'],
+  year: ['year'],
+  format: ['format', 'codec'],
+  codec: ['codec', 'format'],
+  path: ['path'],
+  file: ['path'],
+};
+
 const tokenizeQuery = (query) => {
   if (!query) return [];
-  return String(query)
-    .split(/\s+/)
-    .filter(Boolean)
-    .map((tok) => {
-      let type = 'include';
-      let text = tok;
-      if (tok.startsWith('-')) { type = 'exclude'; text = tok.slice(1); }
-      else if (tok.startsWith('+')) { type = 'include'; text = tok.slice(1); }
-      const fieldMatch = text.match(/^(title|artist|album):(.+)$/);
-      if (fieldMatch) {
-        return { type, field: fieldMatch[1], text: fieldMatch[2] };
-      }
-      return { type, field: null, text };
-    });
+  const tokens = [];
+  const re = /([+-]?)(?:([a-z_]+):)?(?:"([^"]*)"?|(\S+))/gi;
+  let m;
+  while ((m = re.exec(String(query))) !== null) {
+    let field = m[2] ? m[2].toLowerCase() : null;
+    let text = m[3] !== undefined ? m[3] : (m[4] || '');
+    if (field && !SEARCH_FIELDS[field]) {
+      // Not a field we know ("re:stacks"): treat the whole thing as text.
+      text = `${m[2]}:${text}`;
+      field = null;
+    }
+    text = normalizeForCompare(text);
+    if (!text) continue;
+    tokens.push({ type: m[1] === '-' ? 'exclude' : 'include', field, text });
+  }
+  return tokens;
+};
+
+const trackSearchCache = new WeakMap();
+const trackHaystack = (track) => {
+  let hay = trackSearchCache.get(track);
+  if (hay === undefined) {
+    const fileName = track?.path ? String(track.path).split(/[/\\]/).pop() : '';
+    hay = normalizeForCompare([track?.title, track?.artist, track?.album, track?.album_artist, fileName].filter(Boolean).join(' \u0001 '));
+    trackSearchCache.set(track, hay);
+  }
+  return hay;
 };
 
 const matchesTrackToken = (track, token) => {
-  const needle = (token.text || '').toLowerCase();
+  const needle = token.text || '';
   if (!needle) return true;
   if (token.field) {
-    const val = ((track?.[token.field] || '') + '').toLowerCase();
-    return val.includes(needle);
+    return SEARCH_FIELDS[token.field].some((key) => normalizeForCompare(track?.[key] ?? '').includes(needle));
   }
-  const title = (track?.title || '').toLowerCase();
-  const artist = (track?.artist || '').toLowerCase();
-  const album = (track?.album || '').toLowerCase();
-  return title.includes(needle) || artist.includes(needle) || album.includes(needle);
+  return trackHaystack(track).includes(needle);
 };
 
 const filterTracksByQuery = (base, query) => {
@@ -528,6 +579,17 @@ const filterTracksByQuery = (base, query) => {
       }
     }
     return true;
+  });
+};
+
+// Column sorting (click a column header). No sort = the list's natural order.
+const sortTracks = (list) => {
+  if (!librarySort.key || !Array.isArray(list)) return list;
+  const { key, dir } = librarySort;
+  const text = (t) => (key === 'artist' ? getDisplayArtistName(t) : String(t?.[key] ?? ''));
+  return [...list].sort((a, b) => {
+    if (key === 'duration') return ((Number(a?.duration) || 0) - (Number(b?.duration) || 0)) * dir;
+    return text(a).localeCompare(text(b), undefined, { numeric: true, sensitivity: 'base' }) * dir;
   });
 };
 
@@ -556,7 +618,7 @@ const computeLibraryBase = () => {
 
 const applyLibrarySearch = (query) => {
   const base = computeLibraryBase();
-  tracks = filterTracksByQuery(base, query);
+  tracks = sortTracks(filterTracksByQuery(base, query));
   renderLibrary();
 };
 
@@ -641,25 +703,24 @@ function updateSearchPlaceholder() {
 }
 
 const albumMatchesQuery = (album, query) => {
-  const needle = (query || '').toLowerCase();
-  if (!needle) return true;
-  const name = (album?.name || album?.album || '').toLowerCase();
-  const artist = (album?.artist || '').toLowerCase();
-  return name.includes(needle) || artist.includes(needle);
+  const needles = normalizeForCompare(query || '').split(/\s+/).filter(Boolean);
+  if (!needles.length) return true;
+  const hay = normalizeForCompare(`${album?.name || album?.album || ''} ${album?.artist || ''}`);
+  return needles.every((n) => hay.includes(n));
 };
 
 const artistMatchesQuery = (artist, query) => {
-  const needle = (query || '').toLowerCase();
-  if (!needle) return true;
-  const name = (artist?.name || '').toLowerCase();
-  return name.includes(needle);
+  const needles = normalizeForCompare(query || '').split(/\s+/).filter(Boolean);
+  if (!needles.length) return true;
+  const hay = normalizeForCompare(artist?.name || '');
+  return needles.every((n) => hay.includes(n));
 };
 
 const playlistMatchesQuery = (playlist, query) => {
-  const needle = (query || '').toLowerCase();
-  if (!needle) return true;
-  const name = (playlist?.name || '').toLowerCase();
-  return name.includes(needle);
+  const needles = normalizeForCompare(query || '').split(/\s+/).filter(Boolean);
+  if (!needles.length) return true;
+  const hay = normalizeForCompare(playlist?.name || '');
+  return needles.every((n) => hay.includes(n));
 };
 
 async function ensureAlbumsCache(force = false) {
@@ -789,8 +850,8 @@ async function ensureAlbumTracks(albumNameRaw, albumArtistRaw = '', force = fals
   return fallback;
 }
 
-async function handleSearchInput(rawValue = '') {
-  const query = (rawValue || '').toLowerCase().trim();
+async function handleSearchInput(rawValue = '', { fromUser = false } = {}) {
+  const query = (rawValue || '').trim();
 
   if (currentView === 'albums') {
     const source = await ensureAlbumsCache();
@@ -813,10 +874,23 @@ async function handleSearchInput(rawValue = '') {
     return;
   }
 
+  // Network browsers: filter what is on screen (Enter searches the server).
+  if (currentView === 'upnp' || currentView === 'nas') {
+    applyNetFilter(currentView, query);
+    return;
+  }
+
+  // Any other view (Settings, plugin pages) has nothing to filter: typing a
+  // query there jumps to the library results instead of silently doing nothing.
+  if (currentView !== 'library') {
+    if (fromUser && query) switchView('library', true);
+    return;
+  }
+
   // Album view loads tracks by normalized album + album artist context.
   if (libraryContext.type === 'album' && libraryContext.name) {
     const base = await ensureAlbumTracks(libraryContext.name, libraryContext.artist);
-    tracks = filterTracksByQuery(base, query);
+    tracks = sortTracks(filterTracksByQuery(base, query));
     renderLibrary();
     return;
   }
@@ -1730,6 +1804,15 @@ function customConfirm(message, options = {}) {
   });
 }
 
+// Native alert / confirm dialogs leave Electron text inputs unfocusable on Windows
+// afterwards (the search box "stops working"); messages go through the in-app
+// notification bar and dialogs instead.
+function uiAlert(message, type) {
+  const text = String(message ?? '');
+  const kind = type || (/fail|error|invalid|could not|unable/i.test(text) ? 'error' : 'info');
+  NotificationCenter.show({ message: text, type: kind, autoClose: 4500 });
+}
+
 const NotificationCenter = (() => {
   let current = null;
   let hideTimer = null;
@@ -1990,10 +2073,17 @@ const renderLibrary = () => {
   // Selection state for library items
   if (!globalThis.__spectra_selectedTrackIds) globalThis.__spectra_selectedTrackIds = new Set();
   const selectedTrackIds = globalThis.__spectra_selectedTrackIds;
-  for (const track of tracks) {
+  const setSingleSelection = (el, track) => {
+    selectedTrackIds.clear();
+    selectedTrackIds.add(track.id);
+    trackList.querySelectorAll('.track-item.selected').forEach((n) => n.classList.remove('selected'));
+    el.classList.add('selected');
+  };
+  const buildRow = (track) => {
     const el = document.createElement('div');
     const isSelected = selectedTrackIds.has(track.id);
-    el.className = `track-item ${currentTrack && currentTrack.id === track.id ? 'active' : ''} ${isSelected ? 'selected' : ''}`;
+    el.className = `track-item ${tracksMatch(currentTrack, track) ? 'active' : ''} ${isSelected ? 'selected' : ''}`;
+    if (track.id != null) el.dataset.trackId = String(track.id);
     // Store path in dataset for right-click actions
     if (track.path) el.dataset.path = track.path;
 
@@ -2057,11 +2147,9 @@ const renderLibrary = () => {
         el.classList.toggle('selected', selectedTrackIds.has(track.id));
         return;
       }
-      // Otherwise select single and play
-      selectedTrackIds.clear();
-      selectedTrackIds.add(track.id);
-      // re-render library to update classes
-      renderLibrary();
+      // Otherwise select single and play. Only classes change: rebuilding the
+      // whole list here reset long libraries back to their first page.
+      setSingleSelection(el, track);
       const sameTrack = currentTrack && (
         (track.id && currentTrack.id && track.id === currentTrack.id) ||
         (!track.id && currentTrack.path && track.path && currentTrack.path === track.path)
@@ -2082,19 +2170,63 @@ const renderLibrary = () => {
     el.oncontextmenu = (e) => {
       e.preventDefault();
       // If this item is not part of selection, select it only
-      if (!selectedTrackIds.has(track.id)) {
-        selectedTrackIds.clear();
-        selectedTrackIds.add(track.id);
-        renderLibrary();
-      }
+      if (!selectedTrackIds.has(track.id)) setSingleSelection(el, track);
       // Build array of selected track objects to send to main
       const selected = tracks.filter(t => selectedTrackIds.has(t.id)).map(t => (typeof structuredClone === 'function' ? structuredClone(t) : JSON.parse(JSON.stringify(t))));
       electron.showTrackContextMenu(selected);
     };
 
-    trackList.appendChild(el);
+    return el;
+  };
+
+  // Render in pages: building tens of thousands of rows per keystroke made
+  // search and navigation crawl on large libraries.
+  const BATCH = 400;
+  const token = ++libraryRenderToken;
+  const list = tracks;
+  let index = 0;
+  if (!list.length) {
+    const empty = document.createElement('div');
+    empty.className = 'net-empty-hint';
+    const q = searchInputEl ? searchInputEl.value.trim() : '';
+    empty.textContent = q ? `No tracks match "${q}"` : 'No tracks here yet';
+    trackList.appendChild(empty);
+    return;
   }
+  const appendBatch = () => {
+    if (token !== libraryRenderToken) return;
+    const frag = document.createDocumentFragment();
+    const end = Math.min(list.length, index + BATCH);
+    for (; index < end; index++) frag.appendChild(buildRow(list[index]));
+    trackList.appendChild(frag);
+    if (index >= list.length) return;
+    const sentinel = document.createElement('div');
+    sentinel.style.height = '1px';
+    trackList.appendChild(sentinel);
+    const observer = new IntersectionObserver((entries) => {
+      if (!entries.some((e) => e.isIntersecting)) return;
+      observer.disconnect();
+      sentinel.remove();
+      appendBatch();
+    }, { rootMargin: '800px' });
+    observer.observe(sentinel);
+  };
+  appendBatch();
 };
+
+// Move the "now playing" highlight without rebuilding the list.
+function updateActiveTrackRow() {
+  if (!trackList) return;
+  const id = currentTrack && currentTrack.id != null ? String(currentTrack.id) : null;
+  trackList.querySelectorAll('.track-item.active').forEach((n) => {
+    if (n.dataset.trackId !== id) n.classList.remove('active');
+  });
+  if (id != null) {
+    for (const n of trackList.querySelectorAll('.track-item')) {
+      if (n.dataset.trackId === id) { n.classList.add('active'); break; }
+    }
+  }
+}
 
 // Show album context menu (right-click menu for albums)
 const showAlbumContextMenu = async (event, albumInfo) => {
@@ -2178,7 +2310,7 @@ const showWebAlbumContextMenu = (event, albumInfo) => {
 const handleAlbumDeleteConfirm = async (albumInfo) => {
   const { albumName, artistName, trackCount } = albumInfo;
 
-  const confirmed = window.confirm(
+  const confirmed = await customConfirm(
     `Delete album "${albumName}" by ${artistName || 'Unknown Artist'}?\n\nThis will remove all ${trackCount} track(s) from your library.\n\nThis cannot be undone.`
   );
 
@@ -2194,7 +2326,7 @@ const handleAlbumDeleteConfirm = async (albumInfo) => {
       }
     } catch (err) {
       console.error('Failed to delete album:', err);
-      alert('Failed to delete album: ' + (err.message || err));
+      uiAlert('Failed to delete album: ' + (err.message || err));
     }
   }
 };
@@ -2226,7 +2358,7 @@ const loadLibrary = async () => {
   artistsCache = [];
 
   const querySource = searchInputEl || document.getElementById('search-input');
-  const query = querySource ? querySource.value.toLowerCase().trim() : '';
+  const query = querySource ? querySource.value.trim() : '';
 
   if (libraryContext.type === 'playlist' && currentPlaylistFilter?.id) {
     try {
@@ -2418,47 +2550,57 @@ async function renderArtists({ data, forceReload = false } = {}) {
 // where the user picked a track out of a specific list (library, album,
 // playlist). playTrack() without a contextList is used for Next/Prev inside
 // the existing context — it preserves playbackContext as-is.
+// Mirror the playback list into the main-process queue so the queue panel,
+// remote clients and headless mode see the same list.
+async function mirrorQueueToMain(list, track) {
+  try {
+    const seed = list.map((t) => ({
+      id: t.id,
+      path: t.path,
+      title: t.title,
+      artist: t.artist,
+      album: t.album,
+      album_artist: t.album_artist,
+      duration: t.duration,
+      cover_path: t.cover_path || t.coverPath || null,
+    }));
+    const currentIndex = Math.max(0, seed.findIndex((t) => tracksMatch(t, track)));
+    await electron.setQueue(seed, currentIndex);
+  } catch (err) {
+    console.warn('setQueue failed:', err);
+  }
+}
+
 const startPlayback = async (track, list, meta = {}) => {
+  if (!track) return;
   if (Array.isArray(list) && list.length) {
     playbackContext = {
       list: [...list],
       type: meta.type || 'library',
       key: meta.key || null,
     };
-    // Mirror into main-process queue so media keys / remote / Next/Prev
-    // handlers on main also have the right list.
-    try {
-      const seed = list.map((t) => ({
-        id: t.id,
-        path: t.path,
-        title: t.title,
-        artist: t.artist,
-        album: t.album,
-        album_artist: t.album_artist,
-        duration: t.duration,
-        cover_path: t.cover_path || t.coverPath || null,
-      }));
-      const currentIndex = Math.max(0, seed.findIndex((t) =>
-        (track?.id != null && t.id != null && t.id === track.id) ||
-        (track?.path && t.path && t.path === track.path)
-      ));
-      await electron.setQueue(seed, currentIndex);
-    } catch (err) {
-      console.warn('setQueue failed:', err);
-    }
+    playHistory = [];
+    shufflePlayed = new Set();
+    forcedNext = [];
+    await mirrorQueueToMain(playbackContext.list, track);
   }
-  return playTrack(track, { ...meta, forceRestart: true });
+  return playTrack(track, { forceRestart: true });
 };
 
 const getAutoSampleRateForOutput = () => undefined;
 // Play Track
 const playTrack = async (track, opts = {}) => {
-  const { startTime, forceRestart = true } = opts || {};
+  if (!track || !track.path) return;
+  const { startTime, forceRestart = true, gapless = false } = opts || {};
 
   // Check if same track BEFORE updating currentTrack
-  const isSameTrack = currentTrack && track && currentTrack.id === track.id;
+  const isSameTrack = tracksMatch(currentTrack, track);
 
   currentTrack = track;
+  playInstance++;
+  endedPolls = 0;
+  pendingResumePosition = null;
+  lastStatusDuration = 0;
   // Show UI animation for now playing
   showNowPlaying();
   // record start as lastPlayed with zero elapsed until periodic saver updates it
@@ -2483,15 +2625,44 @@ const playTrack = async (track, opts = {}) => {
     bufferMs: Number.parseInt(String(settings.bufferMs || '100'), 10) || 100,
     bufferFrames: Number.parseInt(String(settings.bufferFrames || '0'), 10) || 0,
     volume: Number(volumeSlider.value), // Pass current volume as number
+    // Auto-advance appends to the open device (gapless); a user-initiated
+    // change cuts over immediately.
+    gapless: gapless === true,
     track: track
   };
   if (typeof startTime === 'number' && startTime >= 0) playbackOptions.startTime = startTime;
-  // If we are already on this track and not forcing restart, just resume
-  if (!forceRestart && isPlaying && isSameTrack) {
-    await electron.resume();
-  } else {
-    await electron.playTrack(track.path, playbackOptions);
+
+  // Update the UI first so rapid Next/Prev presses feel instant.
+  isPlaying = true;
+  lastKnownPosition = startPos;
+  updateNowPlaying();
+  updateActiveTrackRow();
+  updatePlayButton();
+  if (currentTimeEl) currentTimeEl.textContent = formatTime(startPos);
+  if (seekSlider && !isSeeking) {
+    const dur = effectiveDuration();
+    seekSlider.value = dur > 0 ? Math.min(100, (startPos / dur) * 100) : 0;
   }
+
+  const myInstance = playInstance;
+  playRequestsInFlight++;
+  try {
+    // If we are already on this track and not forcing restart, just resume
+    if (!forceRestart && isSameTrack && engineActive) {
+      await electron.resume();
+    } else {
+      await electron.playTrack(track.path, playbackOptions);
+    }
+  } finally {
+    playRequestsInFlight--;
+  }
+  if (myInstance !== playInstance) return; // a newer request superseded this one
+
+  if (!playHistory.length || !tracksMatch(playHistory[playHistory.length - 1], track)) {
+    playHistory.push(track);
+    if (playHistory.length > 200) playHistory.shift();
+  }
+  shufflePlayed.add(trackKey(track));
 
   // Keep main-process queue index in sync when tracks change from renderer
   // controls (Prev/Next/click), so media keys continue from the correct slot.
@@ -2501,11 +2672,6 @@ const playTrack = async (track, opts = {}) => {
     }
   } catch {}
 
-  isPlaying = true;
-  lastKnownPosition = startPos;
-  updateNowPlaying();
-  renderLibrary(); // Update active state
-  updatePlayButton();
   if (isFullscreenVisible()) {
     showFullscreen();
   }
@@ -2514,16 +2680,24 @@ const playTrack = async (track, opts = {}) => {
 // Show a simple playback error notification with option to relink file
 const showPlaybackError = async (errInfo) => {
   console.log('showPlaybackError called with', errInfo);
-  if (!errInfo || !errInfo.filePath) return;
+  if (!errInfo) return;
+  isPlaying = false;
+  updatePlayButton();
   const friendly = errInfo.message || 'Playback failed.';
-  const wantRelink = window.confirm(`${friendly}\n\nFile: ${errInfo.filePath}\n\nLocate the file in a new location?`);
-  console.log('user chose to relink:', wantRelink);
+  const filePath = errInfo.filePath || '';
+  const isMissingLocalFile = !!filePath && !/^https?:\/\//i.test(filePath) && /not found|ENOENT/i.test(friendly);
+  if (!isMissingLocalFile) {
+    // Device / decoder / network errors: relinking a file would not help.
+    NotificationCenter.show({ message: 'Playback failed', detail: friendly, type: 'error', autoClose: 7000 });
+    return;
+  }
+  const wantRelink = await customConfirm(`${friendly}\n\nLocate the file in a new location?`, {
+    title: 'File not found', confirmLabel: 'Locate…',
+  });
   if (!wantRelink) return;
   // Ask main process to let user pick a replacement file and update DB
   try {
-    console.log('calling electron.relinkTrack');
-    const result = await electron.relinkTrack({ filePath: errInfo.filePath, track: errInfo.track });
-    console.log('relinkTrack returned:', result);
+    await electron.relinkTrack({ filePath: errInfo.filePath, track: errInfo.track });
     // After relink, reload library so the path is updated
     await loadLibrary();
   } catch (e) {
@@ -2538,10 +2712,12 @@ electron.on('audio:error', (errInfo) => {
 
 // Main process emits this when FFmpeg reaches natural end-of-stream.
 // Use it as the primary auto-advance trigger so pause state never skips tracks.
-electron.on('audio:ended', () => {
+electron.on('audio:ended', (info) => {
   if (!currentTrack) return;
-  if (lastAutoAdvancedTrackId === (currentTrack && currentTrack.id)) return;
-  lastAutoAdvancedTrackId = currentTrack && currentTrack.id;
+  // Ignore an end event for a track the user already navigated away from.
+  if (info && (info.id != null || info.path) && !tracksMatch(info, currentTrack)) return;
+  if (advancedInstance === playInstance) return;
+  advancedInstance = playInstance;
   void advanceToNext();
 });
 
@@ -2600,7 +2776,7 @@ const updateNowPlaying = async () => {
     npArt.style.display = 'flex'; // Flex for centering icon
   }
 
-  totalTimeEl.textContent = formatTime(currentTrack.duration);
+  totalTimeEl.textContent = formatTime(effectiveDuration());
 };
 
 // Fullscreen view handlers
@@ -3197,39 +3373,98 @@ const updatePlayButton = () => {
 const initSearch = () => {
   const searchInput = document.getElementById('search-input');
   if (!searchInput) return;
+  searchInputEl = searchInput;
 
-  searchInput.addEventListener('input', (e) => {
-    const query = e.target.value.toLowerCase().trim();
-    // Delegate to the scoped search handler which respects currentView and libraryContext
-    void handleSearchInput(query);
+  // Debounced so each keystroke does not re-filter and re-render the library.
+  let timer = null;
+  const run = () => {
+    if (timer) { clearTimeout(timer); timer = null; }
+    void handleSearchInput(searchInput.value, { fromUser: true });
+  };
+  searchInput.addEventListener('input', () => {
+    if (timer) clearTimeout(timer);
+    timer = setTimeout(run, 120);
   });
 
-  // Enter key should also run the scoped search immediately
   searchInput.addEventListener('keydown', (e) => {
     if (e.key === 'Enter') {
-      const q = e.target.value.toLowerCase().trim();
-      void handleSearchInput(q);
+      // In the UPnP browser, Enter asks the server to search its whole library.
+      if (currentView === 'upnp' && searchInput.value.trim()) {
+        if (timer) { clearTimeout(timer); timer = null; }
+        void searchUpnp(searchInput.value);
+      } else {
+        run();
+      }
+    } else if (e.key === 'Escape') {
+      searchInput.value = '';
+      run();
+      searchInput.blur();
     }
   });
 };
+
+function focusSearch() {
+  const input = searchInputEl || document.getElementById('search-input');
+  if (!input) return;
+  input.focus();
+  input.select();
+}
+
+// Column-header sorting for the track list.
+function initLibrarySorting() {
+  const header = document.querySelector('#view-library .track-list-header');
+  if (!header) return;
+  const columns = { '.col-title': 'title', '.col-artist': 'artist', '.col-album': 'album', '.col-duration': 'duration' };
+  const cells = [];
+  const refresh = () => {
+    for (const { el, key } of cells) {
+      let mark = el.querySelector('.sort-indicator');
+      if (!mark) {
+        mark = document.createElement('span');
+        mark.className = 'sort-indicator';
+        mark.style.cssText = 'margin-left:4px;font-size:10px;opacity:.8';
+        el.appendChild(mark);
+      }
+      mark.textContent = librarySort.key === key ? (librarySort.dir === 1 ? '▲' : '▼') : '';
+    }
+  };
+  for (const [selector, key] of Object.entries(columns)) {
+    const el = header.querySelector(selector);
+    if (!el) continue;
+    cells.push({ el, key });
+    el.style.cursor = 'pointer';
+    el.title = 'Click to sort';
+    el.onclick = () => {
+      if (librarySort.key !== key) librarySort = { key, dir: 1 };
+      else if (librarySort.dir === 1) librarySort = { key, dir: -1 };
+      else librarySort = { key: null, dir: 1 };
+      refresh();
+      void handleSearchInput(searchInputEl ? searchInputEl.value : '');
+    };
+  }
+  refresh();
+}
 
 // Sync state from server
 const syncState = (state) => {
   if (!state) return;
 
-  // Update isPlaying
-  isPlaying = state.playing && !state.paused;
-  updatePlayButton();
+  // Update isPlaying (not while our own play request is still starting up)
+  if (!playRequestsInFlight) {
+    isPlaying = !!state.playing && !state.paused;
+    updatePlayButton();
+  }
+  engineActive = !!state.playing;
 
-  // Update currentTrack if changed
-  if (state.track && (!currentTrack || currentTrack.id !== state.track.id)) {
+  // Update currentTrack if changed (e.g. started from a remote client)
+  if (state.track && state.playing && !playRequestsInFlight && !tracksMatch(currentTrack, state.track)) {
       currentTrack = state.track;
-      // reset auto-advance marker when track changes
-      lastAutoAdvancedTrackId = null;
+      playInstance++;
+      lastStatusDuration = 0;
       updateNowPlaying();
       if (isFullscreenVisible()) showFullscreen();
       showNowPlaying();
-      renderLibrary();
+      updateActiveTrackRow();
   } else if (state.track && currentTrack) {
       // Even if same track, ensure the now playing bar is visible
       showNowPlaying();
@@ -3246,55 +3481,307 @@ const syncState = (state) => {
 // Advance playback to the next track based on the active PLAYBACK context,
 // not the currently-viewed list. That way browsing a different album while
 // music plays doesn't redirect Next/auto-advance to that album.
-async function advanceToNext() {
-  if (!currentTrack) return;
-  // If repeat one, restart same track
-  if (repeatMode === 'one') {
-    try { await playTrack(currentTrack); } catch (e) { console.warn('advanceToNext replay failed', e); }
-    return;
+function getPlaybackList() {
+  if (Array.isArray(playbackContext.list) && playbackContext.list.length) return playbackContext.list;
+  // Fallbacks for sessions that started without a context (restored track,
+  // playback started from a remote client).
+  if (Array.isArray(tracks) && tracks.length) return tracks;
+  if (Array.isArray(libraryCache) && libraryCache.length) return libraryCache;
+  return [];
+}
+
+// Shuffle without repeats: every track plays once before any plays again.
+function pickShuffleNext(list) {
+  const currentKey = trackKey(currentTrack);
+  let candidates = list.filter((t) => !shufflePlayed.has(trackKey(t)) && trackKey(t) !== currentKey);
+  if (!candidates.length) {
+    if (repeatMode !== 'all') return null;
+    shufflePlayed = new Set();
+    candidates = list.filter((t) => trackKey(t) !== currentKey);
+    if (!candidates.length) candidates = list;
+  }
+  return candidates[Math.floor(Math.random() * candidates.length)] || null;
+}
+
+// Move to the next track of the active PLAYBACK context (not the list being
+// viewed). `auto` = the previous track ended by itself → gapless hand-over.
+async function playNext({ auto = false } = {}) {
+  if (!currentTrack) return false;
+  if (auto && repeatMode === 'one') {
+    await playTrack(currentTrack, { gapless: true });
+    return true;
   }
 
-  // Prefer the playbackContext captured when playback started.
-  let sourceList = Array.isArray(playbackContext.list) && playbackContext.list.length
-    ? playbackContext.list
-    : [];
-
-  // Fallbacks for sessions that started before playbackContext was introduced
-  // (e.g. if main process triggered playback via media keys).
-  if (sourceList.length === 0) {
-    if (Array.isArray(tracks) && tracks.length) sourceList = tracks;
-    else if (Array.isArray(libraryCache) && libraryCache.length) sourceList = libraryCache;
+  const list = getPlaybackList();
+  let next = null;
+  while (forcedNext.length && !next) {
+    const candidate = forcedNext.shift();
+    if (candidate && candidate.path) next = candidate;
   }
-
-  if (!sourceList || sourceList.length === 0) return;
-
-  // Find current index in sourceList
-  let idx = sourceList.findIndex(t => (t.id && currentTrack.id && t.id === currentTrack.id) || (t.path && currentTrack.path && t.path === currentTrack.path));
-
-  // Shuffle handling
-  if (shuffleEnabled) {
-    const randIdx = Math.floor(Math.random() * sourceList.length);
-    const next = sourceList[randIdx];
-    if (next) await playTrack(next);
-    return;
-  }
-
-  // Next index
-  if (idx === -1) idx = 0;
-  const nextIdx = idx + 1;
-  if (nextIdx < sourceList.length) {
-    await playTrack(sourceList[nextIdx]);
-  } else {
-    // End of list
-    if (repeatMode === 'all') {
-      await playTrack(sourceList[0]);
+  if (!next && list.length) {
+    if (shuffleEnabled) {
+      next = pickShuffleNext(list);
     } else {
-      // stop playback
-      try { await electron.pause(); } catch {}
+      const idx = list.findIndex((t) => tracksMatch(t, currentTrack));
+      if (idx + 1 < list.length) next = list[idx + 1];
+      else if (repeatMode === 'all') next = list[0];
+    }
+  }
+
+  if (!next) {
+    if (auto) {
+      // End of the list: the engine lets the tail play out and releases the device.
       isPlaying = false;
       updatePlayButton();
     }
+    return false;
   }
+  await playTrack(next, { gapless: auto });
+  return true;
+}
+
+async function playPrevious() {
+  if (!currentTrack) return;
+  // Like every other player: Previous first rewinds, a second press goes back.
+  if (engineActive && lastKnownPosition > 3) {
+    lastKnownPosition = 0;
+    if (currentTimeEl) currentTimeEl.textContent = formatTime(0);
+    if (seekSlider) seekSlider.value = 0;
+    await electron.seek(0);
+    return;
+  }
+  if (shuffleEnabled && playHistory.length > 1) {
+    playHistory.pop(); // current
+    const prev = playHistory.pop();
+    if (prev) { await playTrack(prev); return; }
+  }
+  const list = getPlaybackList();
+  if (!list.length) return;
+  const idx = list.findIndex((t) => tracksMatch(t, currentTrack));
+  if (idx > 0) await playTrack(list[idx - 1]);
+  else if (repeatMode === 'all') await playTrack(list[list.length - 1]);
+  else await playTrack(currentTrack);
+}
+
+async function advanceToNext() {
+  if (!currentTrack) return;
+  if (stopAfterCurrent) {
+    stopAfterCurrent = false;
+    isPlaying = false;
+    updatePlayButton();
+    NotificationCenter.show({ message: 'Stopped after current track', type: 'info', autoClose: 2500 });
+    return;
+  }
+  try {
+    await playNext({ auto: true });
+  } catch (e) {
+    console.warn('advanceToNext failed', e);
+  }
+}
+
+async function togglePlayback() {
+  if (isPlaying) {
+    isPlaying = false;
+    updatePlayButton();
+    await electron.pause();
+    return;
+  }
+  if (currentTrack) {
+    let status = null;
+    try { status = await electron.getAudioStatus(); } catch {}
+    if (status && status.playing) {
+      // Engine has this track loaded: resume if paused.
+      if (status.paused) await electron.resume();
+      isPlaying = true;
+    } else {
+      // Nothing loaded (fresh start or playback finished): start the current
+      // track, continuing from the remembered position after a restart.
+      const resumeAt = Number(pendingResumePosition) >= 1 ? Number(pendingResumePosition) : undefined;
+      await playTrack(currentTrack, resumeAt !== undefined ? { startTime: resumeAt } : {});
+    }
+  } else if (tracks.length > 0) {
+    await startPlayback(tracks[0], tracks, {
+      type: libraryContext.type || 'library',
+      key: libraryContext.name || libraryContext.id || null,
+    });
+  }
+  updatePlayButton();
+}
+
+function setVolumeRelative(delta) {
+  if (!volumeSlider) return;
+  const next = Math.max(0, Math.min(100, Number(volumeSlider.value) + delta));
+  volumeSlider.value = String(next);
+  try { localStorage.setItem('spectra_volume', String(next)); } catch {}
+  electron.setVolume(next);
+}
+
+async function seekRelative(deltaSeconds) {
+  if (!currentTrack || !engineActive) return;
+  const dur = effectiveDuration();
+  let target = Math.max(0, lastKnownPosition + deltaSeconds);
+  if (dur > 0) target = Math.min(target, Math.max(0, dur - 1));
+  lastKnownPosition = target;
+  if (currentTimeEl) currentTimeEl.textContent = formatTime(target);
+  await electron.seek(target);
+}
+
+// "Play Next" / "Add to Queue" from the track context menu.
+async function enqueueTracks(items, { next = false } = {}) {
+  const incoming = (Array.isArray(items) ? items : [items]).filter((t) => t && t.path);
+  if (!incoming.length) return;
+  if (!currentTrack) {
+    await startPlayback(incoming[0], incoming, { type: 'queue' });
+    return;
+  }
+  const fresh = incoming.filter((t) => !tracksMatch(t, currentTrack));
+  if (!fresh.length) return;
+  const base = (playbackContext.list.length ? playbackContext.list : [currentTrack])
+    .filter((t) => tracksMatch(t, currentTrack) || !fresh.some((n) => tracksMatch(n, t)));
+  const idx = Math.max(0, base.findIndex((t) => tracksMatch(t, currentTrack)));
+  if (next) {
+    base.splice(idx + 1, 0, ...fresh);
+    forcedNext = [...fresh, ...forcedNext.filter((t) => !fresh.some((n) => tracksMatch(n, t)))];
+  } else {
+    base.push(...fresh);
+  }
+  playbackContext = { ...playbackContext, list: base };
+  for (const t of fresh) shufflePlayed.delete(trackKey(t));
+  await mirrorQueueToMain(base, currentTrack);
+  NotificationCenter.show({
+    message: next
+      ? `${fresh.length === 1 ? `"${fresh[0].title || 'Track'}"` : `${fresh.length} tracks`} will play next`
+      : `${fresh.length} track${fresh.length !== 1 ? 's' : ''} added to queue`,
+    type: 'success', autoClose: 2200,
+  });
+  const queuePanel = document.getElementById('queue-panel');
+  if (queuePanel && !queuePanel.classList.contains('hidden')) { try { await renderQueue(); } catch {} }
+}
+
+async function removeSelectedTracks() {
+  const ids = Array.from(globalThis.__spectra_selectedTrackIds || []).filter((id) => id != null);
+  if (!ids.length) return;
+  const ok = await customConfirm(
+    ids.length === 1 ? 'Remove this track from the library?' : `Remove ${ids.length} tracks from the library?`,
+    { title: 'Remove from library', confirmLabel: 'Remove' }
+  );
+  if (!ok) return;
+  for (const id of ids) await electron.removeTrack(id);
+  globalThis.__spectra_selectedTrackIds.clear();
+  await loadLibrary();
+}
+
+function handlePlayerCommand(command) {
+  switch (command) {
+    case 'toggle': void togglePlayback(); break;
+    case 'next': void playNext(); break;
+    case 'previous': void playPrevious(); break;
+    case 'stop':
+      isPlaying = false;
+      updatePlayButton();
+      void electron.stop();
+      break;
+    case 'stop-after-current':
+      stopAfterCurrent = !stopAfterCurrent;
+      NotificationCenter.show({
+        message: stopAfterCurrent ? 'Will stop after the current track' : 'Stop after current: off',
+        type: 'info', autoClose: 2200,
+      });
+      break;
+    case 'volume-up': setVolumeRelative(5); break;
+    case 'volume-down': setVolumeRelative(-5); break;
+    case 'focus-search': focusSearch(); break;
+    default: break;
+  }
+}
+
+// Keyboard shortcuts. They live here (not as menu accelerators) so that keys
+// typed into text fields are never stolen.
+function initKeyboardShortcuts() {
+  const isTextTarget = (el) => {
+    if (!el || !el.tagName) return false;
+    if (el.isContentEditable) return true;
+    if (el.tagName === 'TEXTAREA' || el.tagName === 'SELECT') return true;
+    return el.tagName === 'INPUT' && !['range', 'checkbox', 'radio', 'button', 'submit'].includes(el.type);
+  };
+  const modalOpen = () => Array.from(document.querySelectorAll('.modal')).some((m) => m.style.display && m.style.display !== 'none');
+
+  document.addEventListener('keydown', (e) => {
+    const mod = e.ctrlKey || e.metaKey;
+    const key = e.key;
+    if (mod && !e.altKey && (key === 'f' || key === 'F')) {
+      e.preventDefault();
+      focusSearch();
+      return;
+    }
+    if (isTextTarget(e.target) || modalOpen() || e.altKey) return;
+
+    if (key === ' ' && !mod) {
+      if (e.target && e.target.tagName === 'BUTTON') return; // let the focused button act
+      e.preventDefault();
+      void togglePlayback();
+    } else if (mod && key === 'ArrowRight') { e.preventDefault(); void playNext(); }
+    else if (mod && key === 'ArrowLeft') { e.preventDefault(); void playPrevious(); }
+    else if (mod && key === 'ArrowUp') { e.preventDefault(); setVolumeRelative(5); }
+    else if (mod && key === 'ArrowDown') { e.preventDefault(); setVolumeRelative(-5); }
+    else if (!mod && key === 'ArrowRight' && e.target?.type !== 'range') { e.preventDefault(); void seekRelative(e.shiftKey ? 30 : 5); }
+    else if (!mod && key === 'ArrowLeft' && e.target?.type !== 'range') { e.preventDefault(); void seekRelative(e.shiftKey ? -30 : -5); }
+    else if (mod && (key === 'a' || key === 'A') && currentView === 'library') {
+      e.preventDefault();
+      if (!globalThis.__spectra_selectedTrackIds) globalThis.__spectra_selectedTrackIds = new Set();
+      const sel = globalThis.__spectra_selectedTrackIds;
+      sel.clear();
+      for (const t of tracks) sel.add(t.id);
+      if (trackList) trackList.querySelectorAll('.track-item').forEach((n) => n.classList.add('selected'));
+    } else if (key === 'Delete' && currentView === 'library') {
+      e.preventDefault();
+      void removeSelectedTracks();
+    } else if (key === 'Enter' && currentView === 'library') {
+      const sel = globalThis.__spectra_selectedTrackIds;
+      const first = sel && sel.size ? tracks.find((t) => sel.has(t.id)) : null;
+      if (first) {
+        e.preventDefault();
+        void startPlayback(first, tracks, {
+          type: libraryContext.type || 'library',
+          key: libraryContext.name || libraryContext.id || null,
+        });
+      }
+    } else if (key === '/' && !mod) {
+      e.preventDefault();
+      focusSearch();
+    }
+  });
+}
+
+// "FLAC · 96 kHz · 24-bit → WASAPI exclusive" under the now-playing title.
+function updateTechLine(status) {
+  let el = document.getElementById('np-tech');
+  if (!el) {
+    const host = document.querySelector('.now-playing-info .track-details');
+    if (!host) return;
+    el = document.createElement('div');
+    el.id = 'np-tech';
+    el.className = 'track-tech';
+    el.style.cssText = 'font-size:11px;opacity:.6;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;margin-top:2px';
+    host.appendChild(el);
+  }
+  let text = '';
+  if (status && status.playing && status.source) {
+    const src = status.source;
+    const out = status.output || {};
+    const khz = (hz) => (hz ? `${(hz / 1000).toFixed(hz % 1000 ? 1 : 0)} kHz` : '');
+    const parts = [];
+    if (src.codec) parts.push(String(src.codec).split(/[ (]/)[0].toUpperCase());
+    if (src.sampleRate) parts.push(khz(src.sampleRate));
+    if (src.bitDepth) parts.push(`${src.bitDepth}-bit`);
+    else if (src.bitrate) parts.push(`${Math.round(src.bitrate / 1000)} kbps`);
+    let outText = out.backend ? String(out.backend) : '';
+    if (out.sampleRate && out.sampleRate !== src.sampleRate) outText += ` ${khz(out.sampleRate)}`;
+    if (out.bitPerfect) outText += ' · bit-perfect';
+    if (stopAfterCurrent) outText += ' · stop after current';
+    text = parts.join(' · ') + (outText ? ` → ${outText}` : '');
+  }
+  if (el.textContent !== text) el.textContent = text;
 }
 
 // Plugin System API (sandboxed via factory)
@@ -4203,7 +4690,7 @@ async function init() {
       if (viewPlaylists && viewPlaylists.style.display !== 'none') renderPlaylists({ forceReload: true });
     } catch (e) {
       console.error('Failed to create playlist', e);
-      alert('Failed to create playlist');
+      uiAlert('Failed to create playlist');
     }
   };
   if (btnImportPlaylist) btnImportPlaylist.onclick = async () => {
@@ -4212,15 +4699,15 @@ async function init() {
       if (res && res.success) {
         playlistsCache = [];
         await renderPlaylists({ forceReload: true });
-        alert('Playlist imported');
+        uiAlert('Playlist imported');
       } else if (res && res.canceled) {
         // user canceled
       } else {
-        alert('Import failed: ' + (res && res.error ? res.error : 'unknown'));
+        uiAlert('Import failed: ' + (res && res.error ? res.error : 'unknown'));
       }
     } catch (e) {
       console.error('Import playlist failed', e);
-      alert('Import failed');
+      uiAlert('Import failed');
     }
   };
   if (btnImportUrl) btnImportUrl.onclick = async () => {
@@ -4230,7 +4717,7 @@ async function init() {
 
       const trimmedUrl = url.trim();
       if (!/^https?:\/\//i.test(trimmedUrl)) {
-        alert('Please enter a valid http(s) URL');
+        uiAlert('Please enter a valid http(s) URL');
         return;
       }
 
@@ -4246,7 +4733,7 @@ async function init() {
 
       if (res && res.success) {
         await loadLibrary();
-        const playNow = confirm('Track added to library. Play it now?');
+        const playNow = await customConfirm('Track added to library. Play it now?');
         if (playNow) {
           // Refresh library and find the just-added track
           const lib = await electron.getLibrary();
@@ -4254,72 +4741,28 @@ async function init() {
           if (t) await playTrack(t);
         }
       } else {
-        alert('Failed to add remote track: ' + (res && res.error ? res.error : 'unknown'));
+        uiAlert('Failed to add remote track: ' + (res && res.error ? res.error : 'unknown'));
       }
     } catch (e) {
       console.error('addImportUrl error', e);
-      alert('Error adding remote URL: ' + (e && e.message ? e.message : e));
+      uiAlert('Error adding remote URL: ' + (e && e.message ? e.message : e));
     }
   };
 
   // Play button
-  if (btnPlay) btnPlay.onclick = async () => {
-    if (isPlaying) {
-      await electron.pause();
-      isPlaying = false;
-    } else {
-      if (currentTrack) {
-        // Query engine status to decide whether to resume or start playback
-        try {
-          const status = await electron.getAudioStatus();
-          // If engine already has an active process (playing or paused), resume if paused
-          if (status && status.playing) {
-            if (status.paused) {
-              await electron.resume();
-              isPlaying = true;
-            } else {
-              // already playing
-              isPlaying = true;
-            }
-          } else {
-            // No active process — start playback from the current track
-            await playTrack(currentTrack);
-            // playTrack sets isPlaying
-          }
-        } catch {
-          // Fallback: attempt to start playback
-          await playTrack(currentTrack);
-        }
-      } else if (tracks.length > 0) {
-        await startPlayback(tracks[0], tracks, {
-          type: libraryContext.type || 'library',
-          key: libraryContext.name || libraryContext.id || null,
-        });
-      }
-    }
-    updatePlayButton();
-  };
+  if (btnPlay) btnPlay.onclick = () => { void togglePlayback(); };
 
   // Prev/Next buttons — use the saved playback context, not the currently
   // visible list, so viewing a different album while music plays doesn't
-  // hijack the next-track target.
-  if (btnPrev) btnPrev.onclick = () => {
-    if (!currentTrack) return;
-    const list = playbackContext.list.length ? playbackContext.list : tracks;
-    if (!list.length) return;
-    const idx = list.findIndex(t => t.id === currentTrack.id);
-    if (idx > 0) playTrack(list[idx - 1]);
-    else if (repeatMode === 'all') playTrack(list[list.length - 1]);
-  };
+  // hijack the next-track target. Shuffle and repeat are honoured.
+  if (btnPrev) btnPrev.onclick = () => { void playPrevious(); };
+  if (btnNext) btnNext.onclick = () => { void playNext(); };
 
-  if (btnNext) btnNext.onclick = () => {
-    if (!currentTrack) return;
-    const list = playbackContext.list.length ? playbackContext.list : tracks;
-    if (!list.length) return;
-    const idx = list.findIndex(t => t.id === currentTrack.id);
-    if (idx >= 0 && idx < list.length - 1) playTrack(list[idx + 1]);
-    else if (repeatMode === 'all' && list.length) playTrack(list[0]);
-  };
+  // Transport commands from the menu, tray and media keys
+  electron.on('player:command', handlePlayerCommand);
+  electron.on('queue:play-next', (items) => { void enqueueTracks(items, { next: true }); });
+  electron.on('queue:append', (items) => { void enqueueTracks(items, { next: false }); });
+  initKeyboardShortcuts();
 
   // Volume/seek
   if (volumeSlider) {
@@ -4335,14 +4778,23 @@ async function init() {
     };
   }
   if (seekSlider) {
+    seekSlider.step = '0.05'; // 1% steps were 36 s jumps on an hour-long track
     seekSlider.onchange = (e) => {
-      if (currentTrack) {
-        const time = (e.target.value / 100) * currentTrack.duration;
-        electron.seek(time);
+      const dur = effectiveDuration();
+      if (currentTrack && dur > 0) {
+        const time = (Number(e.target.value) / 100) * dur;
+        lastKnownPosition = time;
+        if (currentTimeEl) currentTimeEl.textContent = formatTime(time);
+        if (engineActive) electron.seek(time);
+        else pendingResumePosition = time; // not loaded yet: start there on Play
       }
       isSeeking = false;
     };
-    seekSlider.oninput = () => { isSeeking = true; };
+    seekSlider.oninput = (e) => {
+      isSeeking = true;
+      const dur = effectiveDuration();
+      if (dur > 0 && currentTimeEl) currentTimeEl.textContent = formatTime((Number(e.target.value) / 100) * dur);
+    };
   }
 
   // Drag and drop
@@ -4428,7 +4880,7 @@ async function init() {
         await renderPlaylists({ forceReload: true });
       } catch (err) {
         console.error('Failed to save playlist edits:', err);
-        alert('Failed to save changes');
+        uiAlert('Failed to save changes');
       }
     };
   }
@@ -4437,7 +4889,7 @@ async function init() {
     btnDeletePlaylist.onclick = async () => {
       if (!currentEditingPlaylist) return;
 
-      const confirmed = confirm('Are you sure you want to delete this playlist? This cannot be undone.');
+      const confirmed = await customConfirm('Are you sure you want to delete this playlist? This cannot be undone.');
       if (!confirmed) return;
 
       try {
@@ -4456,7 +4908,7 @@ async function init() {
         await renderPlaylists({ forceReload: true });
       } catch (err) {
         console.error('Failed to delete playlist:', err);
-        alert('Failed to delete playlist');
+        uiAlert('Failed to delete playlist');
       }
     };
   }
@@ -4472,7 +4924,7 @@ async function init() {
   });
 
   electron.on('track:remove', async (trackId) => {
-    if (confirm('Are you sure you want to remove this track from the library?')) {
+    if (await customConfirm('Are you sure you want to remove this track from the library?')) {
       await electron.removeTrack(trackId);
       loadLibrary();
     }
@@ -4481,7 +4933,7 @@ async function init() {
   // Handle multi-remove initiated from context menu
   electron.on('tracks:remove', async (trackIds) => {
     if (!Array.isArray(trackIds) || trackIds.length === 0) return;
-    if (confirm(`Are you sure you want to remove ${trackIds.length} tracks from the library?`)) {
+    if (await customConfirm(`Are you sure you want to remove ${trackIds.length} tracks from the library?`)) {
       for (const id of trackIds) {
         await electron.removeTrack(id);
       }
@@ -4519,9 +4971,11 @@ async function init() {
       count: `${current}/${total}`
     });
   });
-  electron.on('import:complete', () => {
+  electron.on('import:complete', (info) => {
     NotificationCenter.show({
-      message: 'Import complete!',
+      message: info && info.failed
+        ? `Import complete — ${info.failed} of ${info.total} could not be read`
+        : 'Import complete!',
       type: 'success',
       autoClose: 2600,
       sticky: false,
@@ -4562,7 +5016,7 @@ async function init() {
         }
       }
       await renderPlaylists();
-      alert(`Created playlist "${created.name}" and added ${Array.isArray(trackIds) ? trackIds.length : 0} tracks.`);
+      uiAlert(`Created playlist "${created.name}" and added ${Array.isArray(trackIds) ? trackIds.length : 0} tracks.`);
     } catch (e) {
       console.error('playlist:create-from-selection handler failed', e);
     }
@@ -4611,55 +5065,55 @@ async function init() {
 
   // Periodic UI updates
   setInterval(async () => {
-      if (currentTrack) {
-        // Prefer full audio status when available
-        let status = null;
-        try { status = await electron.getAudioStatus(); } catch {}
-        let time = 0;
-        if (status && typeof status.currentTime === 'number') time = status.currentTime;
-        else {
-          try { time = await electron.getTime(); } catch {}
-        }
-        renderAudioOutputStatus(status);
-        if (time > 0) lastKnownPosition = time;
-        if (currentTimeEl) currentTimeEl.textContent = formatTime(time);
-        if (!isSeeking && currentTrack.duration > 0 && seekSlider) seekSlider.value = (time / currentTrack.duration) * 100;
-        // Persist last played position
-        saveLastPlayed(currentTrack, time);
-        // Ensure Now Playing bar visible when we have a current track
-        showNowPlaying();
+    if (!currentTrack) return;
+    let status = null;
+    try { status = await electron.getAudioStatus(); } catch {}
+    const ok = status && !status.error;
+    if (ok) engineActive = !!status.playing;
+    renderAudioOutputStatus(status);
+    updateTechLine(status);
 
-        // Auto-advance detection: if player reports not playing/paused and time is at/after end
-        try {
-          const playingFlag = status ? Boolean(status.playing) : isPlaying;
-          const nearEnd = currentTrack.duration > 0 && time >= Math.max(0, currentTrack.duration - AUTO_ADVANCE_EPS);
-          // Do not auto-skip while merely paused near the end.
-          if (nearEnd && !playingFlag) {
-            if (lastAutoAdvancedTrackId !== (currentTrack && currentTrack.id)) {
-              lastAutoAdvancedTrackId = currentTrack && currentTrack.id;
-              void advanceToNext();
-            }
-          }
-        } catch (err) {
-          // ignore
-        }
+    if (ok && !playRequestsInFlight) {
+      // Keep the play button honest (end of list, device errors, remote control).
+      const nowPlaying = engineActive && !status.paused;
+      if (nowPlaying !== isPlaying) { isPlaying = nowPlaying; updatePlayButton(); }
+      if (engineActive && status.duration > 0 && Math.abs(status.duration - lastStatusDuration) > 0.5) {
+        lastStatusDuration = status.duration;
+        if (totalTimeEl) totalTimeEl.textContent = formatTime(effectiveDuration());
       }
+    }
+
+    // Only a loaded track has a meaningful position; otherwise keep showing
+    // (and keep saved) the remembered one instead of overwriting it with 0.
+    if (ok && engineActive && typeof status.currentTime === 'number' && !playRequestsInFlight) {
+      const time = status.currentTime;
+      lastKnownPosition = time;
+      if (!isSeeking) {
+        if (currentTimeEl) currentTimeEl.textContent = formatTime(time);
+        const dur = effectiveDuration();
+        if (dur > 0 && seekSlider) seekSlider.value = Math.min(100, (time / dur) * 100);
+      }
+      saveLastPlayed(currentTrack, time);
+    }
+    showNowPlaying();
+
+    // Safety net for a missed 'audio:ended' event: the engine reports the
+    // track as finished on two consecutive polls and nobody advanced yet.
+    if (ok && status.ended && advancedInstance !== playInstance && !playRequestsInFlight) {
+      if (++endedPolls >= 2) {
+        endedPolls = 0;
+        advancedInstance = playInstance;
+        void advanceToNext();
+      }
+    } else {
+      endedPolls = 0;
+    }
   }, 500);
 
   // Initial load
   await loadLibrary();
-  // Keyboard: Ctrl/Cmd + A => select all tracks in current view
-  document.addEventListener('keydown', (e) => {
-    if ((e.ctrlKey || e.metaKey) && (e.key === 'a' || e.key === 'A')) {
-      e.preventDefault();
-      if (!globalThis.__spectra_selectedTrackIds) globalThis.__spectra_selectedTrackIds = new Set();
-      const sel = globalThis.__spectra_selectedTrackIds;
-      sel.clear();
-      for (const t of tracks) sel.add(t.id);
-      renderLibrary();
-    }
-  });
   initSearch();
+  initLibrarySorting();
   await loadSettingsUI();
   // Push current settings to main (ensure minimize-to-tray preference applied at startup)
   try { void saveSettings(); } catch (e) { console.warn('Initial saveSettings failed', e); }
@@ -4687,6 +5141,10 @@ async function init() {
       const found = tracks.find(t => String(t.id) === String(last.id) || t.path === last.path);
       if (found) {
         currentTrack = found;
+        pendingResumePosition = Number(last.elapsed) || 0;
+        // Finished (or nearly finished) last time: start over instead.
+        if (found.duration > 0 && pendingResumePosition > found.duration - Math.min(5, found.duration * 0.1)) pendingResumePosition = 0;
+        lastKnownPosition = pendingResumePosition;
         // update UI but do not auto-play
         updateNowPlaying();
         // restore seek slider and time display
@@ -4701,23 +5159,70 @@ async function init() {
   }
 }
 
-// ─── UPnP / DLNA Browser ──────────────────────────────────────────────────────
+// ─── Network browsers: shared helpers ────────────────────────────────────────
 
 function netFormatDuration(dur) {
-  if (!dur) return '';
+  if (dur == null || dur === '') return '';
+  if (typeof dur === 'number') return dur > 0 ? formatTime(dur) : '';
   const parts = String(dur).split(':');
   if (parts.length === 3) {
     const h = parseInt(parts[0], 10);
     const m = parseInt(parts[1], 10);
     const s = parseInt(parts[2], 10);
-    if (h > 0) return `${h}:${String(m).padStart(2,'0')}:${String(s).padStart(2,'0')}`;
-    return `${m}:${String(s).padStart(2,'0')}`;
+    if (h > 0) return `${h}:${String(m).padStart(2, '0')}:${String(s).padStart(2, '0')}`;
+    return `${m}:${String(s).padStart(2, '0')}`;
   }
   return dur;
 }
 
-function netPlayTrack(track) {
-  return playTrack(track, { forceRestart: true });
+const netNotify = (message, type = 'info', autoClose = 3000) =>
+  NotificationCenter.show({ message: String(message), type, autoClose });
+
+const netErrorText = (err) => String(err && err.message ? err.message : err)
+  .replace(/^Error invoking remote method '[^']+': (Error: )?/, '');
+
+function netShowMessage(container, text, className = 'net-empty-hint') {
+  container.innerHTML = '';
+  const el = document.createElement('div');
+  el.className = className;
+  el.textContent = text; // textContent: server-supplied text is never parsed as HTML
+  container.appendChild(el);
+  return el;
+}
+
+function netIconButton(icon, title, onClick, { danger = false, size = null } = {}) {
+  const btn = document.createElement('button');
+  btn.title = title;
+  if (danger) btn.className = 'danger';
+  const span = document.createElement('span');
+  span.className = 'material-icons';
+  span.textContent = icon;
+  if (size) span.style.fontSize = `${size}px`;
+  btn.appendChild(span);
+  btn.onclick = async (e) => {
+    e.stopPropagation();
+    if (btn.disabled) return;
+    btn.disabled = true;
+    try { await onClick(e); } finally { btn.disabled = false; }
+  };
+  return btn;
+}
+
+function netToolbarButton(icon, label, onClick) {
+  const btn = document.createElement('button');
+  btn.className = 'btn-secondary';
+  const span = document.createElement('span');
+  span.className = 'material-icons';
+  span.style.cssText = 'font-size:16px;vertical-align:middle;margin-right:4px';
+  span.textContent = icon;
+  btn.appendChild(span);
+  btn.appendChild(document.createTextNode(label));
+  btn.onclick = async () => {
+    if (btn.disabled) return;
+    btn.disabled = true;
+    try { await onClick(); } catch (err) { netNotify(netErrorText(err), 'error', 4000); } finally { btn.disabled = false; }
+  };
+  return btn;
 }
 
 function renderNetBreadcrumb(container, crumbs, onNavigate) {
@@ -4737,7 +5242,87 @@ function renderNetBreadcrumb(container, crumbs, onNavigate) {
   });
 }
 
-// ─── Network → Playlist / Library helpers ────────────────────────────────────
+// Filter the rows currently shown in a network browser by the search box.
+function applyNetFilter(kind, rawQuery = '') {
+  const fb = document.getElementById(kind === 'upnp' ? 'upnp-filebrowser' : 'nas-filebrowser');
+  if (!fb) return;
+  const needles = normalizeForCompare(rawQuery).split(/\s+/).filter(Boolean);
+  let shown = 0;
+  let total = 0;
+  fb.querySelectorAll('.net-file-item').forEach((row) => {
+    total++;
+    const hay = row.dataset.search || '';
+    const match = needles.every((n) => hay.includes(n));
+    row.style.display = match ? '' : 'none';
+    if (match) shown++;
+  });
+  let note = fb.querySelector('.net-filter-note');
+  if (!needles.length || !total) {
+    if (note) note.remove();
+    return;
+  }
+  if (!note) {
+    note = document.createElement('div');
+    note.className = 'net-empty-hint net-filter-note';
+    const list = fb.querySelector('.net-file-list');
+    if (list) fb.insertBefore(note, list); else fb.appendChild(note);
+  }
+  const scope = kind === 'upnp' && upnpSelectedUsn ? ' — press Enter to search the whole server' : '';
+  note.textContent = `${shown} of ${total} shown in this folder${scope}`;
+}
+
+async function refreshLibraryCaches() {
+  try {
+    libraryCache = await electron.getLibrary();
+    albumsCache = [];
+    artistsCache = [];
+  } catch (err) {
+    console.warn('Failed to refresh library after network add', err);
+  }
+}
+
+/**
+ * Put network items into the library and return their library rows.
+ * `items`: [{ path, remote: boolean, title?, artist?, album?, duration?, coverUrl?, ... }]
+ */
+async function registerNetworkTracks(items) {
+  const list = (items || []).filter((it) => it && it.path);
+  if (!list.length) return [];
+  const remote = list.filter((it) => it.remote);
+  const local = list.filter((it) => !it.remote);
+
+  const idByPath = new Map();
+  if (remote.length === 1) {
+    const { path: url, remote: _r, ...info } = remote[0];
+    const res = await electron.addRemote({ url, ...info });
+    if (res?.success) idByPath.set(url, res.track || { id: res.id, path: url });
+    else throw new Error(res?.error || 'Could not add the track to the library');
+  } else if (remote.length > 1) {
+    await electron.addRemoteMany(remote.map(({ path: url, remote: _r, ...info }) => ({ url, ...info })));
+  }
+  if (local.length) await electron.addFiles(local.map((it) => it.path));
+
+  await refreshLibraryCaches();
+  const byPath = new Map((libraryCache || []).map((t) => [t.path, t]));
+  const out = [];
+  for (const it of list) {
+    const row = byPath.get(it.path) || idByPath.get(it.path);
+    if (row && row.id != null) out.push(row);
+  }
+  return out;
+}
+
+async function addNetworkItemsToLibrary(items, label) {
+  if (!items.length) { netNotify('No audio files here', 'info'); return; }
+  const rows = await registerNetworkTracks(items);
+  if (!rows.length) throw new Error('Nothing could be added to the library');
+  netNotify(
+    rows.length === 1 ? `Added "${label || rows[0].title}" to library` : `${rows.length} tracks added to library`,
+    'success'
+  );
+}
+
+// ─── Network → Playlist helpers ──────────────────────────────────────────────
 
 function showPlaylistPicker() {
   return new Promise(async (resolve) => {
@@ -4750,11 +5335,18 @@ function showPlaylistPicker() {
     let playlists = [];
     try { playlists = await electron.getPlaylists(); } catch {}
 
+    const close = () => {
+      modal.style.display = 'none';
+      if (cancelBtn) cancelBtn.onclick = null;
+      if (newBtn) newBtn.onclick = null;
+      modal.onclick = null;
+    };
+
     list.innerHTML = '';
     if (!playlists.length) {
-      list.innerHTML = '<div style="opacity:.6;font-size:13px;padding:8px 0">No playlists yet — create one below</div>';
+      netShowMessage(list, 'No playlists yet — create one below').style.cssText = 'opacity:.6;font-size:13px;padding:8px 0';
     } else {
-      playlists.forEach(pl => {
+      playlists.forEach((pl) => {
         const btn = document.createElement('button');
         btn.className = 'btn-text';
         btn.style.cssText = 'display:block;width:100%;text-align:left;padding:8px 4px;font-size:14px';
@@ -4764,24 +5356,19 @@ function showPlaylistPicker() {
       });
     }
 
-    const close = () => {
-      modal.style.display = 'none';
-      if (cancelBtn) cancelBtn.onclick = null;
-      if (newBtn) newBtn.onclick = null;
-      modal.onclick = null;
-    };
-
     if (cancelBtn) cancelBtn.onclick = () => { close(); resolve(null); };
     if (newBtn) {
       newBtn.onclick = async () => {
-        const name = prompt('New playlist name:');
+        // window.prompt() does not exist in Electron — use the in-app prompt.
+        const name = await customPrompt('New playlist name:');
         if (!name || !name.trim()) return;
         try {
           const result = await electron.createPlaylist(name.trim());
+          playlistsCache = [];
           close();
           resolve({ id: result.lastInsertRowid, name: name.trim() });
         } catch (err) {
-          alert('Failed to create playlist: ' + (err?.message || err));
+          netNotify('Failed to create playlist: ' + netErrorText(err), 'error', 4000);
         }
       };
     }
@@ -4790,49 +5377,54 @@ function showPlaylistPicker() {
   });
 }
 
-async function addNetworkTrackToPlaylist(trackInfo) {
+async function addNetworkItemsToPlaylist(items) {
+  if (!items.length) { netNotify('No audio files here', 'info'); return; }
   const pl = await showPlaylistPicker();
   if (!pl) return;
   try {
-    const result = await electron.addRemote(trackInfo);
-    if (!result || !result.success) {
-      NotificationCenter.show({ message: 'Failed to register track', type: 'error', autoClose: 3000 });
-      return;
-    }
-    await electron.addTrackToPlaylist(pl.id, result.id);
-    NotificationCenter.show({ message: `Added to "${pl.name}"`, type: 'success', autoClose: 2500 });
+    const rows = await registerNetworkTracks(items);
+    for (const row of rows) await electron.addTrackToPlaylist(pl.id, row.id);
+    playlistsCache = [];
+    netNotify(`${rows.length} track${rows.length !== 1 ? 's' : ''} added to "${pl.name}"`, rows.length ? 'success' : 'error');
   } catch (err) {
-    NotificationCenter.show({ message: String(err?.message || err), type: 'error', autoClose: 3000 });
+    netNotify(netErrorText(err), 'error', 4000);
   }
-}
-
-async function addNetworkTracksToPlaylist(trackInfoList) {
-  const pl = await showPlaylistPicker();
-  if (!pl) return;
-  let added = 0;
-  for (const trackInfo of trackInfoList) {
-    try {
-      const result = await electron.addRemote(trackInfo);
-      if (result?.success) {
-        await electron.addTrackToPlaylist(pl.id, result.id);
-        added++;
-      }
-    } catch {}
-  }
-  NotificationCenter.show({ message: `${added} track${added !== 1 ? 's' : ''} added to "${pl.name}"`, type: 'success', autoClose: 3000 });
 }
 
 // ─── UPnP / DLNA Browser ─────────────────────────────────────────────────────
+
+const upnpToTrack = (t) => ({
+  id: 'upnp:' + (t.id || t.url),
+  path: t.url,
+  title: t.title || '',
+  artist: t.artist || '',
+  album: t.album || '',
+  duration: Number(t.duration) || 0,
+  cover_path: t.albumArt || null,
+});
+
+const upnpToLibraryItem = (t) => ({
+  path: t.url,
+  remote: true,
+  title: t.title || undefined,
+  artist: t.artist || undefined,
+  album: t.album || undefined,
+  duration: Number(t.duration) || undefined,
+  coverUrl: t.albumArt || undefined,
+  sampleRate: t.sampleRate || undefined,
+  bitDepth: t.bitDepth || undefined,
+  channels: t.channels || undefined,
+});
 
 function renderUpnpServers(servers) {
   const list = document.getElementById('upnp-servers-list');
   if (!list) return;
   if (!servers || !servers.length) {
-    list.innerHTML = '<div class="net-empty-hint">No servers found on network</div>';
+    netShowMessage(list, 'No servers found on network');
     return;
   }
   list.innerHTML = '';
-  servers.forEach(s => {
+  servers.forEach((s) => {
     const item = document.createElement('div');
     item.className = 'net-server-item' + (s.usn === upnpSelectedUsn ? ' active' : '');
     item.dataset.usn = s.usn;
@@ -4841,11 +5433,24 @@ function renderUpnpServers(servers) {
     icon.textContent = 'dns';
     const name = document.createElement('span');
     name.textContent = s.friendlyName || s.usn;
-    name.style.overflow = 'hidden';
-    name.style.textOverflow = 'ellipsis';
-    name.style.whiteSpace = 'nowrap';
+    name.style.cssText = 'flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap';
     item.appendChild(icon);
     item.appendChild(name);
+    if (s.manual) {
+      const actions = document.createElement('div');
+      actions.className = 'net-server-item-actions';
+      actions.appendChild(netIconButton('delete', 'Remove server', async () => {
+        await electron.upnpRemoveServer({ usn: s.usn });
+        upnpServers = upnpServers.filter((x) => x.usn !== s.usn);
+        if (upnpSelectedUsn === s.usn) {
+          upnpSelectedUsn = null;
+          const fb = document.getElementById('upnp-filebrowser');
+          if (fb) netShowMessage(fb, 'Select a server to browse');
+        }
+        renderUpnpServers(upnpServers);
+      }, { danger: true, size: 16 }));
+      item.appendChild(actions);
+    }
     item.onclick = () => {
       upnpSelectedUsn = s.usn;
       upnpBreadcrumb = [{ id: '0', name: s.friendlyName || 'Root' }];
@@ -4856,26 +5461,55 @@ function renderUpnpServers(servers) {
   });
 }
 
+let upnpBrowseToken = 0;
+
 async function browseUpnp(usn, objectId) {
   const fb = document.getElementById('upnp-filebrowser');
   if (!fb) return;
-  fb.innerHTML = '<div class="net-loading">Loading…</div>';
+  const token = ++upnpBrowseToken;
+  netShowMessage(fb, 'Loading…', 'net-loading');
   try {
     const items = await electron.upnpBrowse({ usn, objectId });
-    renderUpnpItems(fb, usn, items);
+    if (token !== upnpBrowseToken) return; // a newer navigation won
+    renderUpnpItems(fb, usn, items, { objectId });
+    if (searchInputEl && searchInputEl.value.trim()) applyNetFilter('upnp', searchInputEl.value);
   } catch (err) {
-    fb.innerHTML = `<div class="net-empty-hint">Error: ${err && err.message ? err.message : err}</div>`;
+    if (token !== upnpBrowseToken) return;
+    netShowMessage(fb, `Error: ${netErrorText(err)}`);
   }
 }
 
-function renderUpnpItems(fb, usn, items) {
+async function searchUpnp(query) {
+  const fb = document.getElementById('upnp-filebrowser');
+  const q = String(query || '').trim();
+  if (!fb || !q) return;
+  if (!upnpSelectedUsn) { netNotify('Select a server first', 'info'); return; }
+  const usn = upnpSelectedUsn;
+  const token = ++upnpBrowseToken;
+  netShowMessage(fb, `Searching for "${q}"…`, 'net-loading');
+  try {
+    const items = await electron.upnpSearch({ usn, query: q });
+    if (token !== upnpBrowseToken) return;
+    const root = upnpBreadcrumb[0] || { id: '0', name: 'Root' };
+    upnpBreadcrumb = [root, { id: null, name: `Search: ${q}` }];
+    renderUpnpItems(fb, usn, items, { objectId: null, emptyText: `No results for "${q}"` });
+  } catch (err) {
+    if (token !== upnpBrowseToken) return;
+    // Not every server implements Search; fall back to filtering what is on screen.
+    netNotify(`This server cannot search (${netErrorText(err)}) — filtering the current folder instead`, 'info', 4500);
+    const last = upnpBreadcrumb[upnpBreadcrumb.length - 1];
+    await browseUpnp(usn, (last && last.id) || '0');
+  }
+}
+
+function renderUpnpItems(fb, usn, items, { objectId = null, emptyText = 'Empty folder' } = {}) {
   fb.innerHTML = '';
 
   const breadEl = document.createElement('div');
   breadEl.className = 'net-breadcrumb';
   renderNetBreadcrumb(breadEl, upnpBreadcrumb, (idx) => {
     upnpBreadcrumb = upnpBreadcrumb.slice(0, idx + 1);
-    browseUpnp(usn, upnpBreadcrumb[upnpBreadcrumb.length - 1].id);
+    browseUpnp(usn, upnpBreadcrumb[upnpBreadcrumb.length - 1].id || '0');
   });
   fb.appendChild(breadEl);
 
@@ -4883,20 +5517,44 @@ function renderUpnpItems(fb, usn, items) {
   fileList.className = 'net-file-list';
 
   if (!items || !items.length) {
-    fileList.innerHTML = '<div class="net-empty-hint">Empty folder</div>';
+    netShowMessage(fileList, emptyText);
     fb.appendChild(fileList);
     return;
   }
 
-  const trackItems = items.filter(it => it.type === 'track');
+  const trackItems = items.filter((it) => it.type === 'track');
+  const hasFolders = items.some((it) => it.type === 'container');
+  const playList = trackItems.map(upnpToTrack);
 
-  items.forEach(it => {
+  const toolbar = document.createElement('div');
+  toolbar.className = 'net-folder-toolbar';
+  if (trackItems.length) {
+    toolbar.appendChild(netToolbarButton('play_arrow', 'Play all', async () => {
+      await startPlayback(playList[0], playList, { type: 'upnp', key: usn });
+    }));
+    toolbar.appendChild(netToolbarButton('library_add', 'Add all to library', () =>
+      addNetworkItemsToLibrary(trackItems.map(upnpToLibraryItem))));
+    toolbar.appendChild(netToolbarButton('playlist_add', 'Add all to playlist', () =>
+      addNetworkItemsToPlaylist(trackItems.map(upnpToLibraryItem))));
+  }
+  if (hasFolders && objectId != null) {
+    toolbar.appendChild(netToolbarButton('create_new_folder', 'Add folder + subfolders to library', async () => {
+      netNotify('Scanning server folders…', 'info', 6000);
+      const all = await electron.upnpListRecursive({ usn, objectId });
+      await addNetworkItemsToLibrary((all || []).map(upnpToLibraryItem));
+    }));
+  }
+  if (toolbar.childElementCount) fb.appendChild(toolbar);
+
+  items.forEach((it) => {
+    const isFolder = it.type === 'container';
     const row = document.createElement('div');
-    row.className = 'net-file-item ' + (it.type === 'container' ? 'is-folder' : 'is-track');
+    row.className = 'net-file-item ' + (isFolder ? 'is-folder' : 'is-track');
+    row.dataset.search = normalizeForCompare([it.title, it.artist, it.album].filter(Boolean).join(' '));
 
     const icon = document.createElement('span');
     icon.className = 'material-icons';
-    icon.textContent = it.type === 'container' ? 'folder' : 'audio_file';
+    icon.textContent = isFolder ? 'folder' : 'audio_file';
 
     const meta = document.createElement('div');
     meta.className = 'net-file-item-meta';
@@ -4905,7 +5563,7 @@ function renderUpnpItems(fb, usn, items) {
     nameEl.textContent = it.title || it.name || '(untitled)';
     meta.appendChild(nameEl);
 
-    if (it.type === 'track' && (it.artist || it.album)) {
+    if (!isFolder && (it.artist || it.album)) {
       const sub = document.createElement('div');
       sub.className = 'net-file-item-sub';
       sub.textContent = [it.artist, it.album].filter(Boolean).join(' · ');
@@ -4915,112 +5573,100 @@ function renderUpnpItems(fb, usn, items) {
     row.appendChild(icon);
     row.appendChild(meta);
 
-    if (it.type === 'track') {
-      if (it.duration) {
+    if (isFolder) {
+      const actions = document.createElement('div');
+      actions.className = 'net-file-item-actions';
+      actions.appendChild(netIconButton('library_add', 'Add this folder (with subfolders) to library', async () => {
+        try {
+          netNotify(`Scanning "${it.title}"…`, 'info', 6000);
+          const all = await electron.upnpListRecursive({ usn, objectId: it.id });
+          await addNetworkItemsToLibrary((all || []).map(upnpToLibraryItem));
+        } catch (err) { netNotify(netErrorText(err), 'error', 4000); }
+      }));
+      row.appendChild(actions);
+      row.onclick = () => {
+        // Leaving search results: restart the trail from the server root.
+        const trail = upnpBreadcrumb.filter((c) => c.id != null);
+        upnpBreadcrumb = [...trail, { id: it.id, name: it.title || it.name || 'Folder' }];
+        browseUpnp(usn, it.id);
+      };
+    } else {
+      const durText = netFormatDuration(it.duration);
+      if (durText) {
         const dur = document.createElement('div');
         dur.className = 'net-file-item-duration';
-        dur.textContent = netFormatDuration(it.duration);
+        dur.textContent = durText;
         row.appendChild(dur);
       }
 
+      const play = () => startPlayback(upnpToTrack(it), playList, { type: 'upnp', key: usn });
       const actions = document.createElement('div');
       actions.className = 'net-file-item-actions';
-
-      const playBtn = document.createElement('button');
-      playBtn.title = 'Play';
-      playBtn.innerHTML = '<span class="material-icons">play_circle</span>';
-      const makeUpnpTrack = (t) => ({
-        id: 'upnp:' + t.id, path: t.url,
-        title: t.title || '', artist: t.artist || '', album: t.album || '', duration: 0,
-      });
-      playBtn.onclick = (e) => {
-        e.stopPropagation();
-        startPlayback(makeUpnpTrack(it), trackItems.map(makeUpnpTrack), { type: 'upnp', key: usn });
-      };
-
-      const libBtn = document.createElement('button');
-      libBtn.title = 'Add to library';
-      libBtn.innerHTML = '<span class="material-icons">library_add</span>';
-      libBtn.onclick = async (e) => {
-        e.stopPropagation();
-        try {
-          const result = await electron.addRemote({ url: it.url, title: it.title || '', artist: it.artist || '', album: it.album || '' });
-          if (result?.success) {
-            NotificationCenter.show({ message: `Added "${it.title || it.url}" to library`, type: 'success', autoClose: 2500 });
-          } else {
-            NotificationCenter.show({ message: 'Failed to add to library', type: 'error', autoClose: 3000 });
-          }
-        } catch (err) {
-          NotificationCenter.show({ message: String(err?.message || err), type: 'error', autoClose: 3000 });
-        }
-      };
-
-      const plBtn = document.createElement('button');
-      plBtn.title = 'Add to playlist';
-      plBtn.innerHTML = '<span class="material-icons">playlist_add</span>';
-      plBtn.onclick = (e) => {
-        e.stopPropagation();
-        addNetworkTrackToPlaylist({ url: it.url, title: it.title || '', artist: it.artist || '', album: it.album || '' });
-      };
-
-      actions.appendChild(playBtn);
-      actions.appendChild(libBtn);
-      actions.appendChild(plBtn);
+      actions.appendChild(netIconButton('play_circle', 'Play', play));
+      actions.appendChild(netIconButton('library_add', 'Add to library', async () => {
+        try { await addNetworkItemsToLibrary([upnpToLibraryItem(it)], it.title); }
+        catch (err) { netNotify(netErrorText(err), 'error', 4000); }
+      }));
+      actions.appendChild(netIconButton('playlist_add', 'Add to playlist', () =>
+        addNetworkItemsToPlaylist([upnpToLibraryItem(it)])));
       row.appendChild(actions);
-
-      row.ondblclick = () => playBtn.onclick(new MouseEvent('click'));
-    } else {
-      row.onclick = () => {
-        upnpBreadcrumb = [...upnpBreadcrumb, { id: it.id, name: it.title || it.name }];
-        browseUpnp(usn, it.id);
-      };
+      row.ondblclick = play;
     }
 
     fileList.appendChild(row);
   });
 
-  // Toolbar: add all tracks in this folder to playlist
-  if (trackItems.length > 0) {
-    const toolbar = document.createElement('div');
-    toolbar.className = 'net-folder-toolbar';
-    const addAllBtn = document.createElement('button');
-    addAllBtn.className = 'btn-secondary';
-    addAllBtn.innerHTML = '<span class="material-icons" style="font-size:16px;vertical-align:middle;margin-right:4px">playlist_add</span>Add all to playlist';
-    addAllBtn.onclick = () => {
-      addNetworkTracksToPlaylist(trackItems.map(t => ({
-        url: t.url, title: t.title || '', artist: t.artist || '', album: t.album || '',
-      })));
-    };
-    toolbar.appendChild(addAllBtn);
-    fb.appendChild(toolbar);
-  }
-
   fb.appendChild(fileList);
 }
 
-async function loadUpnpView() {
+function setUpnpStatus(text) {
   const statusEl = document.getElementById('upnp-status');
+  if (statusEl) statusEl.textContent = text;
+}
+
+async function loadUpnpView() {
   const scanBtn = document.getElementById('btn-upnp-scan');
 
   if (scanBtn && !scanBtn._bound) {
     scanBtn._bound = true;
     scanBtn.onclick = async () => {
-      if (statusEl) statusEl.textContent = 'Scanning…';
+      setUpnpStatus('Scanning…');
       scanBtn.disabled = true;
       try {
-        const servers = await electron.upnpScan();
-        upnpServers = servers || [];
+        upnpServers = (await electron.upnpScan()) || [];
         renderUpnpServers(upnpServers);
-        if (statusEl) statusEl.textContent = upnpServers.length
+        setUpnpStatus(upnpServers.length
           ? `${upnpServers.length} server${upnpServers.length !== 1 ? 's' : ''} found`
-          : 'No servers found';
+          : 'No servers found — check that the server is on and Windows Firewall allows Spectra, or add it by URL');
       } catch (err) {
-        if (statusEl) statusEl.textContent = 'Scan failed';
+        setUpnpStatus(`Scan failed: ${netErrorText(err)}`);
         console.error('[upnp] scan error', err);
       } finally {
         scanBtn.disabled = false;
       }
     };
+
+    // "Add by URL" for networks where multicast discovery is blocked.
+    const addBtn = document.createElement('button');
+    addBtn.id = 'btn-upnp-add';
+    addBtn.className = 'btn-secondary';
+    addBtn.title = 'Add a server by its device description URL';
+    addBtn.textContent = 'Add by URL';
+    addBtn.onclick = async () => {
+      const url = await customPrompt('Server description URL (e.g. http://192.168.1.10:8200/rootDesc.xml):');
+      if (!url || !url.trim()) return;
+      setUpnpStatus('Connecting…');
+      try {
+        const server = await electron.upnpAddServer({ location: url.trim() });
+        upnpServers = (await electron.upnpGetServers()) || [server];
+        renderUpnpServers(upnpServers);
+        setUpnpStatus(`Added ${server.friendlyName || 'server'}`);
+      } catch (err) {
+        setUpnpStatus('');
+        netNotify(`Could not add server: ${netErrorText(err)}`, 'error', 5000);
+      }
+    };
+    scanBtn.insertAdjacentElement('afterend', addBtn);
   }
 
   if (!upnpServers.length) {
@@ -5028,28 +5674,48 @@ async function loadUpnpView() {
       const cached = await electron.upnpGetServers();
       if (cached && cached.length) {
         upnpServers = cached;
-        renderUpnpServers(upnpServers);
-        if (statusEl) statusEl.textContent = `${upnpServers.length} server${upnpServers.length !== 1 ? 's' : ''} (cached)`;
+        setUpnpStatus(`${upnpServers.length} server${upnpServers.length !== 1 ? 's' : ''}`);
       }
-    } catch {}
-  } else {
-    renderUpnpServers(upnpServers);
+    } catch (err) {
+      setUpnpStatus(/No handler registered/i.test(String(err))
+        ? 'UPnP plugin is not running — enable it in Settings → Plugins'
+        : `Unavailable: ${netErrorText(err)}`);
+    }
   }
+  renderUpnpServers(upnpServers);
 }
 
 // ─── NAS / Network Storage Browser ───────────────────────────────────────────
+
+const nasShareIsRemote = (shareId) => nasShares.find((s) => s.id === shareId)?.type === 'webdav';
+const nasTitle = (name) => String(name || '').replace(/\.[^.]+$/, '');
+
+const nasToTrack = (t) => ({
+  id: 'nas:' + t.path,
+  path: t.path,
+  title: nasTitle(t.name),
+  artist: '',
+  album: '',
+  duration: 0,
+});
+
+const nasToLibraryItem = (shareId) => {
+  const remote = nasShareIsRemote(shareId);
+  return (t) => (remote ? { path: t.path, remote: true } : { path: t.path, remote: false });
+};
 
 function renderNasShares(shares) {
   const list = document.getElementById('nas-shares-list');
   if (!list) return;
   if (!shares || !shares.length) {
-    list.innerHTML = '<div class="net-empty-hint">No shares configured</div>';
+    netShowMessage(list, 'No shares yet — click "Add Share"');
     return;
   }
   list.innerHTML = '';
-  shares.forEach(s => {
+  shares.forEach((s) => {
     const item = document.createElement('div');
     item.className = 'net-server-item' + (s.id === nasSelectedShareId ? ' active' : '');
+    item.title = s.url || s.path || '';
 
     const icon = document.createElement('span');
     icon.className = 'material-icons';
@@ -5057,10 +5723,7 @@ function renderNasShares(shares) {
 
     const name = document.createElement('span');
     name.textContent = s.name;
-    name.style.flex = '1';
-    name.style.overflow = 'hidden';
-    name.style.textOverflow = 'ellipsis';
-    name.style.whiteSpace = 'nowrap';
+    name.style.cssText = 'flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap';
 
     const badge = document.createElement('span');
     badge.className = 'net-share-type-badge';
@@ -5068,78 +5731,76 @@ function renderNasShares(shares) {
 
     const actions = document.createElement('div');
     actions.className = 'net-server-item-actions';
-
-    const editBtn = document.createElement('button');
-    editBtn.title = 'Edit share';
-    editBtn.innerHTML = '<span class="material-icons" style="font-size:16px">edit</span>';
-    editBtn.onclick = (e) => {
-      e.stopPropagation();
-      if (showNasModal) showNasModal(s);
-    };
-
-    const testBtn = document.createElement('button');
-    testBtn.title = 'Test connection';
-    testBtn.innerHTML = '<span class="material-icons" style="font-size:16px">wifi_tethering</span>';
-    testBtn.onclick = async (e) => {
-      e.stopPropagation();
+    actions.appendChild(netIconButton('edit', 'Edit share', () => { if (showNasModal) showNasModal(s); }, { size: 16 }));
+    actions.appendChild(netIconButton('wifi_tethering', 'Test connection', async () => {
       try {
         const res = await electron.nasTestShare({ shareId: s.id });
-        NotificationCenter.show({ message: res.message, type: res.ok ? 'success' : 'error', autoClose: 3000 });
+        netNotify(res.message, res.ok ? 'success' : 'error', 4000);
       } catch (err) {
-        NotificationCenter.show({ message: String(err && err.message ? err.message : err), type: 'error', autoClose: 3000 });
+        netNotify(netErrorText(err), 'error', 4000);
       }
-    };
-
-    const removeBtn = document.createElement('button');
-    removeBtn.className = 'danger';
-    removeBtn.title = 'Remove share';
-    removeBtn.innerHTML = '<span class="material-icons" style="font-size:16px">delete</span>';
-    removeBtn.onclick = async (e) => {
-      e.stopPropagation();
-      if (!confirm(`Remove share "${s.name}"?`)) return;
+    }, { size: 16 }));
+    actions.appendChild(netIconButton('delete', 'Remove share', async () => {
+      const ok = await customConfirm(`Remove share "${s.name}"? Tracks already added to the library stay there.`, {
+        title: 'Remove share', confirmLabel: 'Remove',
+      });
+      if (!ok) return;
       try {
         await electron.nasRemoveShare({ shareId: s.id });
         if (nasSelectedShareId === s.id) {
           nasSelectedShareId = null;
           nasBreadcrumb = [];
           const fb = document.getElementById('nas-filebrowser');
-          if (fb) fb.innerHTML = '<div class="net-empty-hint">Select a share to browse</div>';
+          if (fb) netShowMessage(fb, 'Select a share to browse');
         }
         await loadNasView();
       } catch (err) {
-        NotificationCenter.show({ message: String(err && err.message ? err.message : err), type: 'error', autoClose: 3000 });
+        netNotify(netErrorText(err), 'error', 4000);
       }
-    };
-
-    actions.appendChild(editBtn);
-    actions.appendChild(testBtn);
-    actions.appendChild(removeBtn);
+    }, { danger: true, size: 16 }));
 
     item.appendChild(icon);
     item.appendChild(name);
     item.appendChild(badge);
     item.appendChild(actions);
-
-    item.onclick = () => {
-      nasSelectedShareId = s.id;
-      nasBreadcrumb = [{ path: null, name: s.name }];
-      renderNasShares(nasShares);
-      browseNas(s.id, null);
-    };
-
+    item.onclick = () => openNasShare(s);
     list.appendChild(item);
   });
 }
 
+function openNasShare(share) {
+  nasSelectedShareId = share.id;
+  nasBreadcrumb = [{ path: null, name: share.name }];
+  renderNasShares(nasShares);
+  browseNas(share.id, null);
+}
+
+let nasBrowseToken = 0;
+
 async function browseNas(shareId, subPath) {
   const fb = document.getElementById('nas-filebrowser');
   if (!fb) return;
-  fb.innerHTML = '<div class="net-loading">Loading…</div>';
+  const token = ++nasBrowseToken;
+  netShowMessage(fb, 'Loading…', 'net-loading');
   try {
     const items = await electron.nasBrowse({ shareId, subPath });
+    if (token !== nasBrowseToken) return;
     renderNasItems(fb, shareId, subPath, items);
+    if (searchInputEl && searchInputEl.value.trim()) applyNetFilter('nas', searchInputEl.value);
   } catch (err) {
-    fb.innerHTML = `<div class="net-empty-hint">Error: ${err && err.message ? err.message : err}</div>`;
+    if (token !== nasBrowseToken) return;
+    fb.innerHTML = '';
+    const breadEl = document.createElement('div');
+    breadEl.className = 'net-breadcrumb';
+    renderNetBreadcrumb(breadEl, nasBreadcrumb, (idx) => {
+      nasBreadcrumb = nasBreadcrumb.slice(0, idx + 1);
+      browseNas(shareId, nasBreadcrumb[nasBreadcrumb.length - 1].path);
+    });
+    fb.appendChild(breadEl);
+    const msg = document.createElement('div');
+    msg.className = 'net-empty-hint';
+    msg.textContent = `Could not open this location: ${netErrorText(err)}`;
+    fb.appendChild(msg);
   }
 }
 
@@ -5154,24 +5815,59 @@ function renderNasItems(fb, shareId, currentPath, items) {
   });
   fb.appendChild(breadEl);
 
+  const toLibraryItem = nasToLibraryItem(shareId);
+  const remote = nasShareIsRemote(shareId);
+  const trackItems = (items || []).filter((it) => it.type === 'file');
+  const playList = trackItems.map(nasToTrack);
+
+  // Add a whole folder (with subfolders): local/SMB folders go through the
+  // normal folder import; WebDAV folders are listed recursively on the server.
+  const addFolderToLibrary = async (folderPath, label) => {
+    if (!remote) {
+      const target = folderPath || nasShares.find((s) => s.id === shareId)?.path;
+      if (!target) throw new Error('Share has no path');
+      const res = await electron.addFiles([target]);
+      await refreshLibraryCaches();
+      netNotify(res && res.count ? `${res.count} tracks added from "${label}"` : `No audio files found in "${label}"`, res && res.count ? 'success' : 'info');
+      return;
+    }
+    netNotify(`Scanning "${label}"…`, 'info', 6000);
+    const all = await electron.nasListRecursive({ shareId, subPath: folderPath });
+    await addNetworkItemsToLibrary((all || []).map(toLibraryItem));
+  };
+
+  const currentLabel = nasBreadcrumb[nasBreadcrumb.length - 1]?.name || 'folder';
+  const toolbar = document.createElement('div');
+  toolbar.className = 'net-folder-toolbar';
+  if (trackItems.length) {
+    toolbar.appendChild(netToolbarButton('play_arrow', 'Play all', async () => {
+      await startPlayback(playList[0], playList, { type: 'nas', key: shareId });
+    }));
+    toolbar.appendChild(netToolbarButton('playlist_add', 'Add all to playlist', () =>
+      addNetworkItemsToPlaylist(trackItems.map(toLibraryItem))));
+  }
+  toolbar.appendChild(netToolbarButton('library_add', 'Add this folder to library', () =>
+    addFolderToLibrary(currentPath, currentLabel)));
+  fb.appendChild(toolbar);
+
   const fileList = document.createElement('div');
   fileList.className = 'net-file-list';
 
   if (!items || !items.length) {
-    fileList.innerHTML = '<div class="net-empty-hint">Empty folder</div>';
+    netShowMessage(fileList, 'No folders or audio files here');
     fb.appendChild(fileList);
     return;
   }
 
-  const trackItems = items.filter(it => it.type === 'file');
-
-  items.forEach(it => {
+  items.forEach((it) => {
+    const isFolder = it.type === 'directory';
     const row = document.createElement('div');
-    row.className = 'net-file-item ' + (it.type === 'directory' ? 'is-folder' : 'is-track');
+    row.className = 'net-file-item ' + (isFolder ? 'is-folder' : 'is-track');
+    row.dataset.search = normalizeForCompare(it.name);
 
     const icon = document.createElement('span');
     icon.className = 'material-icons';
-    icon.textContent = it.type === 'directory' ? 'folder' : 'audio_file';
+    icon.textContent = isFolder ? 'folder' : 'audio_file';
 
     const meta = document.createElement('div');
     meta.className = 'net-file-item-meta';
@@ -5183,104 +5879,51 @@ function renderNasItems(fb, shareId, currentPath, items) {
     row.appendChild(icon);
     row.appendChild(meta);
 
-    if (it.type === 'file') {
-      const actions = document.createElement('div');
-      actions.className = 'net-file-item-actions';
+    const actions = document.createElement('div');
+    actions.className = 'net-file-item-actions';
 
-      const playBtn = document.createElement('button');
-      playBtn.title = 'Play';
-      playBtn.innerHTML = '<span class="material-icons">play_circle</span>';
-      playBtn.onclick = (e) => {
-        e.stopPropagation();
-        const track = {
-          id: 'nas:' + it.path,
-          path: it.path,
-          title: it.name.replace(/\.[^.]+$/, ''),
-          artist: '',
-          album: '',
-          duration: 0,
-        };
-        startPlayback(track, trackItems.map(t => ({
-          id: 'nas:' + t.path,
-          path: t.path,
-          title: t.name.replace(/\.[^.]+$/, ''),
-          artist: '',
-          album: '',
-          duration: 0,
-        })), { type: 'nas', key: shareId });
-      };
-
-      const share = nasShares.find(s => s.id === shareId);
-      const isWebDav = share?.type === 'webdav';
-      const trackTitle = it.name.replace(/\.[^.]+$/, '');
-
-      const addLibBtn = document.createElement('button');
-      addLibBtn.title = 'Add to library';
-      addLibBtn.innerHTML = '<span class="material-icons">library_add</span>';
-      addLibBtn.onclick = async (e) => {
-        e.stopPropagation();
-        try {
-          if (isWebDav) {
-            const result = await electron.addRemote({ url: it.path, title: trackTitle });
-            if (!result?.success) throw new Error('Failed');
-          } else {
-            await electron.addFiles([it.path]);
-          }
-          NotificationCenter.show({ message: `Added "${it.name}" to library`, type: 'success', autoClose: 2500 });
-        } catch (err) {
-          NotificationCenter.show({ message: String(err?.message || err), type: 'error', autoClose: 3000 });
-        }
-      };
-
-      const plBtn = document.createElement('button');
-      plBtn.title = 'Add to playlist';
-      plBtn.innerHTML = '<span class="material-icons">playlist_add</span>';
-      plBtn.onclick = (e) => {
-        e.stopPropagation();
-        addNetworkTrackToPlaylist({ url: it.path, title: trackTitle });
-      };
-
-      actions.appendChild(playBtn);
-      actions.appendChild(addLibBtn);
-      actions.appendChild(plBtn);
+    if (isFolder) {
+      actions.appendChild(netIconButton('library_add', 'Add this folder (with subfolders) to library', async () => {
+        try { await addFolderToLibrary(it.path, it.name); }
+        catch (err) { netNotify(netErrorText(err), 'error', 4000); }
+      }));
       row.appendChild(actions);
-      row.ondblclick = () => playBtn.onclick(new MouseEvent('click'));
-    } else {
       row.onclick = () => {
         nasBreadcrumb = [...nasBreadcrumb, { path: it.path, name: it.name }];
         browseNas(shareId, it.path);
       };
+    } else {
+      const play = () => startPlayback(nasToTrack(it), playList, { type: 'nas', key: shareId });
+      actions.appendChild(netIconButton('play_circle', 'Play', play));
+      actions.appendChild(netIconButton('library_add', 'Add to library', async () => {
+        try { await addNetworkItemsToLibrary([toLibraryItem(it)], nasTitle(it.name)); }
+        catch (err) { netNotify(netErrorText(err), 'error', 4000); }
+      }));
+      actions.appendChild(netIconButton('playlist_add', 'Add to playlist', () =>
+        addNetworkItemsToPlaylist([toLibraryItem(it)])));
+      row.appendChild(actions);
+      row.ondblclick = play;
     }
 
     fileList.appendChild(row);
   });
-
-  // Toolbar: add all tracks in this folder to playlist
-  if (trackItems.length > 0) {
-    const toolbar = document.createElement('div');
-    toolbar.className = 'net-folder-toolbar';
-    const addAllBtn = document.createElement('button');
-    addAllBtn.className = 'btn-secondary';
-    addAllBtn.innerHTML = '<span class="material-icons" style="font-size:16px;vertical-align:middle;margin-right:4px">playlist_add</span>Add all to playlist';
-    addAllBtn.onclick = () => {
-      addNetworkTracksToPlaylist(trackItems.map(t => ({
-        url: t.path, title: t.name.replace(/\.[^.]+$/, ''),
-      })));
-    };
-    toolbar.appendChild(addAllBtn);
-    fb.appendChild(toolbar);
-  }
 
   fb.appendChild(fileList);
 }
 
 async function loadNasView() {
   try {
-    nasShares = await electron.nasListShares() || [];
-  } catch {
+    nasShares = (await electron.nasListShares()) || [];
+    renderNasShares(nasShares);
+  } catch (err) {
     nasShares = [];
+    const list = document.getElementById('nas-shares-list');
+    if (list) {
+      netShowMessage(list, /No handler registered/i.test(String(err))
+        ? 'Network Storage plugin is not running — enable it in Settings → Plugins'
+        : `Unavailable: ${netErrorText(err)}`);
+    }
   }
-  renderNasShares(nasShares);
 }
 
 function initNasModal() {
@@ -5293,70 +5936,142 @@ function initNasModal() {
   const urlGroup = document.getElementById('nas-url-group');
   const pathGroup = document.getElementById('nas-path-group');
   const credsGroup = document.getElementById('nas-creds-group');
+  const nameInput = document.getElementById('nas-share-name');
+  const urlInput = document.getElementById('nas-share-url');
+  const pathInput = document.getElementById('nas-share-path');
+  const userInput = document.getElementById('nas-share-user');
+  const passInput = document.getElementById('nas-share-pass');
 
-  if (!modal) return;
+  if (!modal || !typeSelect || !saveBtn) return;
 
   let editShareId = null;
+
+  // Inline status line + Test button (created once).
+  let statusEl = modal.querySelector('.nas-modal-status');
+  if (!statusEl) {
+    statusEl = document.createElement('div');
+    statusEl.className = 'nas-modal-status';
+    statusEl.style.cssText = 'min-height:18px;font-size:12px;margin:6px 0 2px;white-space:pre-wrap';
+    saveBtn.parentElement.insertAdjacentElement('beforebegin', statusEl);
+  }
+  let testBtn = document.getElementById('btn-nas-modal-test');
+  if (!testBtn) {
+    testBtn = document.createElement('button');
+    testBtn.id = 'btn-nas-modal-test';
+    testBtn.className = 'btn-text';
+    testBtn.textContent = 'Test';
+    saveBtn.insertAdjacentElement('beforebegin', testBtn);
+  }
+
+  const setStatus = (text, kind = '') => {
+    statusEl.textContent = text || '';
+    statusEl.style.color = kind === 'error' ? '#ff6b6b' : kind === 'ok' ? '#51cf66' : '';
+  };
 
   const updateTypeVisibility = () => {
     const t = typeSelect.value;
     urlGroup.style.display = t === 'webdav' ? '' : 'none';
     pathGroup.style.display = t !== 'webdav' ? '' : 'none';
-    credsGroup.style.display = ''; // credentials available for all share types
+    if (credsGroup) credsGroup.style.display = t === 'local' || t === 'nfs' ? 'none' : '';
   };
 
   // Exposed so renderNasShares can open modal in edit mode
   showNasModal = (existingShare = null) => {
     editShareId = existingShare?.id || null;
     if (modalTitle) modalTitle.textContent = editShareId ? 'Edit Share' : 'Add Share';
-    document.getElementById('nas-share-name').value = existingShare?.name || '';
-    document.getElementById('nas-share-url').value = existingShare?.url || '';
-    document.getElementById('nas-share-path').value = existingShare?.path || '';
-    document.getElementById('nas-share-user').value = existingShare?.credentials?.username || '';
-    document.getElementById('nas-share-pass').value = existingShare?.credentials?.password || '';
-    typeSelect.value = existingShare?.type || 'webdav';
+    nameInput.value = existingShare?.name || '';
+    urlInput.value = existingShare?.url || '';
+    pathInput.value = existingShare?.path || '';
+    userInput.value = existingShare?.credentials?.username || '';
+    passInput.value = '';
+    passInput.placeholder = existingShare?.credentials?.hasPassword ? '(unchanged)' : '';
+    const wanted = existingShare?.type || 'webdav';
+    typeSelect.value = Array.from(typeSelect.options).some((o) => o.value === wanted) ? wanted : typeSelect.options[0]?.value;
     updateTypeVisibility();
+    setStatus('');
     modal.style.display = 'flex';
+    setTimeout(() => nameInput.focus(), 0);
   };
 
   const hideModal = () => { modal.style.display = 'none'; editShareId = null; };
 
+  // Read + validate the form. Returns null (and shows why) when incomplete.
+  const readForm = () => {
+    const type = typeSelect.value;
+    const url = urlInput.value.trim();
+    const sharePath = pathInput.value.trim();
+    const user = userInput.value.trim();
+    const pass = passInput.value;
+    let name = nameInput.value.trim();
+
+    if (type === 'webdav' && !url) { setStatus('Enter the WebDAV URL, e.g. http://192.168.1.10:5005/music', 'error'); urlInput.focus(); return null; }
+    if (type !== 'webdav' && !sharePath) { setStatus('Enter the path, e.g. \\\\server\\share or /mnt/nas', 'error'); pathInput.focus(); return null; }
+    if (!name) {
+      // A missing name should not block saving: derive one.
+      name = type === 'webdav'
+        ? url.replace(/^[a-z]+:\/\//i, '').split(/[/?#]/)[0]
+        : sharePath.replace(/[\\/]+$/, '').split(/[\\/]/).filter(Boolean).pop() || sharePath;
+      nameInput.value = name;
+    }
+
+    const usesCreds = type === 'webdav' || type === 'smb';
+    return {
+      id: editShareId || ('nas-' + Date.now()),
+      name,
+      type,
+      ...(type === 'webdav' ? { url } : { path: sharePath }),
+      ...(usesCreds && (user || pass) ? { credentials: { username: user, password: pass } } : {}),
+    };
+  };
+
   if (addBtn) addBtn.onclick = () => showNasModal(null);
   if (cancelBtn) cancelBtn.onclick = hideModal;
-  modal.onclick = (e) => { if (e.target === modal) hideModal(); };
+  // Close only when the press started on the backdrop, so selecting text in a
+  // field and releasing outside the dialog does not discard the form.
+  let pressedOnBackdrop = false;
+  modal.onmousedown = (e) => { pressedOnBackdrop = e.target === modal; };
+  modal.onclick = (e) => { if (e.target === modal && pressedOnBackdrop) hideModal(); };
+  modal.onkeydown = (e) => {
+    if (e.key === 'Escape') hideModal();
+    else if (e.key === 'Enter' && e.target.tagName === 'INPUT') saveBtn.click();
+  };
 
-  if (typeSelect) typeSelect.onchange = updateTypeVisibility;
+  typeSelect.onchange = () => { updateTypeVisibility(); setStatus(''); };
 
-  if (saveBtn) {
-    saveBtn.onclick = async () => {
-      const name = document.getElementById('nas-share-name').value.trim();
-      const type = typeSelect.value;
-      const url = document.getElementById('nas-share-url').value.trim();
-      const sharePath = document.getElementById('nas-share-path').value.trim();
-      const user = document.getElementById('nas-share-user').value.trim();
-      const pass = document.getElementById('nas-share-pass').value;
+  testBtn.onclick = async () => {
+    const share = readForm();
+    if (!share) return;
+    testBtn.disabled = true;
+    setStatus('Testing…');
+    try {
+      const res = await electron.nasTestShare({ shareId: editShareId, share });
+      setStatus(res.message, res.ok ? 'ok' : 'error');
+    } catch (err) {
+      setStatus(netErrorText(err), 'error');
+    } finally {
+      testBtn.disabled = false;
+    }
+  };
 
-      if (!name) { alert('Name is required'); return; }
-      if (type === 'webdav' && !url) { alert('URL is required for WebDAV'); return; }
-      if (type !== 'webdav' && !sharePath) { alert('Path is required'); return; }
-
-      const share = {
-        id: editShareId || ('nas-' + Date.now()),
-        name,
-        type,
-        ...(type === 'webdav' ? { url } : { path: sharePath }),
-        ...((user || pass) ? { credentials: { username: user, password: pass } } : {}),
-      };
-
-      try {
-        await electron.nasAddShare(share);
-        hideModal();
-        await loadNasView();
-      } catch (err) {
-        alert('Failed to save share: ' + (err && err.message ? err.message : err));
-      }
-    };
-  }
+  saveBtn.onclick = async () => {
+    const share = readForm();
+    if (!share) return;
+    saveBtn.disabled = true;
+    try {
+      const res = await electron.nasAddShare(share);
+      hideModal();
+      await loadNasView();
+      const saved = nasShares.find((s) => s.id === (res?.share?.id || share.id));
+      if (saved) openNasShare(saved); // show its contents right away
+      netNotify(`Share "${share.name}" saved`, 'success', 2500);
+    } catch (err) {
+      setStatus(/No handler registered/i.test(String(err))
+        ? 'Network Storage plugin is not running — enable it in Settings → Plugins'
+        : `Could not save: ${netErrorText(err)}`, 'error');
+    } finally {
+      saveBtn.disabled = false;
+    }
+  };
 }
 
 if (document.readyState === 'loading') {

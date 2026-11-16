@@ -300,16 +300,55 @@ function broadcast(channel, ...args) {
   }
 }
 
+// Every place that decides "is this an audio file" (dialogs, folder scans,
+// drag & drop, network shares) uses this one list.
+const AUDIO_EXTENSIONS = [
+  'flac', 'wav', 'mp3', 'm4a', 'aac', 'ogg', 'oga', 'opus', 'wma', 'alac',
+  'dsf', 'dff', 'ape', 'aiff', 'aif', 'caf', 'wv', 'mka', 'tak', 'tta', 'mp4', 'webm',
+];
+const AUDIO_EXTENSION_SET = new Set(AUDIO_EXTENSIONS.map((e) => `.${e}`));
+const CUE_MARKER = '\x00cue\x00';
+
 // Utility: detect if an argument refers to a local audio file path
 function isAudioPath(p) {
   if (!p) return false;
   try {
     // Accept file:// URLs too
     if (p.startsWith('file://')) return true;
-    const ext = path.extname(p || '').toLowerCase();
-    return ['.flac', '.wav', '.mp3', '.m4a', '.aac', '.ogg', '.opus', '.dsf', '.dff', '.ape', '.aiff', '.caf'].includes(ext);
+    return AUDIO_EXTENSION_SET.has(path.extname(p || '').toLowerCase());
   } catch {
     return false;
+  }
+}
+
+function isRemoteUrl(p) {
+  return typeof p === 'string' && /^https?:\/\//i.test(p);
+}
+
+// Transport commands (menu, tray, media keys) go through the renderer when a
+// window exists: it owns the playback context, shuffle order and the output
+// settings. Headless/server mode falls back to the main-process queue.
+function sendPlayerCommand(command) {
+  if (mainWindow && !mainWindow.isDestroyed()) {
+    mainWindow.webContents.send('player:command', command);
+    return;
+  }
+  const playFromQueue = (track) => {
+    if (!track) return;
+    const { track: _t, startTime: _s, gapless: _g, ...outputOptions } = currentPlaybackOptions || {};
+    handlers['audio:play'](track.path, { ...outputOptions, track });
+  };
+  const status = audioEngine.getStatus();
+  if (command === 'toggle') {
+    if (status.playing && !status.paused) handlers['audio:pause']();
+    else if (status.playing) handlers['audio:resume']();
+    else if (queueIndex >= 0 && playbackQueue[queueIndex]) playFromQueue(playbackQueue[queueIndex]);
+  } else if (command === 'next') {
+    playFromQueue(handlers['queue:next']());
+  } else if (command === 'previous') {
+    playFromQueue(handlers['queue:previous']());
+  } else if (command === 'stop') {
+    handlers['audio:stop']();
   }
 }
 
@@ -358,7 +397,7 @@ async function handleOpenFile(filePath) {
       }
     } else {
       // remote URL: call existing add-remote handler then play
-      await handlers['library:add-remote'](null, { url: filePath }).catch(() => null);
+      await handlers['library:add-remote']({ url: filePath }).catch(() => null);
       await handlers['audio:play'](filePath, {});
     }
   } catch (e) {
@@ -420,13 +459,11 @@ function setupApplicationMenu() {
             const result = await dialog.showOpenDialog(mainWindow, {
               properties: ['openFile', 'multiSelections'],
               filters: [
-                { name: 'Audio Files', extensions: ['mp3', 'flac', 'wav', 'ogg', 'm4a', 'aac', 'wma'] }
+                { name: 'Audio Files', extensions: AUDIO_EXTENSIONS }
               ]
             });
             if (!result.canceled && result.filePaths.length > 0) {
-              for (const filePath of result.filePaths) {
-                await handleOpenFile(filePath);
-              }
+              await processFileList(result.filePaths);
             }
           }
         },
@@ -438,7 +475,7 @@ function setupApplicationMenu() {
               properties: ['openDirectory']
             });
             if (!result.canceled && result.filePaths.length > 0) {
-              mainWindow?.webContents.send('library:import-folder', result.filePaths[0]);
+              await handleAddFiles(result.filePaths);
             }
           }
         },
@@ -478,47 +515,21 @@ function setupApplicationMenu() {
     {
       label: 'Playback',
       submenu: [
-        {
-          label: 'Play/Pause',
-          accelerator: 'Space',
-          click: () => {
-            const status = audioEngine.getStatus();
-            if (status.playing && !status.paused) {
-              handlers['audio:pause']();
-            } else {
-              handlers['audio:resume']();
-            }
-          }
-        },
-        {
-          label: 'Next Track',
-          accelerator: 'CmdOrCtrl+Right',
-          click: () => handlers['queue:next']()
-        },
-        {
-          label: 'Previous Track',
-          accelerator: 'CmdOrCtrl+Left',
-          click: () => handlers['queue:previous']()
-        },
+        // No accelerators here on purpose: a menu accelerator swallows the key
+        // window-wide, so "Space" made it impossible to type a space into the
+        // search box and Ctrl+Arrow broke word navigation in every text field.
+        // The renderer handles these keys when focus is not in an input.
+        { label: 'Play/Pause\tSpace', click: () => sendPlayerCommand('toggle') },
+        { label: 'Stop', click: () => sendPlayerCommand('stop') },
+        { label: 'Next Track\tCtrl+Right', click: () => sendPlayerCommand('next') },
+        { label: 'Previous Track\tCtrl+Left', click: () => sendPlayerCommand('previous') },
         { type: 'separator' },
-        {
-          label: 'Volume Up',
-          accelerator: 'CmdOrCtrl+Up',
-          click: () => {
-            const status = audioEngine.getStatus();
-            const newVolume = Math.min(1, (status.volume || 0.5) + 0.1);
-            handlers['audio:set-volume'](newVolume);
-          }
-        },
-        {
-          label: 'Volume Down',
-          accelerator: 'CmdOrCtrl+Down',
-          click: () => {
-            const status = audioEngine.getStatus();
-            const newVolume = Math.max(0, (status.volume || 0.5) - 0.1);
-            handlers['audio:set-volume'](newVolume);
-          }
-        }
+        { label: 'Stop After Current Track', click: () => sendPlayerCommand('stop-after-current') },
+        { type: 'separator' },
+        { label: 'Volume Up\tCtrl+Up', click: () => sendPlayerCommand('volume-up') },
+        { label: 'Volume Down\tCtrl+Down', click: () => sendPlayerCommand('volume-down') },
+        { type: 'separator' },
+        { label: 'Find\tCtrl+F', click: () => sendPlayerCommand('focus-search') }
       ]
     },
     // Window menu
@@ -643,7 +654,31 @@ async function resolveTrackPath(filePath) {
       console.warn('[main] Failed to resolve object-storage path:', filePath, e);
     }
   }
+  // Other plugins (e.g. NAS: WebDAV credentials) may rewrite a path for playback.
+  for (const [id, loaded] of loadedPlugins) {
+    if (id === 'object-storage' || typeof loaded?.module?.resolvePath !== 'function') continue;
+    try {
+      const resolved = await loaded.module.resolvePath(filePath);
+      if (resolved) return resolved;
+    } catch (e) {
+      console.warn(`[main] Plugin ${id} failed to resolve path`, e);
+    }
+  }
   return filePath;
+}
+
+// Extra request headers a plugin wants on fetches of this URL (e.g. WebDAV auth).
+function getPluginRequestHeaders(url) {
+  for (const [id, loaded] of loadedPlugins) {
+    if (typeof loaded?.module?.getRequestHeaders !== 'function') continue;
+    try {
+      const headers = loaded.module.getRequestHeaders(url);
+      if (headers && Object.keys(headers).length) return headers;
+    } catch (e) {
+      console.warn(`[main] Plugin ${id} failed to provide request headers`, e);
+    }
+  }
+  return {};
 }
 
 // Shared handlers for IPC and Remote Server
@@ -673,9 +708,10 @@ const handlers = {
   },
   'library:add-files': async (filePaths = []) => handleAddFiles(filePaths),
   'library:add-remote': async (remoteInfo = {}) => handleAddRemote(remoteInfo),
+  'library:add-remote-many': async (list = []) => handleAddRemoteMany(list),
 
     // Allow renderer to relink a track whose file has moved
-    'track:relink': async (event, info) => {
+    'track:relink': async (info) => {
       console.log('track:relink called with', info);
       // Allow relinking even if renderer didn't provide the track object.
       const requestedFilePath = info?.filePath || null;
@@ -690,7 +726,7 @@ const handlers = {
         defaultPath: requestedFilePath || (targetTrack && targetTrack.path) || undefined,
         properties: ['openFile'],
         filters: [
-          { name: 'Audio Files', extensions: ['flac','wav','mp3','m4a','aac','ogg','opus','dsf','dff'] },
+          { name: 'Audio Files', extensions: AUDIO_EXTENSIONS },
           { name: 'All Files', extensions: ['*'] }
         ]
       });
@@ -730,27 +766,16 @@ const handlers = {
     },
   'audio:play': async (filePath, options = {}) => {
     try {
-      // If a bulk import is running and we are already playing, avoid reopening the exclusive stream (prevents hiss/static during imports)
-      try {
-        if (global.__spectra_bulk_import) {
-          const status = audioEngine.getStatus();
-          if (status && status.playing) {
-            console.log('[main] audio:play suppressed during bulk import while already playing');
-            return;
-          }
-        }
-      } catch {}
-
       const playPath = await resolveTrackPath(filePath);
 
-      // Guard against missing media (e.g., USB drive unplugged) to avoid “background” silent playback attempts
-      // Skip file existence check for remote URLs (presigned URLs from object storage)
-      const isRemoteUrl = playPath.startsWith('http://') || playPath.startsWith('https://');
+      // Guard against missing media (e.g., USB drive unplugged) to avoid silent playback attempts.
+      // Remote URLs are not checked; cue virtual tracks are checked by their audio file.
+      const localPath = typeof playPath === 'string' ? playPath.split(CUE_MARKER)[0] : playPath;
       try {
-        if (!isRemoteUrl && !fs.existsSync(playPath)) {
-          const err = `File not found: ${playPath}`;
+        if (!isRemoteUrl(playPath) && !fs.existsSync(localPath)) {
+          const err = `File not found: ${localPath}`;
           console.warn('[main] audio:play aborted:', err);
-          broadcast('audio:error', { message: err, filePath: playPath, track: currentTrackMetadata });
+          broadcast('audio:error', { message: err, filePath: localPath, track: options.track || currentTrackMetadata });
           return;
         }
       } catch {}
@@ -779,9 +804,10 @@ const handlers = {
       // Propagate gapless intent from queue:next's __gapless flag or explicit options.gapless
       const isGapless = !!(options.gapless || options.track?.__gapless);
       currentPlaybackOptions = { ...options, track: currentTrackMetadata, gapless: isGapless };
+      const startedTrack = currentTrackMetadata;
       await audioEngine.playFile(playPath, () => {
-        emitPluginEvent('track-stopped', currentTrackMetadata);
-        broadcast('audio:ended');
+        emitPluginEvent('track-stopped', startedTrack);
+        broadcast('audio:ended', { id: startedTrack?.id ?? null, path: startedTrack?.path ?? null });
         broadcastState();
       }, (err) => {
         console.error('Playback error:', err);
@@ -895,9 +921,26 @@ const handlers = {
       const { canceled, filePath } = await dialog.showSaveDialog(mainWindow, {
         title: 'Export playlist',
         defaultPath: path.join(defaultDir, defaultName),
-        filters: [{ name: 'Spectra Playlist', extensions: ['playlist'] }, { name: 'All Files', extensions: ['*'] }]
+        filters: [
+          { name: 'Spectra Playlist', extensions: ['playlist'] },
+          { name: 'M3U8 Playlist (other players)', extensions: ['m3u8'] },
+          { name: 'All Files', extensions: ['*'] }
+        ]
       });
       if (canceled || !filePath) return { success: false, canceled: true };
+
+      // Standard M3U8 so the playlist opens in foobar2000, VLC, etc.
+      if (/\.m3u8?$/i.test(filePath)) {
+        const lines = ['#EXTM3U'];
+        for (const t of db.getPlaylistTracks(playlistId) || []) {
+          const seconds = Math.round(Number(t.duration) || -1);
+          const label = [t.artist, t.title].filter(Boolean).join(' - ') || path.basename(String(t.path));
+          lines.push(`#EXTINF:${seconds},${label}`);
+          lines.push(String(t.path).split(CUE_MARKER)[0]);
+        }
+        fs.writeFileSync(filePath, lines.join('\r\n') + '\r\n', 'utf8');
+        return { success: true, path: filePath };
+      }
 
       // Create a new sqlite DB at the chosen path and populate with playlist + tracks
       const SQL = await initSqlJs();
@@ -934,10 +977,63 @@ const handlers = {
       const { canceled, filePaths } = await dialog.showOpenDialog(mainWindow, {
         title: 'Import playlist',
         properties: ['openFile'],
-        filters: [{ name: 'Spectra Playlist', extensions: ['playlist'] }, { name: 'All Files', extensions: ['*'] }]
+        filters: [
+          { name: 'Playlists', extensions: ['playlist', 'm3u', 'm3u8'] },
+          { name: 'All Files', extensions: ['*'] }
+        ]
       });
       if (canceled || !filePaths || !filePaths.length) return { success: false, canceled: true };
       const impPath = filePaths[0];
+
+      // M3U / M3U8 from other players
+      if (/\.m3u8?$/i.test(impPath)) {
+        const text = fs.readFileSync(impPath, 'utf8').replace(/^﻿/, '');
+        const baseDir = path.dirname(impPath);
+        const created = db.createPlaylist(path.basename(impPath).replace(/\.m3u8?$/i, '') || 'Imported Playlist');
+        let playlistId = created && created.lastInsertRowid ? created.lastInsertRowid : null;
+        if (!playlistId) {
+          const all = db.getAllPlaylists();
+          playlistId = all.length ? Math.max(...all.map((p) => Number(p.id) || 0)) : null;
+        }
+        let added = 0;
+        let missing = 0;
+        let pendingInfo = null;
+        for (const raw of text.split(/\r?\n/)) {
+          const line = raw.trim();
+          if (!line) continue;
+          if (line.startsWith('#EXTINF:')) {
+            const m = line.match(/^#EXTINF:(-?\d+(?:\.\d+)?)[^,]*,(.*)$/);
+            if (m) pendingInfo = { duration: Number(m[1]) > 0 ? Number(m[1]) : 0, label: m[2].trim() };
+            continue;
+          }
+          if (line.startsWith('#')) continue;
+          const info = pendingInfo;
+          pendingInfo = null;
+          try {
+            let stored = null;
+            if (isRemoteUrl(line)) {
+              const [artist, ...rest] = (info?.label || '').split(' - ');
+              const res = await handleAddRemote({
+                url: line,
+                title: rest.length ? rest.join(' - ') : (info?.label || undefined),
+                artist: rest.length ? artist : undefined,
+                duration: info?.duration || undefined,
+              });
+              stored = res?.success ? res.track : null;
+            } else {
+              let filePath = line.startsWith('file://') ? fileURLToPath(line) : line;
+              if (!path.isAbsolute(filePath)) filePath = path.resolve(baseDir, filePath);
+              if (!fs.existsSync(filePath)) { missing++; continue; }
+              stored = await processAndAddTrack(filePath);
+            }
+            if (stored?.id && playlistId) { db.addTrackToPlaylist(playlistId, stored.id); added++; }
+          } catch (e) {
+            missing++;
+            console.warn('[main] m3u import skipped entry', line, e?.message ?? e);
+          }
+        }
+        return { success: true, playlistId, added, missing };
+      }
 
       // Open provided sqlite file and read playlist + tracks
       const SQL = await initSqlJs();
@@ -1303,49 +1399,17 @@ const handlers = {
     console.log(`[plugins] Updated config for ${id}:`, cfg[id]);
     savePluginConfig(cfg);
 
-    // If plugin is currently loaded and is being disabled, deactivate it now
     try {
       const isEnabled = !!enabled;
       const loaded = loadedPlugins.get(id);
       if (!isEnabled && loaded) {
-        try {
-          if (loaded.module.deactivate) {
-            console.log(`[plugins] Deactivating plugin due to disable request: ${id}`);
-            loaded.module.deactivate();
-          }
-        } catch (e) { console.error(`[plugins] Error deactivating plugin ${id}:`, e); }
-        loadedPlugins.delete(id);
+        deactivatePlugin(id);
       }
-
-      // If plugin is being enabled and not yet loaded, attempt to load and activate it
       if (isEnabled && !loaded) {
-        // Try to locate plugin folder in user plugins then repo plugins
-        const tryDirs = [pluginsDir, repoPluginsDir];
-        for (const base of tryDirs) {
+        for (const base of [pluginsDir, repoPluginsDir]) {
           const candidate = path.join(base, id);
-          const manifestPath = path.join(candidate, 'manifest.json');
-          if (!fs.existsSync(manifestPath)) continue;
-          try {
-            const manifest = JSON.parse(fs.readFileSync(manifestPath, 'utf8'));
-            const pluginMainPath = path.join(candidate, manifest.main || 'plugin.js');
-            if (!fs.existsSync(pluginMainPath)) continue;
-            const pluginUrl = new URL(`file:///${pluginMainPath.replace(/\\/g, '/')}`);
-            const pluginModule = await import(pluginUrl.href);
-            if (pluginModule.activate) {
-              const savedSettings = cfg[id]?.settings || manifest.settings || {};
-              const context = { settings: savedSettings, on: (event, handler) => {
-                const handlers = pluginEventHandlers.get(event);
-                if (handlers) handlers.push(handler); else pluginEventHandlers.set(event, [handler]);
-              } };
-              console.log(`[plugins] Activating plugin due to enable request: ${id}`);
-              pluginModule.activate(context);
-              loadedPlugins.set(id, { id, module: pluginModule, manifest, context });
-            }
-            break; // stop after first successful load
-          } catch (e) {
-            console.error(`[plugins] Failed to load enabled plugin ${id} from ${candidate}:`, e);
-            continue;
-          }
+          if (!fs.existsSync(path.join(candidate, 'manifest.json'))) continue;
+          if (await loadPluginFromDir(candidate, loadPluginConfig())) break;
         }
       }
     } catch (err) {
@@ -1406,15 +1470,9 @@ const handlers = {
       console.warn('[plugins] Error while waiting for renderer ack; continuing', err);
     }
 
-    // Deactivate all plugins
-    for (const [id, plugin] of loadedPlugins) {
-      try {
-        if (plugin.module.deactivate) {
-          console.log(`[plugins] Deactivating plugin: ${id}`);
-          plugin.module.deactivate();
-        }
-      } catch (e) { console.warn('error waiting for renderer ack', e); resolve(); }
-    }
+    // Deactivate all plugins (also unregisters their IPC channels so the
+    // reload can register them again without "second handler" errors)
+    for (const id of Array.from(loadedPlugins.keys())) deactivatePlugin(id);
     loadedPlugins.clear();
     pluginEventHandlers.clear();
 
@@ -1581,19 +1639,10 @@ function createTray() {
     },
     {
       label: 'Play/Pause',
-      click: async () => {
-        try {
-          const status = await audioEngine.getStatus();
-          if (status.playing && status.paused) {
-            await audioEngine.resume();
-          } else if (status.playing) {
-            await audioEngine.pause();
-          }
-        } catch (err) {
-          console.error('Tray play/pause error:', err);
-        }
-      }
+      click: () => sendPlayerCommand('toggle')
     },
+    { label: 'Next Track', click: () => sendPlayerCommand('next') },
+    { label: 'Previous Track', click: () => sendPlayerCommand('previous') },
     { type: 'separator' },
     {
       label: 'Quit',
@@ -1723,43 +1772,22 @@ app.whenReady().then(async () => {
 
   // Register global keyboard shortcuts
   const registerShortcuts = () => {
-    globalShortcut.register('MediaPlayPause', () => {
-      const status = audioEngine.getStatus();
-      if (status.playing && !status.paused) {
-        handlers['audio:pause']();
-      } else {
-        handlers['audio:resume']();
+    // Only real media keys are grabbed system-wide. Ctrl+Left/Right used to be
+    // registered globally too, which stole word navigation from every other
+    // application while Spectra was running.
+    const bind = (accelerator, command) => {
+      try {
+        if (!globalShortcut.register(accelerator, () => sendPlayerCommand(command))) {
+          console.warn(`[main] Could not register global shortcut ${accelerator}`);
+        }
+      } catch (e) {
+        console.warn(`[main] Failed to register global shortcut ${accelerator}`, e);
       }
-    });
-    globalShortcut.register('MediaNextTrack', () => {
-      const nextTrack = handlers['queue:next']();
-      if (nextTrack) handlers['audio:play'](nextTrack.path, { track: nextTrack });
-    });
-    globalShortcut.register('MediaPreviousTrack', () => {
-      const prevTrack = handlers['queue:previous']();
-      if (prevTrack) handlers['audio:play'](prevTrack.path, { track: prevTrack });
-    });
-    globalShortcut.register('MediaStop', () => {
-      handlers['audio:stop']();
-    });
-
-    // Custom shortcuts
-    globalShortcut.register('CommandOrControl+Shift+P', () => {
-      const status = audioEngine.getStatus();
-      if (status.playing && !status.paused) {
-        handlers['audio:pause']();
-      } else {
-        handlers['audio:resume']();
-      }
-    });
-    globalShortcut.register('CommandOrControl+Right', () => {
-      const nextTrack = handlers['queue:next']();
-      if (nextTrack) handlers['audio:play'](nextTrack.path, { track: nextTrack });
-    });
-    globalShortcut.register('CommandOrControl+Left', () => {
-      const prevTrack = handlers['queue:previous']();
-      if (prevTrack) handlers['audio:play'](prevTrack.path, { track: prevTrack });
-    });
+    };
+    bind('MediaPlayPause', 'toggle');
+    bind('MediaNextTrack', 'next');
+    bind('MediaPreviousTrack', 'previous');
+    bind('MediaStop', 'stop');
   };
 
   if (!isServerMode) {
@@ -1796,16 +1824,10 @@ app.on('will-quit', () => {
   }
 
   // Deactivate all plugins on quit
-  for (const [id, plugin] of loadedPlugins) {
-    try {
-      if (plugin.module.deactivate) {
-        console.log(`[plugins] Deactivating plugin: ${id}`);
-        plugin.module.deactivate();
-      }
-    } catch (e) {
-      console.error(`[plugins] Error deactivating plugin ${id}:`, e);
-    }
-  }
+  for (const id of Array.from(loadedPlugins.keys())) deactivatePlugin(id);
+
+  try { audioEngine.stop(); } catch {}
+  try { db.flushDb(); } catch {}
 });
 
 // Register IPC Handlers
@@ -1861,7 +1883,21 @@ ipcMain.handle('context-menu:show-track', async (event, tracks) => {
   const items = Array.isArray(tracks) ? tracks : (tracks ? [tracks] : []);
   const first = items[0] || null;
   const template = [];
+  template.push({
+    label: 'Play Next',
+    click: () => { event.sender.send('queue:play-next', items); }
+  });
+  template.push({
+    label: 'Add to Queue',
+    click: () => { event.sender.send('queue:append', items); }
+  });
+  template.push({ type: 'separator' });
   if (items.length === 1) {
+    template.push({
+      label: 'Show in Folder',
+      enabled: !!first?.path && !isRemoteUrl(first.path),
+      click: () => { try { shell.showItemInFolder(String(first.path).split(CUE_MARKER)[0]); } catch {} }
+    });
     template.push({
       label: 'Edit Info',
       click: () => { event.sender.send('track:edit', first); }
@@ -1950,7 +1986,7 @@ ipcMain.handle('context-menu:show-track', async (event, tracks) => {
 ipcMain.handle('library:import-file', async () => {
   const { canceled, filePaths } = await dialog.showOpenDialog(mainWindow, {
     properties: ['openFile', 'multiSelections'],
-    filters: [{ name: 'Audio', extensions: ['flac', 'wav', 'mp3', 'aac', 'ogg', 'm4a', 'alac', 'wma','dsf','dff', 'ape', 'dsd', 'aiff', 'caf'] }]
+    filters: [{ name: 'Audio', extensions: AUDIO_EXTENSIONS }]
   });
 
   if (canceled) return;
@@ -1987,7 +2023,7 @@ async function getAudioFiles(dir) {
           await scan(res);
         } else {
           const ext = path.extname(res).toLowerCase();
-          if (['.flac', '.wav', '.mp3', '.aac', '.ogg', '.m4a'].includes(ext)) {
+          if (AUDIO_EXTENSION_SET.has(ext)) {
             try {
               const st = await fs.promises.stat(res).catch(() => null);
               // Skip tiny files (< 1KB) which are likely bogus/placeholder files
@@ -2243,21 +2279,28 @@ async function processFileList(files) {
     global.__spectra_bulk_import = true;
   } catch {}
 
-  for (let i = 0; i < total; i++) {
-    await processAndAddTrack(files[i]);
-    broadcast('import:progress', {
-      current: i + 1,
-      total,
-      filename: path.basename(files[i])
-    });
-  }
-
-  broadcast('import:complete');
-  console.log('[main] processFileList: import complete');
-
+  let failed = 0;
   try {
-    global.__spectra_bulk_import = false;
-  } catch {}
+    for (let i = 0; i < total; i++) {
+      try {
+        await processAndAddTrack(files[i]);
+      } catch (err) {
+        failed++;
+        console.warn('[main] import skipped unreadable file:', files[i], err?.message ?? err);
+      }
+      broadcast('import:progress', {
+        current: i + 1,
+        total,
+        filename: path.basename(files[i])
+      });
+      // Yield so audio pumping and IPC stay responsive during big imports.
+      if (i % 8 === 7) await new Promise((resolve) => setImmediate(resolve));
+    }
+  } finally {
+    try { global.__spectra_bulk_import = false; } catch {}
+    broadcast('import:complete', { total, failed });
+    console.log(`[main] processFileList: import complete (${total - failed}/${total} added)`);
+  }
 }
 
 async function processAndAddTrack(filePath) {
@@ -2354,68 +2397,127 @@ async function handleAddFiles(filePaths = []) {
   return { success: true, count: allFiles.length };
 }
 
+function titleFromUrl(url) {
+  try {
+    const name = decodeURIComponent(new URL(url).pathname.split('/').filter(Boolean).pop() || '');
+    return name.replace(/\.[a-z0-9]{2,5}$/i, '') || url;
+  } catch {
+    return path.basename(String(url));
+  }
+}
+
 async function handleAddRemote(remoteInfo = {}) {
   try {
-    const { url, title: providedTitle, artist: providedArtist, album: providedAlbum, duration: providedDuration } = remoteInfo || {};
-    if (!url) {
+    const {
+      url,
+      title: providedTitle,
+      artist: providedArtist,
+      album: providedAlbum,
+      duration: providedDuration,
+      coverUrl,
+      sampleRate, bitDepth, channels, format,
+      skipProbe = false,
+    } = remoteInfo || {};
+    if (!url || typeof url !== 'string') {
       return { success: false, error: 'missing url' };
     }
 
+    // Already in the library: fill in anything new and return it.
+    const already = db.getTrackByPath(url);
+
     let track = {
       path: url,
-      title: providedTitle || path.basename(url),
-      artist: providedArtist || 'Remote',
-      album: providedAlbum || '',
+      title: providedTitle || titleFromUrl(url),
+      artist: providedArtist || 'Unknown Artist',
+      album: providedAlbum || 'Unknown Album',
       album_artist: null,
-      duration: providedDuration || 0,
-      format: 'remote',
-      cover_path: null,
+      duration: Number(providedDuration) > 0 ? Number(providedDuration) : 0,
+      format: format || 'remote',
+      cover_path: coverUrl && isRemoteUrl(coverUrl) ? coverUrl : null,
       bitrate: null,
-      sample_rate: null,
-      bit_depth: null,
-      channels: null,
+      sample_rate: Number(sampleRate) || null,
+      bit_depth: Number(bitDepth) || null,
+      channels: Number(channels) || null,
       lossless: null,
       codec: null,
       quality_score: null,
     };
 
-    try {
-      const fetchUrl = await resolveTrackPath(url);
-      let meta = null;
+    // The source already described the track well enough (UPnP browse results):
+    // skip the network probe so adding a whole folder stays fast.
+    const haveEnough = providedTitle && providedArtist && track.duration > 0;
+    if (!skipProbe && !haveEnough) {
+      try {
+        const fetchUrl = await resolveTrackPath(url);
+        let meta = null;
 
-      if (fetchUrl !== url && !fetchUrl.startsWith('http')) {
-        meta = await extractMetadata(fetchUrl).catch(() => null);
-      } else {
-        const MAX_BYTES = 2 * 1024 * 1024;
-        const headers = { Range: `bytes=0-${MAX_BYTES - 1}` };
-        const res = await fetch(fetchUrl, { method: 'GET', headers, redirect: 'follow', timeout: 10000 }).catch(() => null);
-        if (res && (res.status === 206 || res.status === 200)) {
-          const ab = await res.arrayBuffer();
-          const buf = Buffer.from(ab);
-          meta = await extractMetadataFromBuffer(buf, url).catch(() => null);
+        if (fetchUrl !== url && !isRemoteUrl(fetchUrl)) {
+          meta = await extractMetadata(fetchUrl).catch(() => null);
+        } else {
+          const MAX_BYTES = 2 * 1024 * 1024;
+          const headers = { Range: `bytes=0-${MAX_BYTES - 1}`, ...getPluginRequestHeaders(url) };
+          // Credentials travel in the Authorization header, never in the URL.
+          let cleanUrl = url;
+          try { const u = new URL(url); u.username = ''; u.password = ''; cleanUrl = u.href; } catch {}
+          const controller = new AbortController();
+          const timer = setTimeout(() => controller.abort(), 12000);
+          try {
+            const res = await fetch(cleanUrl, { method: 'GET', headers, redirect: 'follow', signal: controller.signal });
+            if (res && (res.status === 206 || res.status === 200)) {
+              // Servers that ignore Range would send the whole file: read only the head.
+              const reader = res.body?.getReader?.();
+              const chunks = [];
+              let received = 0;
+              if (reader) {
+                while (received < MAX_BYTES) {
+                  const { done, value } = await reader.read();
+                  if (done) break;
+                  chunks.push(Buffer.from(value));
+                  received += value.length;
+                }
+                try { await reader.cancel(); } catch {}
+              }
+              const buf = Buffer.concat(chunks);
+              if (buf.length) meta = await extractMetadataFromBuffer(buf, url).catch(() => null);
+            } else if (res && (res.status === 401 || res.status === 403)) {
+              console.warn('[main] remote metadata fetch unauthorized for', cleanUrl);
+            }
+          } catch (fetchErr) {
+            console.warn('[main] remote metadata fetch failed:', fetchErr?.message ?? fetchErr);
+          } finally {
+            clearTimeout(timer);
+          }
         }
-      }
 
-      if (meta) {
-        track.title = providedTitle || meta.title || track.title;
-        track.artist = providedArtist || meta.artist || track.artist;
-        track.album = providedAlbum || meta.album || track.album;
-        track.album_artist = meta.albumArtist || null;
-        track.duration = providedDuration || meta.duration || track.duration;
-        track.format = meta.format || 'remote';
-        if (meta.coverPath) track.cover_path = meta.coverPath;
-        track.bitrate = meta.bitrate ?? track.bitrate;
-        track.sample_rate = meta.sampleRate ?? track.sample_rate;
-        track.bit_depth = meta.bitDepth ?? track.bit_depth;
-        track.channels = meta.channels ?? track.channels;
-        track.lossless = meta.lossless ?? track.lossless;
-        track.codec = meta.codec ?? track.codec;
+        if (meta) {
+          track.title = providedTitle || meta.title || track.title;
+          track.artist = providedArtist || meta.artist || track.artist;
+          track.album = providedAlbum || meta.album || track.album;
+          track.album_artist = meta.albumArtist || null;
+          track.duration = track.duration || meta.duration || 0;
+          track.format = meta.format || track.format;
+          if (meta.coverPath) track.cover_path = meta.coverPath;
+          track.bitrate = meta.bitrate ?? track.bitrate;
+          track.sample_rate = meta.sampleRate ?? track.sample_rate;
+          track.bit_depth = meta.bitDepth ?? track.bit_depth;
+          track.channels = meta.channels ?? track.channels;
+          track.lossless = meta.lossless ?? track.lossless;
+          track.codec = meta.codec ?? track.codec;
+        }
+      } catch (inner) {
+        console.warn('[main] remote metadata fetch failed', inner);
       }
-    } catch (inner) {
-      console.warn('[main] remote metadata fetch failed', inner);
     }
 
     track.quality_score = track.quality_score ?? computeQualityScore(track);
+
+    if (already) {
+      const updates = collectMetadataImprovements(already, track);
+      if (Object.keys(updates).length) db.updateTrackFields(already.id, updates);
+      const refreshed = db.getTrackById(already.id) || already;
+      return { success: true, id: refreshed.id, track: refreshed, existed: true };
+    }
+
     const stored = storeTrackWithDedup(track);
     if (!stored) {
       return { success: false, error: 'failed to store track' };
@@ -2424,174 +2526,228 @@ async function handleAddRemote(remoteInfo = {}) {
     return { success: true, id: stored.id, track: stored };
   } catch (err) {
     console.error('[main] library:add-remote failed', err);
-    return { success: false, error: String(err) };
+    return { success: false, error: String(err?.message || err) };
   }
+}
+
+// Add many remote tracks (a UPnP/WebDAV folder) with the same progress events
+// as a local import. Returns the stored track ids in input order.
+async function handleAddRemoteMany(list = []) {
+  const items = Array.isArray(list) ? list.filter((it) => it && it.url) : [];
+  const ids = [];
+  let failed = 0;
+  if (!items.length) return { success: true, count: 0, ids, failed };
+  broadcast('import:start', { total: items.length });
+  try {
+    for (let i = 0; i < items.length; i++) {
+      const res = await handleAddRemote(items[i]);
+      if (res?.success) ids.push(res.id); else failed++;
+      broadcast('import:progress', { current: i + 1, total: items.length, filename: items[i].title || titleFromUrl(items[i].url) });
+    }
+  } finally {
+    broadcast('import:complete', { total: items.length, failed });
+  }
+  return { success: true, count: ids.length, ids, failed };
 }
 
 // Plugin loading system
-async function checkPluginDependencies(pluginDir, pluginId) {
+function pluginNeedsInstall(pluginDir) {
   const packageJsonPath = path.join(pluginDir, 'package.json');
-
-  // If no package.json, no dependencies to check
-  if (!fs.existsSync(packageJsonPath)) {
-    return;
-  }
-
+  if (!fs.existsSync(packageJsonPath)) return false;
   try {
     const packageJson = JSON.parse(fs.readFileSync(packageJsonPath, 'utf8'));
-    const dependencies = packageJson.dependencies || {};
-
-    // If no dependencies defined, nothing to do
-    if (Object.keys(dependencies).length === 0) {
-      return;
-    }
-
-    // Check if node_modules exists and has the required packages
+    const dependencies = Object.keys(packageJson.dependencies || {});
+    if (!dependencies.length) return false;
     const nodeModulesPath = path.join(pluginDir, 'node_modules');
-    let needsInstall = !fs.existsSync(nodeModulesPath);
-
-    if (!needsInstall) {
-      // Check if all dependencies are installed
-      for (const dep of Object.keys(dependencies)) {
-        const depPath = path.join(nodeModulesPath, dep);
-        if (!fs.existsSync(depPath)) {
-          needsInstall = true;
-          break;
-        }
-      }
-    }
-
-    if (needsInstall) {
-      console.log(`[plugins] Installing dependencies for ${pluginId}...`);
-
-      // Run npm install in the plugin directory
-      const { spawn } = await import('child_process');
-
-      await new Promise((resolve) => {
-        const npmCmd = process.platform === 'win32' ? 'npm.cmd' : 'npm';
-        const installProcess = spawn(npmCmd, ['install'], {
-          cwd: pluginDir,
-          stdio: 'inherit',
-          shell: true
-        });
-
-        installProcess.on('close', (code) => {
-          if (code === 0) {
-            console.log(`[plugins] Dependencies installed for ${pluginId}`);
-            resolve();
-          } else {
-            console.error(`[plugins] Failed to install dependencies for ${pluginId} (exit code: ${code})`);
-            resolve(); // Don't reject, just continue
-          }
-        });
-
-        installProcess.on('error', (err) => {
-          console.error(`[plugins] Error installing dependencies for ${pluginId}:`, err);
-          resolve(); // Don't reject, just continue
-        });
-      });
-    }
+    if (!fs.existsSync(nodeModulesPath)) return true;
+    return dependencies.some((dep) => !fs.existsSync(path.join(nodeModulesPath, dep)));
   } catch (e) {
-    console.error(`[plugins] Error checking dependencies for ${pluginId}:`, e);
+    console.error(`[plugins] Error checking dependencies in ${pluginDir}:`, e);
+    return false;
   }
 }
+
+async function installPluginDependencies(pluginDir, pluginId) {
+  console.log(`[plugins] Installing dependencies for ${pluginId}...`);
+  const { spawn } = await import('child_process');
+  await new Promise((resolve) => {
+    const npmCmd = process.platform === 'win32' ? 'npm.cmd' : 'npm';
+    let settled = false;
+    const done = () => { if (!settled) { settled = true; resolve(); } };
+    let installProcess;
+    try {
+      installProcess = spawn(npmCmd, ['install', '--omit=dev', '--no-audit', '--no-fund'], {
+        cwd: pluginDir,
+        stdio: 'inherit',
+        shell: true
+      });
+    } catch (err) {
+      console.error(`[plugins] Error installing dependencies for ${pluginId}:`, err);
+      return done();
+    }
+    // A hung npm must not keep the plugin (or the others) from ever loading.
+    const timer = setTimeout(() => {
+      console.error(`[plugins] npm install for ${pluginId} timed out`);
+      try { installProcess.kill(); } catch {}
+      done();
+    }, 180000);
+    installProcess.on('close', (code) => {
+      clearTimeout(timer);
+      if (code === 0) console.log(`[plugins] Dependencies installed for ${pluginId}`);
+      else console.error(`[plugins] Failed to install dependencies for ${pluginId} (exit code: ${code})`);
+      done();
+    });
+    installProcess.on('error', (err) => {
+      clearTimeout(timer);
+      console.error(`[plugins] Error installing dependencies for ${pluginId}:`, err);
+      done();
+    });
+  });
+}
+
+// One context factory for every way a plugin gets activated (startup, reload,
+// enable toggle), so all of them get the full API.
+function createPluginContext(pluginId, settings) {
+  const channels = new Set();
+  const context = {
+    settings,
+    on: (event, handler) => {
+      const list = pluginEventHandlers.get(event);
+      if (list) list.push(handler);
+      else pluginEventHandlers.set(event, [handler]);
+    },
+    registerRemoteHandler: (channel, handler) => {
+      handlers[channel] = handler;
+      channels.add(channel);
+      // Re-registration (plugin reload / re-enable) must replace, not throw.
+      try { ipcMain.removeHandler(channel); } catch {}
+      ipcMain.handle(channel, (event, ...args) => handler(...args));
+    },
+    broadcast: (channel, ...args) => {
+      try {
+        broadcast(channel, ...args);
+      } catch (err) {
+        console.warn(`[plugins] broadcast failed for ${channel}`, err);
+      }
+    },
+    // Persist plugin-owned settings (e.g. NAS shares) across restarts.
+    saveSettings: (nextSettings) => {
+      const cfg = loadPluginConfig();
+      const value = nextSettings && typeof nextSettings === 'object' ? nextSettings : context.settings;
+      cfg[pluginId] = { ...(cfg[pluginId] || {}), settings: value };
+      savePluginConfig(cfg);
+      context.settings = value;
+      return value;
+    },
+  };
+  return { context, channels };
+}
+
+function deactivatePlugin(id) {
+  const loaded = loadedPlugins.get(id);
+  if (!loaded) return;
+  try {
+    if (loaded.module.deactivate) {
+      console.log(`[plugins] Deactivating plugin: ${id}`);
+      loaded.module.deactivate();
+    }
+  } catch (e) {
+    console.error(`[plugins] Error deactivating plugin ${id}:`, e);
+  }
+  for (const channel of loaded.channels || []) {
+    try { ipcMain.removeHandler(channel); } catch {}
+    delete handlers[channel];
+  }
+  loadedPlugins.delete(id);
+}
+
+// Load + activate one plugin directory. Returns true when it is active.
+async function loadPluginFromDir(pluginDir, cfg, { bustCache = false } = {}) {
+  const manifestPath = path.join(pluginDir, 'manifest.json');
+  if (!fs.existsSync(manifestPath)) return false;
+  let pluginId = path.basename(pluginDir);
+  try {
+    const manifest = JSON.parse(fs.readFileSync(manifestPath, 'utf8'));
+    pluginId = manifest.id || pluginId;
+
+    // Skip if already loaded from a different location
+    if (loadedPlugins.has(pluginId)) return true;
+
+    if (cfg[pluginId]?.enabled === false) {
+      console.log(`[plugins] Skipping disabled plugin: ${pluginId}`);
+      return false;
+    }
+
+    const pluginMainPath = path.join(pluginDir, manifest.main || 'plugin.js');
+    if (!fs.existsSync(pluginMainPath)) {
+      console.error(`[plugins] Plugin main file not found: ${pluginMainPath}`);
+      return false;
+    }
+
+    // Import the plugin (ESM). A query string forces a fresh module on reload.
+    const pluginUrl = new URL(`file:///${pluginMainPath.replace(/\\/g, '/')}`);
+    if (bustCache) pluginUrl.searchParams.set('v', String(Date.now()));
+    const pluginModule = await import(pluginUrl.href);
+
+    if (!pluginModule.activate) {
+      console.error(`[plugins] Plugin ${pluginId} missing activate function`);
+      return false;
+    }
+
+    const savedSettings = cfg[pluginId]?.settings || manifest.settings || {};
+    const { context, channels } = createPluginContext(pluginId, savedSettings);
+
+    console.log(`[plugins] Activating plugin: ${pluginId}`);
+    await pluginModule.activate(context);
+
+    loadedPlugins.set(pluginId, { id: pluginId, module: pluginModule, manifest, context, channels });
+    console.log(`[plugins] OK Loaded plugin: ${pluginId}`);
+    return true;
+  } catch (e) {
+    console.error(`[plugins] Failed to load plugin ${pluginId}:`, e);
+    return false;
+  }
+}
+
+let pluginsLoadedOnce = false;
 
 async function loadPlugins() {
   console.log('[plugins] Loading plugins...');
   const cfg = loadPluginConfig();
+  const bustCache = pluginsLoadedOnce;
+  pluginsLoadedOnce = true;
 
   // Check both user data plugins and repo plugins (prefer user plugins)
-  const searchDirs = [pluginsDir, repoPluginsDir];
-
-  for (const searchDir of searchDirs) {
+  const ready = [];
+  const needInstall = [];
+  for (const searchDir of [pluginsDir, repoPluginsDir]) {
     if (!fs.existsSync(searchDir)) continue;
-
-    const dirs = fs.readdirSync(searchDir, { withFileTypes: true });
-    for (const d of dirs) {
+    for (const d of fs.readdirSync(searchDir, { withFileTypes: true })) {
       if (!d.isDirectory()) continue;
-
       const pluginDir = path.join(searchDir, d.name);
-      const manifestPath = path.join(pluginDir, 'manifest.json');
-
-      if (!fs.existsSync(manifestPath)) continue;
-
-      try {
-        const manifest = JSON.parse(fs.readFileSync(manifestPath, 'utf8'));
-        const pluginId = manifest.id || d.name;
-
-        // Skip if already loaded from a different location
-        if (loadedPlugins.has(pluginId)) continue;
-
-        // Check if plugin is enabled (default: true)
-        const enabled = cfg[pluginId]?.enabled !== false;
-        if (!enabled) {
-          console.log(`[plugins] Skipping disabled plugin: ${pluginId}`);
-          continue;
-        }
-
-        // Check and install plugin dependencies if needed
-        await checkPluginDependencies(pluginDir, pluginId);
-
-        // Load the plugin module
-        const pluginMainPath = path.join(pluginDir, manifest.main || 'plugin.js');
-        if (!fs.existsSync(pluginMainPath)) {
-          console.error(`[plugins] Plugin main file not found: ${pluginMainPath}`);
-          continue;
-        }
-
-        // Import the plugin (ESM)
-        const pluginUrl = new URL(`file:///${pluginMainPath.replace(/\\/g, '/')}`);
-        const pluginModule = await import(pluginUrl.href);
-
-        if (!pluginModule.activate) {
-          console.error(`[plugins] Plugin ${pluginId} missing activate function`);
-          continue;
-        }
-
-        // Create plugin context with settings from config (or defaults from manifest)
-        const savedSettings = cfg[pluginId]?.settings || manifest.settings || {};
-        const context = {
-          settings: savedSettings,
-          on: (event, handler) => {
-            const handlers = pluginEventHandlers.get(event);
-            if (handlers) {
-              handlers.push(handler);
-            } else {
-              pluginEventHandlers.set(event, [handler]);
-            }
-          },
-          registerRemoteHandler: (channel, handler) => {
-            handlers[channel] = handler;
-            ipcMain.handle(channel, (event, ...args) => handler(...args));
-          },
-          broadcast: (channel, ...args) => {
-            try {
-              broadcast(channel, ...args);
-            } catch (err) {
-              console.warn(`[plugins] broadcast failed for ${channel}`, err);
-            }
-          }
-        };
-
-        // Activate the plugin
-        console.log(`[plugins] Activating plugin: ${pluginId}`);
-        pluginModule.activate(context);
-
-        loadedPlugins.set(pluginId, {
-          id: pluginId,
-          module: pluginModule,
-          manifest,
-          context,
-        });
-
-        console.log(`[plugins] OK Loaded plugin: ${pluginId}`);
-      } catch (e) {
-        console.error(`[plugins] Failed to load plugin ${d.name}:`, e);
-      }
+      if (!fs.existsSync(path.join(pluginDir, 'manifest.json'))) continue;
+      (pluginNeedsInstall(pluginDir) ? needInstall : ready).push(pluginDir);
     }
   }
 
+  // Plugins without pending installs come up immediately...
+  for (const pluginDir of ready) await loadPluginFromDir(pluginDir, cfg, { bustCache });
   console.log(`[plugins] Loaded ${loadedPlugins.size} plugin(s)`);
+
+  // ...the rest install in the background instead of holding everything
+  // (network browsing, UPnP) hostage to a slow `npm install`.
+  if (needInstall.length) {
+    (async () => {
+      for (const pluginDir of needInstall) {
+        const id = path.basename(pluginDir);
+        if (cfg[id]?.enabled === false) continue;
+        await installPluginDependencies(pluginDir, id);
+        if (await loadPluginFromDir(pluginDir, cfg, { bustCache })) {
+          try { mainWindow?.webContents?.send('plugins:reloaded'); } catch {}
+        }
+      }
+    })().catch((e) => console.error('[plugins] background plugin install failed', e));
+  }
 }
 
 // Plugin event system

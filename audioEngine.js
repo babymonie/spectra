@@ -93,6 +93,153 @@ let currentSourceInfo = null;
 let currentOutputInfo = null;
 const backendHealth = new Map();
 
+// Bumped by every playFile()/stop(). Async continuations and stream callbacks
+// compare against it so a superseded request can never touch live state.
+let playGeneration = 0;
+let trackBaseBytes = 0;      // outputStream.totalBytesWritten when this track began
+let currentCueStart = 0;     // absolute offset of a cue virtual track inside its file
+let currentDuration = 0;     // seconds, relative to the (virtual) track start
+let trackEnded = false;      // decoder finished naturally; waiting for a hand-over
+let idleCloseTimer = null;
+let pendingFinish = null;    // end-of-track notification deferred while paused
+let outputErrorHandler = null;
+let lastPlayRequest = { key: null, at: 0, startAt: 0 };
+const probeCache = new Map();
+const EMPTY_CHUNK = Buffer.alloc(0);
+
+function clearIdleClose() {
+  if (idleCloseTimer) { clearTimeout(idleCloseTimer); idleCloseTimer = null; }
+}
+
+// After a natural end the device stays open briefly so the next track can be
+// appended gaplessly. If nothing follows, release the device.
+function scheduleIdleClose(gen) {
+  clearIdleClose();
+  idleCloseTimer = setTimeout(() => {
+    idleCloseTimer = null;
+    if (gen === playGeneration && trackEnded) stop();
+  }, 2500);
+}
+
+function waitForDrain(stream, maxMs = 1200) {
+  return new Promise((resolve) => {
+    const started = Date.now();
+    const tick = () => {
+      if (!stream || stream._closed || isPaused) return resolve();
+      const buffered = typeof stream.getBufferedBytes === 'function' ? stream.getBufferedBytes() : 0;
+      if (buffered <= 0 || Date.now() - started > maxMs) {
+        // Ring is empty; give the hardware buffer a moment to play out too.
+        return setTimeout(resolve, Math.min(150, Math.max(30, Number(stream.actualBufferMs) || 60)));
+      }
+      setTimeout(tick, 15);
+    };
+    tick();
+  });
+}
+
+function isNetworkPath(p) {
+  return typeof p === 'string' && /^https?:\/\//i.test(p);
+}
+
+/**
+ * Ask FFmpeg what a source really is. Used for network streams (UPnP, WebDAV,
+ * object storage) and for local files music-metadata cannot parse, so hi-res
+ * streams are not silently forced to 44.1 kHz / 16-bit.
+ */
+function probeSource(filePath) {
+  if (!resolvedFfmpegPath || !filePath) return Promise.resolve({});
+  if (probeCache.has(filePath)) return Promise.resolve(probeCache.get(filePath));
+  return new Promise((resolve) => {
+    const args = ['-hide_banner'];
+    if (isNetworkPath(filePath)) args.push('-rw_timeout', '8000000');
+    args.push('-i', filePath);
+    let stderr = '';
+    let done = false;
+    let proc;
+    let timer = null;
+    const finish = () => {
+      if (done) return;
+      done = true;
+      if (timer) clearTimeout(timer);
+      const info = {};
+      const dur = stderr.match(/Duration:\s*(\d+):(\d+):(\d+(?:\.\d+)?)/);
+      if (dur) info.duration = Number(dur[1]) * 3600 + Number(dur[2]) * 60 + Number(dur[3]);
+      const audio = stderr.match(/Stream #[^\n]*Audio:\s*([^\n]+)/);
+      if (audio) {
+        const line = audio[1];
+        info.codec = line.split(/[ ,(]/)[0] || null;
+        const rate = line.match(/(\d+)\s*Hz/);
+        if (rate) info.sampleRate = Number(rate[1]);
+        if (/\bmono\b/.test(line)) info.numberOfChannels = 1;
+        else if (/\bstereo\b/.test(line)) info.numberOfChannels = 2;
+        else if (/\b7\.1\b/.test(line)) info.numberOfChannels = 8;
+        else if (/\b5\.1\b/.test(line)) info.numberOfChannels = 6;
+        else {
+          const ch = line.match(/(\d+)\s*channels/);
+          if (ch) info.numberOfChannels = Number(ch[1]);
+        }
+        const explicitBits = line.match(/\((\d+)\s*bit\)/);
+        if (explicitBits) info.bitsPerSample = Number(explicitBits[1]);
+        else if (/\bs16p?\b/.test(line)) info.bitsPerSample = 16;
+        else if (/\bs32p?\b/.test(line)) info.bitsPerSample = 32;
+        else if (/\bdsd_/i.test(line)) info.bitsPerSample = 1;
+      }
+      if (info.sampleRate) {
+        if (probeCache.size > 200) probeCache.delete(probeCache.keys().next().value);
+        probeCache.set(filePath, info);
+      }
+      resolve(info);
+    };
+    timer = setTimeout(() => { try { proc?.kill('SIGTERM'); } catch {} finish(); }, 10000);
+    try {
+      proc = spawn(resolvedFfmpegPath, args, { stdio: ['ignore', 'ignore', 'pipe'] });
+      proc.stderr.on('data', (d) => { if (stderr.length < 65536) stderr += String(d); });
+      proc.on('error', finish);
+      proc.on('close', finish);
+    } catch {
+      finish();
+    }
+  });
+}
+
+/** Kill the decoder side only; the output device stays open. */
+function stopDecoder() {
+  if (silenceInterval) { clearInterval(silenceInterval); silenceInterval = null; }
+  if (ffmpegSupervisor) { try { ffmpegSupervisor.kill(); } catch {} ffmpegSupervisor = null; }
+  if (ffmpegProc) { try { ffmpegProc.kill('SIGTERM'); } catch {} ffmpegProc = null; }
+  if (currentGainStream) { try { currentGainStream.unpipe(); currentGainStream.destroy(); } catch {} currentGainStream = null; }
+}
+
+function detachOutputErrorHandler() {
+  if (outputStream && outputErrorHandler) {
+    try { outputStream.removeListener('error', outputErrorHandler); } catch {}
+    // Keep a no-op listener so a late error on a dying stream is not "unhandled".
+    try { outputStream.on('error', () => {}); } catch {}
+  }
+  outputErrorHandler = null;
+}
+
+/** Absolute position inside the source file (ignores cue offsets). */
+function absolutePosition() {
+  if (outputStream && typeof outputStream.getElapsedTime === 'function') {
+    return currentStartTime + outputStream.getElapsedTime(trackBaseBytes);
+  }
+  return currentStartTime;
+}
+
+/** Restart the current source at `absTime`, keeping pause state and device. */
+function restartCurrent(absTime, extra = {}) {
+  if (!currentFile) return Promise.resolve();
+  return playFile(currentFile, lastOnEnd, lastOnError, {
+    ...(lastOptions || {}),
+    gapless: false,
+    startTime: Math.max(0, Number.isFinite(absTime) ? absTime : 0),
+    __resumePaused: isPaused,
+    __restart: true,
+    ...extra,
+  });
+}
+
 function normalizePlaybackOption(v) {
   return v === undefined || v === null || v === '' ? null : v;
 }
@@ -368,8 +515,9 @@ function setEQ(state) {
 
   if (currentFile && shouldRestart && (ffmpegProc || currentInputStream)) {
     console.log('[audioEngine] EQ changed, restarting playback...');
-    const time = getTime();
-    playFile(currentFile, lastOnEnd, lastOnError, { ...lastOptions, startTime: time });
+    restartCurrent(absolutePosition(), { __reuseOutput: true }).catch((e) => {
+      console.error('[audioEngine] EQ restart failed:', e);
+    });
   }
 }
 
@@ -512,62 +660,101 @@ async function playFile(filePath, onEnd, onError, options = {}) {
     const [startStr, endStr] = rest.split('\x00');
     const cueSec = parseFloat(startStr);
     const cueEnd = endStr && endStr !== '-' ? parseFloat(endStr) : null;
-    const cueOptions = { ...options };
-    if (Number.isFinite(cueSec)) cueOptions.startTime = cueSec;
+    const cueOptions = { ...options, __requestPath: filePath };
+    if (Number.isFinite(cueSec)) {
+      // Callers address a cue track relative to its own start.
+      cueOptions.__cueStartSec = cueSec;
+      cueOptions.startTime = cueSec + Math.max(0, Number(options?.startTime) || 0);
+    }
     if (Number.isFinite(cueEnd)) cueOptions.__cueEndSec = cueEnd;
     return playFile(audioFile, onEnd, onError, cueOptions);
   }
 
   options = applyEqPlaybackCompatibility(routePlaybackOptionsForBackendHealth(options));
-  try {
-    const startAt = Number(options?.startTime ?? 0);
-    const trackPath = options?.track?.path;
-    const currentTrackPath = lastOptions?.track?.path;
-    const sameByTrack = trackPath && currentTrackPath && trackPath === currentTrackPath;
-    const sameByFile = currentFile && filePath && currentFile === filePath;
-    const sameFile = ffmpegProc && (sameByTrack || sameByFile);
-    const outputChanged = hasOutputOptionDelta(options, lastOptions);
-    if (sameFile && startAt < 0.05 && !outputChanged) {
-      console.log('[audioEngine] playFile dedup: already playing this file, ignoring duplicate request');
-      return;
-    }
-  } catch {}
+  const prevOptions = lastOptions || {};
+  const requestKey = options.__requestPath || filePath;
+  const startAt = Math.max(0, Number(options?.startTime ?? 0) || 0);
 
-  // Gapless mode: reuse existing outputStream if format will match, only kill decoder.
-  const wantGapless = options.gapless === true && outputStream && !outputStream._closed;
-  if (wantGapless) {
-    // Stop only the decoder, keep outputStream alive
-    if (ffmpegSupervisor) { try { ffmpegSupervisor.kill(); } catch {} ffmpegSupervisor = null; }
-    if (ffmpegProc) { try { ffmpegProc.kill('SIGTERM'); } catch {} ffmpegProc = null; }
-    if (currentGainStream) { try { currentGainStream.unpipe(); currentGainStream.destroy(); } catch {} currentGainStream = null; }
-    if (silenceInterval) { clearInterval(silenceInterval); silenceInterval = null; }
-    currentStartTime = 0;
+  // Swallow accidental double-fires (click + dblclick, duplicate IPC) only.
+  // A deliberate replay of the same track must restart it.
+  const now = Date.now();
+  if (
+    !options.__restart &&
+    currentFile && !trackEnded &&
+    lastPlayRequest.key === requestKey &&
+    now - lastPlayRequest.at < 350 &&
+    Math.abs(lastPlayRequest.startAt - startAt) < 0.05 &&
+    !hasOutputOptionDelta(options, prevOptions)
+  ) {
+    console.log('[audioEngine] playFile dedup: duplicate request within 350ms ignored');
+    return;
+  }
+  lastPlayRequest = { key: requestKey, at: now, startAt };
+
+  const resumePaused = !!options.__resumePaused;
+  const naturalHandover = options.gapless === true && trackEnded;
+  const reuseRequested = options.gapless === true || options.__reuseOutput === true;
+  options = { ...options };
+  delete options.__resumePaused;
+  delete options.__reuseOutput;
+  delete options.__restart;
+
+  clearIdleClose();
+  pendingFinish = null;
+
+  // Keep the device open when the next source can simply be appended to it
+  // (gapless hand-over, seek, EQ change). Everything else gets a clean reopen.
+  const canReuse =
+    reuseRequested &&
+    outputStream && !outputStream._closed && !outputStream.destroyed &&
+    !currentInputStream &&
+    !hasOutputOptionDelta(options, prevOptions);
+  if (canReuse) {
+    stopDecoder();
   } else {
     stop();
   }
+  const gen = ++playGeneration;
 
   try {
-    console.log('[audioEngine] playFile called for', filePath, wantGapless ? '(gapless)' : '');
+    console.log('[audioEngine] playFile called for', filePath, canReuse ? '(reusing output)' : '');
   } catch {}
-  currentStartTime = options.startTime || 0;
 
+  currentStartTime = startAt;
+  currentCueStart = Number.isFinite(options.__cueStartSec) ? options.__cueStartSec : 0;
   currentFile = filePath;
   lastOnEnd = onEnd;
   lastOnError = onError;
   lastOptions = options;
   isPaused = false;
+  trackEnded = false;
+  trackBaseBytes = outputStream ? outputStream.totalBytesWritten : 0;
 
-  let meta;
-  try {
-    // Use native:true to get gapless + RG tags when available
-    meta = await parseFile(filePath, { native: true });
-  } catch {
-    meta = {};
+  const fail = (err) => {
+    if (gen !== playGeneration) return;
+    stop();
+    if (onError) onError(err);
+  };
+
+  let meta = null;
+  if (!isNetworkPath(filePath)) {
+    try {
+      meta = await parseFile(filePath, { duration: false, skipCovers: true });
+    } catch {
+      meta = null;
+    }
+    if (gen !== playGeneration) return; // superseded while reading tags
+  }
+  let fmt = { ...(meta?.format || {}) };
+  if (!fmt.sampleRate || !fmt.numberOfChannels) {
+    const probed = await probeSource(filePath);
+    if (gen !== playGeneration) return;
+    const known = Object.fromEntries(Object.entries(fmt).filter(([, v]) => v !== undefined && v !== null));
+    fmt = { ...probed, ...known };
   }
 
   // Extract ReplayGain from parsed tags and store for gain computation
   const metaCommon = meta?.common || {};
-  const metaNative = meta?.native || {};
   const trackRgMeta = (() => {
     let trackGain = null, albumGain = null, trackPeak = null, albumPeak = null;
     const rg = (v) => { if (v == null) return null; if (typeof v === 'number') return v; if (typeof v?.dB === 'number') return v.dB; return parseFloat(String(v)) || null; };
@@ -578,9 +765,15 @@ async function playFile(filePath, onEnd, onError, options = {}) {
     albumPeak = pk(metaCommon.replaygain_album_peak);
     return { trackGain, albumGain, trackPeak, albumPeak };
   })();
+  {
+    const fullDuration = Number(fmt.duration) || 0;
+    currentDuration = Number.isFinite(options.__cueEndSec)
+      ? Math.max(0, options.__cueEndSec - currentCueStart)
+      : Math.max(0, fullDuration - currentCueStart);
+  }
   // Pass RG into options so attachPipeline and computeTotalGain can use it
   options = { ...options, __replaygain: trackRgMeta };
-  const fmt = meta?.format || {};
+  lastOptions = options;
   if (options.__backendHealthBypass) {
     console.warn('[audioEngine] bypassing unhealthy backend', options.__backendHealthBypass);
   }
@@ -627,19 +820,33 @@ async function playFile(filePath, onEnd, onError, options = {}) {
     bitDepth = 24;
   }
 
-  // For gapless: check if existing outputStream format matches next track.
-  // If it matches, reuse it; otherwise fall through to open a new one.
+  // Reuse the open device when the next source has the same output format.
   let gaplessReused = false;
-  if (wantGapless && outputStream && !outputStream._closed) {
+  if (canReuse && outputStream && !outputStream._closed) {
     const fmtOk =
       (outputStream.actualSampleRate || 0) === sampleRate &&
       (outputStream.actualChannels || 0) === channels &&
-      (outputStream.actualBitDepth || 0) === bitDepth;
+      (outputStream.actualBitDepth || 0) === bitDepth &&
+      !useDop && !useNativeDsd;
     if (fmtOk) {
       gaplessReused = true;
-      console.log('[audioEngine] gapless: reusing outputStream (format match)');
+      console.log('[audioEngine] reusing outputStream (format match)');
+      const reused = outputStream;
+      // The previous decoder may have been cut mid-frame: realign, and count
+      // this track's position from the first byte that follows.
+      trackBaseBytes = reused.totalBytesWritten;
+      reused.realign(() => {
+        if (gen === playGeneration && outputStream === reused) trackBaseBytes = reused.totalBytesWritten;
+      });
+      if (!resumePaused) { try { reused.resume(); } catch {} }
     } else {
-      console.log('[audioEngine] gapless: format mismatch, reopening outputStream');
+      console.log('[audioEngine] output format changes; reopening outputStream');
+      if (naturalHandover) {
+        // Let the tail of the finished track play out before closing the device.
+        await waitForDrain(outputStream);
+        if (gen !== playGeneration) return;
+      }
+      detachOutputErrorHandler();
       try { outputStream.end(); if (typeof outputStream.destroy === 'function') outputStream.destroy(); } catch {}
       outputStream = null;
     }
@@ -661,9 +868,10 @@ async function playFile(filePath, onEnd, onError, options = {}) {
         dsdNative: useNativeDsd,
       });
     } catch (err) {
-      if (onError) onError(err);
+      fail(err);
       return;
     }
+    trackBaseBytes = 0;
   }
 
   const actualSampleRate = outputStream.actualSampleRate || sampleRate;
@@ -678,6 +886,8 @@ async function playFile(filePath, onEnd, onError, options = {}) {
     bitDepth: fmt.bitsPerSample || null,
     channels: fmt.numberOfChannels || channels,
     codec: fmt.codec || null,
+    lossless: fmt.lossless ?? null,
+    bitrate: fmt.bitrate || null,
     sampleRatePolicy,
   };
   currentOutputInfo = {
@@ -800,7 +1010,7 @@ async function playFile(filePath, onEnd, onError, options = {}) {
   if (!resolvedFfmpegPath) {
     const err = new Error('FFmpeg binary path is not available');
     console.error('[audioEngine] Cannot start FFmpeg:', err.message);
-    if (onError) onError(err);
+    fail(err);
     return;
   }
 
@@ -869,6 +1079,7 @@ async function playFile(filePath, onEnd, onError, options = {}) {
       // LCG state for fast TPDF random generation (two independent streams)
       this._r1 = (Math.random() * 0xffffffff) >>> 0;
       this._r2 = (Math.random() * 0xffffffff) >>> 0;
+      this._carry = null;
     }
 
     _tpdf() {
@@ -880,52 +1091,48 @@ async function playFile(filePath, onEnd, onError, options = {}) {
 
     _transform(chunk, encoding, callback) {
       try {
+        // FFmpeg's pipe is read in arbitrary slices, so a chunk can end in the
+        // middle of a sample (always possible for 24-bit). Carry the partial
+        // sample over instead of scaling misaligned bytes into noise.
+        if (this._carry) {
+          chunk = Buffer.concat([this._carry, chunk]);
+          this._carry = null;
+        }
         if (this.gain === 1) {
           this.push(chunk);
           return callback();
         }
 
+        const width = this.format === 's16le' ? 2 : this.format === 's24le' ? 3
+          : (this.format === 's32le' || this.format === 'f32le') ? 4 : 1;
+        const usable = chunk.length - (chunk.length % width);
+        if (usable < chunk.length) this._carry = Buffer.from(chunk.subarray(usable));
+        if (usable === 0) return callback();
+        const src = usable === chunk.length ? chunk : chunk.subarray(0, usable);
+        const out = Buffer.allocUnsafe(usable);
+
         if (this.format === 's16le') {
-          const out = Buffer.allocUnsafe(chunk.length);
-          for (let i = 0; i + 1 < chunk.length; i += 2) {
-            const s = chunk.readInt16LE(i);
-            // TPDF dither: ±0.5 LSB triangular noise before quantization
-            let v = s * this.gain + this._tpdf() * 0.5;
+          for (let i = 0; i < usable; i += 2) {
+            // TPDF dither: +/-0.5 LSB triangular noise before quantization
+            let v = src.readInt16LE(i) * this.gain + this._tpdf() * 0.5;
             v = v > 32767 ? 32767 : v < -32768 ? -32768 : Math.round(v);
             out.writeInt16LE(v, i);
           }
-          this.push(out);
-          return callback();
-        }
-
-        if (this.format === 'f32le') {
-          const view = new DataView(chunk.buffer, chunk.byteOffset, chunk.length);
-          const out = Buffer.allocUnsafe(chunk.length);
-          for (let i = 0; i + 3 < chunk.length; i += 4) {
-            let v = view.getFloat32(i, true) * this.gain;
+        } else if (this.format === 'f32le') {
+          for (let i = 0; i < usable; i += 4) {
+            let v = src.readFloatLE(i) * this.gain;
             v = v > 1 ? 1 : v < -1 ? -1 : v;
             out.writeFloatLE(v, i);
           }
-          this.push(out);
-          return callback();
-        }
-
-        if (this.format === 's32le') {
-          const out = Buffer.allocUnsafe(chunk.length);
-          for (let i = 0; i + 3 < chunk.length; i += 4) {
-            const s = chunk.readInt32LE(i);
-            let v = s * this.gain + this._tpdf() * 0.5;
+        } else if (this.format === 's32le') {
+          for (let i = 0; i < usable; i += 4) {
+            let v = src.readInt32LE(i) * this.gain + this._tpdf() * 0.5;
             v = v > 2147483647 ? 2147483647 : v < -2147483648 ? -2147483648 : Math.round(v);
             out.writeInt32LE(v, i);
           }
-          this.push(out);
-          return callback();
-        }
-
-        if (this.format === 's24le') {
-          const out = Buffer.allocUnsafe(chunk.length);
-          for (let i = 0; i + 2 < chunk.length; i += 3) {
-            let s = chunk[i] | (chunk[i + 1] << 8) | (chunk[i + 2] << 16);
+        } else if (this.format === 's24le') {
+          for (let i = 0; i < usable; i += 3) {
+            let s = src[i] | (src[i + 1] << 8) | (src[i + 2] << 16);
             if (s & 0x800000) s |= 0xff000000; // sign-extend to int32
             let v = s * this.gain + this._tpdf() * 0.5;
             v = v > 0x7fffff ? 0x7fffff : v < -0x800000 ? -0x800000 : Math.round(v);
@@ -933,15 +1140,20 @@ async function playFile(filePath, onEnd, onError, options = {}) {
             out[i + 1] = (v >> 8) & 0xff;
             out[i + 2] = (v >> 16) & 0xff;
           }
-          this.push(out);
-          return callback();
+        } else {
+          src.copy(out);
         }
 
-        this.push(chunk);
+        this.push(out);
         return callback();
       } catch (err) {
         return callback(err);
       }
+    }
+
+    _flush(callback) {
+      if (this._carry) { this.push(this._carry); this._carry = null; }
+      callback();
     }
   }
 
@@ -967,7 +1179,12 @@ async function playFile(filePath, onEnd, onError, options = {}) {
       if (err.code !== 'EPIPE') console.error('[audioEngine] stdout error:', err);
     });
 
-    const gain = new GainTransform(ffmpegFormat, actualChannels, totalGain, trackRg);
+    // A crashed decoder may have stopped mid-frame; realign before appending.
+    if (thisSupervisor.spawnCount > 1 && outputStream && typeof outputStream.realign === 'function') outputStream.realign();
+
+    // Keep the live volume across decoder restarts instead of the start value.
+    const liveGain = bitPerfectOutput ? 1 : computeTotalGain(Number(lastOptions?.volume ?? volPct), trackRg);
+    const gain = new GainTransform(ffmpegFormat, actualChannels, liveGain, trackRg);
     currentGainStream = gain;
     proc.stdout.pipe(gain).pipe(outputStream, { end: false });
   };
@@ -1017,17 +1234,38 @@ async function playFile(filePath, onEnd, onError, options = {}) {
 
   thisSupervisor.on('close', (code, signal) => {
     if (thisSupervisor !== ffmpegSupervisor) return;
-    console.log('[audioEngine] FFmpeg exited — code:', code, 'signal:', signal);
+    console.log('[audioEngine] FFmpeg exited - code:', code, 'signal:', signal);
     ffmpegProc = null;
-    if (!isPaused && onEnd && code === 0) onEnd();
+    if (code !== 0) return; // killed by us (stop/seek/skip)
+
+    // Natural end of the source. The decoder is done, but its last PCM may
+    // still be travelling through the gain stage and the write queue. Only
+    // report the end once every byte has reached the device ring, so the
+    // tail is never cut and the next track can be appended gaplessly.
+    const gainStream = currentGainStream;
+    const finish = () => {
+      if (gen !== playGeneration) return;
+      if (isPaused) { pendingFinish = finish; return; } // never advance while paused
+      pendingFinish = null;
+      trackEnded = true;
+      ffmpegSupervisor = null;
+      scheduleIdleClose(gen);
+      if (onEnd) onEnd();
+    };
+    const afterDecoderFlushed = () => {
+      if (gen !== playGeneration) return;
+      if (!outputStream || outputStream._closed || outputStream.destroyed) return finish();
+      outputStream.write(EMPTY_CHUNK, () => finish());
+    };
+    if (!gainStream || gainStream.readableEnded || gainStream.destroyed) afterDecoderFlushed();
+    else gainStream.once('end', afterDecoderFlushed);
   });
 
   thisSupervisor.on('error', (err) => {
     if (thisSupervisor !== ffmpegSupervisor) return;
     console.error('[audioEngine] FFmpeg supervisor gave up:', err.message);
     ffmpegProc = null;
-    if (onError) onError(err);
-    stop();
+    fail(err);
   });
 
   thisSupervisor.start(buildArgs(options.startTime || 0), {
@@ -1037,7 +1275,13 @@ async function playFile(filePath, onEnd, onError, options = {}) {
   });
 
   if (outputStream && typeof outputStream.on === 'function') {
-    outputStream.on('error', (err) => {
+    // One live handler per stream: a reused (gapless) stream must not keep
+    // firing handlers that belong to tracks which already finished.
+    if (outputErrorHandler) {
+      try { outputStream.removeListener('error', outputErrorHandler); } catch {}
+    }
+    outputErrorHandler = (err) => {
+      if (gen !== playGeneration) return;
       console.error('[audioEngine] output stream error:', err);
       const msg = err?.message ?? String(err);
       const asioNoCallbackStall = isAsioNoCallbackStall(msg);
@@ -1050,7 +1294,7 @@ async function playFile(filePath, onEnd, onError, options = {}) {
         /exclusive audio write stalled|exclusive audio write failed|device lost/i.test(msg);
 
       if (canFallback) {
-        const restartAt = getTime();
+        const restartAt = absolutePosition();
         const fallbackDeviceId = resolveWasapiFallbackDeviceId(options?.deviceId);
         const fallbackReason = asioNoCallbackStall ? 'asio driver started but produced zero callbacks' : 'device stopped consuming audio';
         if (asioNoCallbackStall) {
@@ -1078,14 +1322,24 @@ async function playFile(filePath, onEnd, onError, options = {}) {
         });
         return;
       }
-      if (onError) onError(err);
-      stop();
-    });
+      fail(err);
+    };
+    outputStream.on('error', outputErrorHandler);
   }
+
+  // A seek / EQ change issued while paused must stay paused.
+  if (resumePaused) pause();
 }
 
 function stop() {
+  playGeneration++;
+  clearIdleClose();
+  pendingFinish = null;
+  trackEnded = false;
   currentStartTime = 0;
+  currentCueStart = 0;
+  currentDuration = 0;
+  trackBaseBytes = 0;
   currentSourceInfo = null;
   currentOutputInfo = null;
   // stop any silence filler
@@ -1114,6 +1368,7 @@ function stop() {
   }
 
   if (outputStream) {
+    detachOutputErrorHandler();
     try {
       outputStream.end();
       // Force destroy to ensure native handle closes
@@ -1128,7 +1383,7 @@ function stop() {
 
 function pause() {
   console.log('[audioEngine] pause called');
-  if ((!ffmpegProc && !ffmpegSupervisor && !currentInputStream) || isPaused) return;
+  if ((!ffmpegProc && !ffmpegSupervisor && !currentInputStream) || isPaused || trackEnded) return;
 
   try {
     // 1) pause native output first so it stops consuming ring
@@ -1169,12 +1424,10 @@ function resume() {
 
   // If decoder died while paused/stalled, restart from current position so
   // resume doesn't unpause a drained ring with no producer.
-  if (!ffmpegProc && !ffmpegSupervisor && currentFile) {
-    const restartAt = getTime();
-    playFile(currentFile, lastOnEnd, lastOnError, {
-      ...(lastOptions || {}),
-      startTime: Number.isFinite(restartAt) ? restartAt : 0,
-    }).catch((e) => {
+  if (trackEnded) return; // finished; the next track (if any) is already on its way
+  if (!ffmpegProc && !ffmpegSupervisor && !currentInputStream && currentFile) {
+    isPaused = false;
+    restartCurrent(absolutePosition()).catch((e) => {
       console.error('[audioEngine] resume restart failed:', e);
     });
     return;
@@ -1202,9 +1455,16 @@ function resume() {
 
   isPaused = false;
 
+  // The decoder may have finished while we were paused.
+  if (pendingFinish) {
+    const finish = pendingFinish;
+    pendingFinish = null;
+    finish();
+  }
+
   // Confirm native resumed (helps diagnose devices that stay paused)
   try {
-    const after = exclusiveAudio?.getStats
+    const after = outputStream && exclusiveAudio?.getStats
       ? exclusiveAudio.getStats(outputStream.handle)
       : null;
     if (after) console.log('[audioEngine] native stats after resume:', after);
@@ -1225,7 +1485,9 @@ function getStatus() {
   return {
     exclusiveAvailable: !!exclusiveAudio,
     exclusiveLoadError,
-    playing: !!(ffmpegProc || currentInputStream || outputStream),
+    playing: !!currentFile && !trackEnded,
+    ended: trackEnded,
+    duration: currentDuration || 0,
     paused: !!isPaused,
     currentFile: currentFile || null,
     currentTime: getTime(),
@@ -1374,16 +1636,26 @@ function openAsioControlPanel(options = {}) {
 }
 
 function getTime() {
-  if (outputStream && typeof outputStream.getElapsedTime === 'function') {
-    return currentStartTime + outputStream.getElapsedTime();
-  }
-  return currentStartTime;
+  const t = absolutePosition() - currentCueStart;
+  if (!Number.isFinite(t) || t < 0) return 0;
+  return currentDuration > 0 ? Math.min(t, currentDuration) : t;
 }
 
 function seek(time) {
-  if (!currentFile) return;
-  console.log('[audioEngine] seeking to', time);
-  playFile(currentFile, lastOnEnd, lastOnError, { ...lastOptions, startTime: time });
+  if (!currentFile || trackEnded) return;
+  const rel = Math.max(0, Number(time) || 0);
+  const target = currentDuration > 0 ? Math.min(rel, Math.max(0, currentDuration - 0.25)) : rel;
+  console.log('[audioEngine] seeking to', target);
+  // Keep the device open when its buffer is short enough that the leftover
+  // audio is inaudible; otherwise reopen for an instant cut.
+  let reuse = false;
+  try {
+    const stats = outputStream && exclusiveAudio?.getStats ? exclusiveAudio.getStats(outputStream.handle) : null;
+    reuse = !!stats && Number(stats.ringDurationMs) > 0 && Number(stats.ringDurationMs) <= 260;
+  } catch {}
+  restartCurrent(target + currentCueStart, { __reuseOutput: reuse }).catch((e) => {
+    console.error('[audioEngine] seek failed:', e);
+  });
 }
 
 const audioEngineApi = {

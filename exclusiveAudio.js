@@ -131,15 +131,20 @@ class ExclusiveStream extends Writable {
     console.log(`[ExclusiveStream] Opened: handle=${this.handle}, backend=${this.actualBackend}, rate=${this.actualSampleRate}, ch=${this.actualChannels}, format=${this.actualSampleFormat}, buffer=${this.actualBufferFrames || 0} frames`);
   }
 
-  getElapsedTime() {
+  /**
+   * Seconds of audio actually played since `baseBytes` bytes had been queued.
+   * `baseBytes` lets a reused (gapless) stream report per-track positions.
+   */
+  getElapsedTime(baseBytes = 0) {
     if (!this.actualSampleRate || !this.actualChannels || !this.actualBitDepth) return 0;
     const bytesPerSample = this.actualBitDepth / 8;
     const bytesPerFrame = this.actualChannels * bytesPerSample;
     const bytesPerSecond = this.actualSampleRate * bytesPerFrame;
     if (bytesPerSecond === 0) return 0;
-    const queuedSeconds = this.totalBytesWritten / bytesPerSecond;
+    const queuedSeconds = Math.max(0, this.totalBytesWritten - baseBytes) / bytesPerSecond;
     // Subtract buffered-but-not-yet-played latency so the reported position
     // tracks actual playback rather than bytes enqueued.
+    if (this._closed) return queuedSeconds;
     try {
       const stats = native.getStats(this.handle);
       if (stats) {
@@ -152,8 +157,31 @@ class ExclusiveStream extends Writable {
     }
     return queuedSeconds;
   }
+  /** Bytes still queued in the native ring (not yet handed to the device). */
+  getBufferedBytes() {
+    if (this._closed) return 0;
+    try {
+      const stats = native.getStats ? native.getStats(this.handle) : null;
+      return stats && Number.isFinite(stats.buffered) ? stats.buffered : 0;
+    } catch {
+      return 0;
+    }
+  }
+
 _write(chunk, encoding, callback) {
   if (this._closed) return callback();
+  // Realign marker: after a decoder was cut off mid-frame (seek, skip, gapless
+  // hand-over) pad with silence up to the next frame boundary, otherwise every
+  // following sample lands in the wrong channel/byte and plays as noise.
+  if (chunk && chunk.__realign) {
+    const frameBytes = Math.max(1, (this.actualBitDepth / 8) * this.actualChannels);
+    const rem = this.totalBytesWritten % frameBytes;
+    if (rem === 0) return callback();
+    chunk = Buffer.alloc(frameBytes - rem);
+  }
+  // Zero-length chunks are used as flush markers; the native layer would
+  // report them as "0 bytes written" and we would misread that as a stall.
+  if (!chunk || chunk.length === 0) return callback();
 
   let doneCalled = false;
   const zeroWriteStartedAt = Date.now();
@@ -235,6 +263,14 @@ _write(chunk, encoding, callback) {
     }
     this._closeNative();
     callback();
+  }
+
+  /** Queue a frame-realign marker behind any writes already in flight. */
+  realign(callback) {
+    if (this._closed || this.destroyed || this.writableEnded) return;
+    const marker = Buffer.alloc(0);
+    marker.__realign = true;
+    try { this.write(marker, () => { if (callback) callback(); }); } catch {}
   }
 
   _closeNative() {

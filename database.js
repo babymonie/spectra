@@ -24,11 +24,39 @@ const initDb = async () => {
 };
 
 // Save database to disk
+// Exporting + rewriting the whole database on every statement made bulk
+// imports quadratic and stalled the main process (which also pumps audio),
+// so writes are coalesced and flushed shortly after the last change.
+let saveTimer = null;
+let dbDirty = false;
+
+export const flushDb = () => {
+  if (saveTimer) { clearTimeout(saveTimer); saveTimer = null; }
+  if (!db || !dbDirty) return;
+  dbDirty = false;
+  try {
+    const data = db.export();
+    const tmp = `${dbPath}.tmp`;
+    fs.writeFileSync(tmp, data);
+    fs.renameSync(tmp, dbPath); // atomic replace: a crash mid-write cannot corrupt the library
+  } catch (err) {
+    dbDirty = true;
+    console.error('[database] failed to save database', err);
+  }
+};
+
 const saveDb = () => {
   if (!db) return;
-  const data = db.export();
-  fs.writeFileSync(dbPath, data);
+  dbDirty = true;
+  if (saveTimer) return;
+  saveTimer = setTimeout(() => { saveTimer = null; flushDb(); }, 400);
 };
+
+try {
+  app.on('before-quit', flushDb);
+  app.on('will-quit', flushDb);
+  process.on('exit', flushDb);
+} catch {}
 
 // Helper to run SQL and save
 const run = (sql, params = []) => {
@@ -666,6 +694,7 @@ const api = {
   updateTrackLyrics,
   updateTrackFields,
   getAlbumTracks,
+  flushDb,
 }
 
 export default api;
