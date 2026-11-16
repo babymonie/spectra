@@ -1,11 +1,16 @@
 #!/usr/bin/env node
-const fs = require('fs');
-const path = require('path');
-const { execSync } = require('child_process');
+import fs from 'node:fs';
+import path from 'node:path';
+import { fileURLToPath } from 'node:url';
+import { execSync } from 'node:child_process';
+
+const __dirname = path.dirname(fileURLToPath(import.meta.url));
+const repoDir = path.resolve(__dirname, '..');
+const execOptions = { cwd: repoDir };
 
 function lastCommitMessage() {
   try {
-    return execSync('git log -1 --pretty=%B').toString().trim();
+    return execSync('git log -1 --pretty=%B', execOptions).toString().trim();
   } catch (e) {
     return '';
   }
@@ -35,8 +40,8 @@ pkg.version = newVersion;
 fs.writeFileSync(pkgPath, JSON.stringify(pkg, null, 2) + '\n', 'utf8');
 
 try {
-  execSync('git add package.json');
-  execSync(`git commit -m "chore: bump version to ${newVersion}"`);
+  execSync('git add package.json', execOptions);
+  execSync(`git commit -m "chore: bump version to ${newVersion}"`, execOptions);
   console.log('Bumped package.json to', newVersion);
 } catch (e) {
   console.error('Failed to create bump commit:', e && e.message ? e.message : e);

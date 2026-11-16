@@ -1,7 +1,7 @@
 import { createRequire } from 'node:module';
 import path from 'path';
 import net from 'net';
-import { fileURLToPath } from 'url';
+import { fileURLToPath, pathToFileURL } from 'url';
 import fs from 'fs';
 import audioEngine from './audioEngine.js';
 import { DeviceMonitor } from './deviceMonitor.js';
@@ -1340,13 +1340,13 @@ const handlers = {
       } catch (e) {
         console.warn('[main] Failed to find available port for remote server', e);
       }
-      remoteServer.start(remoteServerPort, remoteServerHost);
+      await remoteServer.start(remoteServerPort, remoteServerHost);
       // Broadcast current remote info to renderer and remote clients
       try {
         broadcast('remote:info', { host: remoteServerHost, port: remoteServerPort, isRunning: !!remoteServer.isRunning });
       } catch (e) { /* noop */ }
     } else {
-      remoteServer.stop();
+      await remoteServer.stop();
       try {
         broadcast('remote:info', { host: remoteServerHost, port: remoteServerPort, isRunning: !!remoteServer.isRunning });
       } catch (e) { /* noop */ }
@@ -1732,7 +1732,7 @@ app.whenReady().then(async () => {
       console.warn('[main] Failed to pick alternative remote port, using configured port', e);
     }
 
-    remoteServer.start(remoteServerPort, remoteServerHost);
+    await remoteServer.start(remoteServerPort, remoteServerHost);
   } else {
     console.log('[main] Remote server disabled via CLI/env flag.');
   }
@@ -1761,12 +1761,13 @@ app.whenReady().then(async () => {
   deviceMonitor.on('device-added', (d) => {
     console.log('[devices] Device connected:', d.name || d.id);
     broadcast('audio:device-added', d);
-    broadcast('audio:devices-changed', audioEngine.getDevices());
   });
   deviceMonitor.on('device-removed', (d) => {
     console.log('[devices] Device disconnected:', d.name || d.id);
     broadcast('audio:device-removed', d);
-    broadcast('audio:devices-changed', audioEngine.getDevices());
+  });
+  deviceMonitor.on('changed', () => {
+    broadcast('audio:devices-changed', deviceMonitor.getKnownDevices());
   });
   deviceMonitor.start();
 
@@ -2685,7 +2686,7 @@ async function loadPluginFromDir(pluginDir, cfg, { bustCache = false } = {}) {
     }
 
     // Import the plugin (ESM). A query string forces a fresh module on reload.
-    const pluginUrl = new URL(`file:///${pluginMainPath.replace(/\\/g, '/')}`);
+    const pluginUrl = pathToFileURL(pluginMainPath);
     if (bustCache) pluginUrl.searchParams.set('v', String(Date.now()));
     const pluginModule = await import(pluginUrl.href);
 

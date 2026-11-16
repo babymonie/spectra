@@ -64,41 +64,7 @@ class RemoteServer {
       });
     });
 
-      this.app.use(express.static(this.rendererPath));
-
-      if (this.pluginRoots.length) {
-        this.app.use('/plugins', (req, res, next) => {
-          try {
-            const rawPath = req.path || '';
-            const sanitized = path.normalize(rawPath).replace(/^([/\\]+)/, '');
-            if (!sanitized) {
-              res.status(404).end();
-              return;
-            }
-            const segments = sanitized.split(/[/\\]+/);
-            if (segments.includes('..')) {
-              res.status(400).end();
-              return;
-            }
-
-            for (const root of this.pluginRoots) {
-              if (!root) continue;
-              const absoluteRoot = path.resolve(root);
-              const candidate = path.resolve(absoluteRoot, sanitized);
-              const rootCompare = absoluteRoot.toLowerCase();
-              const candidateCompare = candidate.toLowerCase();
-              if (!candidateCompare.startsWith(rootCompare)) continue;
-              if (fs.existsSync(candidate) && fs.statSync(candidate).isFile()) {
-                res.sendFile(candidate);
-                return;
-              }
-            }
-          } catch (err) {
-            console.warn('[remote] Failed to serve plugin asset', err);
-          }
-          next();
-        });
-      }
+    this.app.use(express.static(this.rendererPath));
 
     if (this.pluginRoots.length) {
       this.app.use('/plugins', (req, res, next) => {
@@ -160,22 +126,51 @@ class RemoteServer {
     }
   }
 
-  start(port = 3000, host = '0.0.0.0') {
+  async start(port = 3000, host = '0.0.0.0') {
+    if (this.stopping) await this.stopping;
     if (this.isRunning) return;
-    this.port = port;
-    this.server.listen(this.port, host, () => {
-      const displayHost = host === '0.0.0.0' || host === '::' ? '0.0.0.0' : host;
-      console.log(`Remote server running on http://${displayHost}:${this.port}`);
-      this.isRunning = true;
+    if (this.starting) return this.starting;
+    this.starting = new Promise((resolve, reject) => {
+      const onError = (error) => {
+        this.server.removeListener('listening', onListening);
+        reject(error);
+      };
+      const onListening = () => {
+        this.server.removeListener('error', onError);
+        this.port = this.server.address().port;
+        this.isRunning = true;
+        console.log(`Remote server running on port ${this.port}`);
+        resolve();
+      };
+      this.server.once('error', onError);
+      this.server.once('listening', onListening);
+      this.server.listen(port, host);
     });
+    try {
+      await this.starting;
+    } finally {
+      this.starting = null;
+    }
   }
 
-  stop() {
+  async stop() {
+    if (this.starting) await this.starting;
+    if (this.stopping) return this.stopping;
     if (!this.isRunning) return;
-    this.server.close(() => {
-      console.log('Remote server stopped');
-      this.isRunning = false;
+    this.stopping = new Promise((resolve, reject) => {
+      this.io.disconnectSockets(true);
+      this.server.close((error) => {
+        this.isRunning = false;
+        if (error) reject(error);
+        else resolve();
+      });
+      this.server.closeIdleConnections?.();
     });
+    try {
+      await this.stopping;
+    } finally {
+      this.stopping = null;
+    }
   }
 }
 
